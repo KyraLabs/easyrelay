@@ -29,6 +29,10 @@ Zig `0.16.0`, exactly. The version is a pin, not a minimum
 
 [docs/development.md](docs/development.md) has the full command list and the code conventions.
 
+[CLAUDE.md](CLAUDE.md) is the same ground rules written for AI coding agents, plus the Zig 0.16
+API changes that trip up anything trained on older Zig. It is worth a read even if you never use
+one — it is the densest summary of the project's conventions.
+
 ## Before you open a pull request
 
 Run what CI runs:

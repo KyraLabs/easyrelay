@@ -24,5 +24,7 @@ versions may contain breaking changes; they will always be listed under `Changed
   Commits check.
 - Phase 0 validation spike: a written go/no-go on the storage and transport dependencies, with
   measurements, and the documentation corrections it forced.
+- `CLAUDE.md`: conventions for AI coding agents, covering the Zig 0.16 API changes, allocator
+  and assertion discipline for a service handling untrusted input, and the measurement rules.
 
 [Unreleased]: https://github.com/KyraLabs/easyrelay/commits/main
