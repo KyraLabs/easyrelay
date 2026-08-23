@@ -1,0 +1,13 @@
+# Every change needs a maintainer review. Ownership is deliberately coarse while the
+# project is small; split it when there is more than one maintainer per area.
+*                       @AndreaDiazCorreia
+
+# Decisions and the protocol contract carry more weight than ordinary code: changing them
+# retroactively invalidates work built on top.
+/docs/adr/              @AndreaDiazCorreia
+/docs/protocol.md       @AndreaDiazCorreia
+/docs/nips.md           @AndreaDiazCorreia
+
+# Supply chain and anything that runs with a token.
+/.github/workflows/     @AndreaDiazCorreia
+/build.zig.zon          @AndreaDiazCorreia

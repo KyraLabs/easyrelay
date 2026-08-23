@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/KyraLabs/easyrelay/security/advisories/new
+    about: Do not open a public issue for a security problem. Report it privately here.
+  - name: Roadmap
+    url: https://github.com/KyraLabs/easyrelay/blob/main/docs/roadmap.md
+    about: What is being built, in what order, and what each phase must satisfy.
+  - name: Architecture decisions
+    url: https://github.com/KyraLabs/easyrelay/tree/main/docs/adr
+    about: Why the project is built the way it is, before proposing a change to it.

@@ -1,0 +1,78 @@
+name: Bug report
+description: Something behaves incorrectly
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        easyrelay is pre-alpha and the relay is not implemented yet, so most reports at this
+        stage will concern the build, the tooling or the documentation. That is fine.
+
+        For a security problem, do not use this form — report it privately at
+        [Security Advisories](https://github.com/KyraLabs/easyrelay/security/advisories/new).
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you observed, and what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands or client messages. A reproduction someone else can run.
+      placeholder: |
+        1. zig build
+        2. ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: easyrelay version
+      description: Output of `easyrelay --version`, or the commit SHA.
+    validations:
+      required: true
+
+  - type: input
+    id: zig
+    attributes:
+      label: Zig version
+      description: Output of `zig version`. The project pins 0.16.0.
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: Linux x86_64 / macOS aarch64
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Configuration
+      description: The configuration that reproduces it. Redact keys and hostnames.
+      render: zig
+
+  - type: textarea
+    id: protocol
+    attributes:
+      label: Protocol details
+      description: |
+        For a wire-behaviour bug, paste the exact messages exchanged and quote the NIP text
+        you believe is being violated. A protocol report without the spec quote is much
+        slower to act on.
+      render: json
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      render: shell

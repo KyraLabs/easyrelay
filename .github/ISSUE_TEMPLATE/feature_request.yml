@@ -1,0 +1,57 @@
+name: Feature request
+description: Propose something the project should do
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please read [the roadmap](https://github.com/KyraLabs/easyrelay/blob/main/docs/roadmap.md)
+        and [the non-goals](https://github.com/KyraLabs/easyrelay/blob/main/docs/overview.md#non-goals)
+        first. Work belonging to a later phase is usually deferred rather than declined, but
+        deliberate non-goals are declined.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What cannot be done today, and who is blocked by it. Not the solution yet.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposal
+      description: What you think should happen.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: phase
+    attributes:
+      label: Which roadmap phase does this belong to?
+      options:
+        - Phase 0 — Foundation and validation spike
+        - Phase 1 — NIP-01 in memory
+        - Phase 2 — Persistence and indexes
+        - Phase 3 — Operational hardening
+        - Phase 4 — Advanced NIPs
+        - Phase 5 — Negentropy (NIP-77)
+        - Phase 6 — Scaling
+        - None of them
+    validations:
+      required: true
+
+  - type: textarea
+    id: none
+    attributes:
+      label: If none of them, why should it exist?
+      description: |
+        The roadmap is deliberately bounded. Something outside it needs a reason that
+        survives the non-goals list.
+
+  - type: input
+    id: nip
+    attributes:
+      label: Related NIP
+      description: If this is protocol work, which NIP, and a link to it.
