@@ -5,8 +5,14 @@
 > below are stable; only their spelling may change. Examples use ZON, the current
 > recommendation.
 
+**A configuration file is optional.** Every setting has a default that is correct for a real
+deployment, so `easyrelay` with no file and no arguments starts a working relay. Read this
+document when you want to change something, not to get started — see the quick start in the
+[README](../README.md).
+
 easyrelay reads one configuration file, given by `--config <path>` or defaulting to
-`./easyrelay.zon`. Every setting has a default; a relay starts with an empty file.
+`./easyrelay.zon` if it exists. `easyrelay init` writes a fully commented file with every
+default filled in, which is the easier way to start editing than transcribing from here.
 
 Any setting may be overridden by an environment variable named `EASYRELAY_` followed by the
 path in upper snake case: `limits.max_event_size` becomes `EASYRELAY_LIMITS_MAX_EVENT_SIZE`.

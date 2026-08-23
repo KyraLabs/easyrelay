@@ -191,3 +191,4 @@ Every architectural claim above traces to a record:
 | Schnorr via vendored `libsecp256k1` | [ADR-0006](adr/0006-cryptography.md) |
 | Configuration format | [ADR-0007](adr/0007-configuration-format.md) |
 | The `Store` boundary | [ADR-0008](adr/0008-store-abstraction-boundary.md) |
+| Zero-config defaults and bundled TLS | [ADR-0009](adr/0009-deployment-experience.md) |

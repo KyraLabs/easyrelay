@@ -5,13 +5,50 @@
 
 ## Deployment model
 
-One binary, one configuration file, one data directory, behind a reverse proxy that terminates
-TLS. easyrelay binds to loopback by default and does not speak TLS itself — certificates,
-renewal and HTTP/2 are the proxy's job, and it does that job better.
+One binary, one data directory, and a reverse proxy that terminates TLS. A configuration file is
+optional — every setting has a working default. easyrelay binds to loopback and does not speak
+TLS itself: certificates, renewal and HTTP/2 are the proxy's job, and it does that job better.
 
 ```
 client ──TLS──> Caddy / nginx ──plaintext ws──> easyrelay ──> LMDB data directory
 ```
+
+Delegating TLS does not mean delegating the work to you. The project ships the proxy
+configuration, and that is the documented default path. See
+[ADR-0009](adr/0009-deployment-experience.md).
+
+## The default path: bundled compose
+
+Point a domain's A record at the machine, then:
+
+```bash
+curl -LO https://github.com/KyraLabs/easyrelay/raw/main/deploy/docker-compose.yml
+RELAY_DOMAIN=relay.example.com docker compose up -d
+```
+
+That is a public relay on `wss://relay.example.com`. Caddy obtains the certificate and renews
+it; easyrelay runs on the internal network with its data on a named volume; metrics stay off the
+public interface.
+
+To change relay settings, drop an `easyrelay.zon` next to the compose file — it is mounted
+automatically if present. Generate a starting point with `docker compose run --rm easyrelay
+init > easyrelay.zon`.
+
+Everything below is for operators who want to run the binary directly instead.
+
+## Running the binary directly
+
+```bash
+easyrelay                                    # loopback, defaults, data in ./data
+easyrelay --config /etc/easyrelay/easyrelay.zon
+easyrelay init > easyrelay.zon               # commented file with every default filled in
+easyrelay doctor --config ./easyrelay.zon    # validate config and environment before starting
+```
+
+`easyrelay doctor` checks that the configuration parses and is internally consistent, that the
+data directory exists and is writable, how much map-size headroom remains, and whether the relay
+will be reachable from anywhere other than loopback. Run it after any configuration change and
+before restarting a relay people depend on.
 
 ## systemd unit
 

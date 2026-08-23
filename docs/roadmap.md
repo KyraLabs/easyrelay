@@ -18,6 +18,12 @@ later phase while an earlier one is being implemented, since the tests derive fr
 | [5](#phase-5--negentropy-nip-77) | Negentropy (NIP-77) | Relay-to-relay set reconciliation |
 | [6](#phase-6--scaling) | Scaling | Evented I/O and honest benchmarks |
 
+**Ease of deployment is not a phase.** It is the third project goal
+([overview.md](overview.md#3-it-is-trivial-to-run)) and it is delivered incrementally, with its
+own deliverables and exit criteria inside Phases 1, 2 and 3. Deferring it to a polish phase at
+the end is how it fails to happen, and by then the defaults it depends on have already
+calcified. [ADR-0009](adr/0009-deployment-experience.md) fixes what it commits to.
+
 ---
 
 ## Phase 0 — Foundation and validation spike
@@ -73,6 +79,9 @@ A relay that a real client can publish to and read from, with no persistence.
 - Subscription registry with live fan-out to matching subscriptions.
 - Conformance tests for filter semantics; official BIP-340 vectors and canonical-id vectors
   under `tests/vectors/`.
+- **Runs with no arguments.** `easyrelay` with no flags and no configuration file starts and
+  serves. Zero-config is established here, while the surface is small enough that it costs
+  nothing, rather than retrofitted once every setting exists.
 
 ### Exit criteria
 
@@ -84,6 +93,8 @@ A relay that a real client can publish to and read from, with no persistence.
 - An event with a tampered id, and an event with a valid id but an invalid signature, are both
   rejected with `invalid:`.
 - `EOSE` arrives after stored events and before any live event on the same subscription.
+- A clean checkout builds and `./easyrelay` serves a client, with no file created or edited
+  first.
 
 ---
 
@@ -100,6 +111,16 @@ A relay that a real client can publish to and read from, with no persistence.
 - NIP-11 relay information document, generated from configuration and from
   [nips.md](nips.md), served on `Accept: application/nostr+json`.
 - Configuration file loading, which closes [ADR-0007](adr/0007-configuration-format.md).
+- **A complete default set.** Every setting in [configuration.md](configuration.md) has a
+  default correct for a real deployment, not merely one that avoids a crash. Defaults are a
+  correctness surface from this point on and are reviewed as such.
+- **`easyrelay init`**, emitting a fully commented configuration file with every default filled
+  in, so tuning starts from a complete document rather than from the reference manual.
+- **Actionable startup validation.** Unknown key, out-of-range value or contradictory
+  combination stops the relay with a message naming the key and the fix. No silently ignored
+  lines, no stack traces.
+- **A useful startup message**: the URL being served, the data directory in use, whether the
+  relay is reachable only from loopback, and what to change if that is not what was wanted.
 
 ### Exit criteria
 
@@ -112,6 +133,10 @@ A relay that a real client can publish to and read from, with no persistence.
   the same query against a 10k-event dataset. Flat-as-it-grows is the property being tested,
   not any absolute number.
 - The NIP-11 `supported_nips` array matches [nips.md](nips.md) exactly, checked by a test.
+- The relay starts and persists data with no configuration file present.
+- `easyrelay init` output, fed back in unmodified, produces byte-identical behaviour to running
+  with no file at all. Verified by a test, because a drifting `init` template is worse than none.
+- Every configuration error path has a test asserting the message names the offending key.
 
 ---
 
@@ -133,6 +158,15 @@ The phase that makes the relay safe to expose to the open internet.
 - Graceful shutdown: stop accepting, drain the write queue, commit, close.
 - Structured logging with levels and per-connection correlation.
 - Prometheus metrics on `GET /metrics`, and `GET /health`.
+- **Distribution.** Prebuilt binaries for common Linux and macOS targets, cross-compiled from
+  one host — Zig makes this a build matrix rather than a CI fleet — plus a container image,
+  published as release artifacts and checksummed.
+- **`deploy/docker-compose.yml`**: easyrelay behind Caddy, parameterised by a single
+  `RELAY_DOMAIN`, tested in CI. This is the documented default path to a public relay and the
+  substance of [ADR-0009](adr/0009-deployment-experience.md).
+- **A systemd unit** shipped as an artifact rather than only pasted in the documentation.
+- **`easyrelay doctor`**: validates the configuration, checks the data directory is writable,
+  reports map-size headroom, and states whether the relay is reachable from outside loopback.
 
 ### Exit criteria
 
@@ -146,6 +180,15 @@ The phase that makes the relay safe to expose to the open internet.
   targeting another author's event, which must be ignored.
 - The backup and restore runbook in [operations.md](operations.md) has been executed end to end
   against a running relay.
+- **The timed first-run test.** Someone who has not seen the project before, given only the
+  README and a domain name pointed at a fresh machine, reaches a working `wss://` relay that a
+  real client connects to, in under ten minutes, without reading any other document and without
+  asking a question. Run against a real person for each release, and treated as a failing test
+  when it fails — the fix is the documentation or the defaults, not the tester.
+- A published binary runs on a machine with no toolchain, no LMDB and no `libsecp256k1`
+  installed.
+- `docker compose up -d` with only `RELAY_DOMAIN` set yields a relay reachable over `wss://`
+  with a valid certificate.
 
 ---
 
@@ -228,6 +271,13 @@ implementation exists; this is a port of the C++ reference.
 ---
 
 ## Ordering rationale
+
+Ease of deployment is spread across Phases 1 to 3 rather than concentrated, because each of its
+pieces depends on the phase it sits in and on nothing later. Zero-config start is free in Phase
+1 and expensive to retrofit afterwards. Defaults cannot be declared correct before Phase 2 knows
+what the settings are. Distribution artifacts are meaningless before Phase 3 makes the relay
+safe to expose. Bolting all of it on at the end would mean shipping a relay whose defaults were
+chosen when nobody was thinking about the operator.
 
 Persistence precedes hardening because rate limits and policy are meaningless against a relay
 that loses everything on restart. Hardening precedes advanced NIPs because a relay exposed to

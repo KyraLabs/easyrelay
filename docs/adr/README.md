@@ -15,5 +15,6 @@ the outcome of a validation that the record itself scheduled.
 | [0006](0006-cryptography.md) | BIP-340 via `libsecp256k1`, never `std.crypto` | Accepted |
 | [0007](0007-configuration-format.md) | Configuration file format | Proposed |
 | [0008](0008-store-abstraction-boundary.md) | A first-party `Store` interface as an isolation boundary | Accepted |
+| [0009](0009-deployment-experience.md) | Zero-configuration defaults, TLS via a bundled proxy | Accepted |
 
 Use [0000-template.md](0000-template.md) for new records.
