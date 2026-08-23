@@ -1,0 +1,15 @@
+.{
+    .name = .easyrelay,
+    .version = "0.0.0-dev",
+    // Globally unique package id, generated once. Changing it has security and trust implications.
+    .fingerprint = 0x8609f37b9c403b70,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "LICENSE",
+        "README.md",
+    },
+}
