@@ -34,7 +34,8 @@ anything is built on top of it.
 ### Deliverables
 
 - `build.zig` and `build.zig.zon` with every dependency pinned to an exact release.
-- `.zigversion` pinning Zig `0.16.0`, and a mise configuration that matches it.
+- `.zigversion` pinning Zig `0.16.0`, a matching `mise.toml`, and `scripts/check-toolchain.sh`
+  guarding the two against `build.zig.zon`.
 - A trivial `main.zig`, a test target, and `zig fmt` compliance.
 - CI running format check, build and tests on every push.
 - **A validation spike against `zig-nostr/nostr`**, discarded afterwards, answering:

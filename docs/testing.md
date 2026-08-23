@@ -64,7 +64,8 @@ against what clients actually do.
 
 ### Fuzzing
 
-Zig's built-in fuzzer, over every parser that touches untrusted bytes:
+Zig's built-in fuzzer, driven through the test runner with `zig build test --fuzz`, over every
+parser that touches untrusted bytes:
 
 - JSON message decoding.
 - Event decoding and canonical re-serialization.

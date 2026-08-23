@@ -6,12 +6,16 @@
 something; the version is not a floor, it is a pin. See
 [ADR-0001](adr/0001-language-and-toolchain.md).
 
-With [mise](https://mise.jdx.dev):
+With [mise](https://mise.jdx.dev), which reads `mise.toml`:
 
 ```bash
 mise install
 zig version   # must print 0.16.0
 ```
+
+The pin appears in three files that have to agree — `.zigversion`, `mise.toml`, and
+`minimum_zig_version` in `build.zig.zon`. `./scripts/check-toolchain.sh` enforces that and CI
+runs it, so drift fails a pull request instead of surfacing later as an unrelated build error.
 
 Nothing else is required. `libsecp256k1` and LMDB are vendored and compiled from source by the
 dependency graph, and Zig ships its own C compiler, so there are no system packages to install
@@ -19,21 +23,32 @@ and no `pkg-config` to satisfy.
 
 ## Commands
 
+Available now:
+
 ```bash
-zig build              # build the relay
-zig build run          # build and run with ./easyrelay.zon
-zig build test         # unit, vector and conformance tests
-zig build test --summary all
-zig fmt --check .      # formatting gate, same as CI
-zig build bench        # benchmark harness
-zig build fuzz         # fuzz targets
+zig build                    # build the relay into zig-out/bin/
+zig build run                # build and run it
+zig build test               # run all tests
+zig build test --summary all # ... with a per-step summary
+zig build check              # type-check without producing artifacts (fast editor diagnostics)
+zig fmt --check .            # formatting gate, identical to CI
+./scripts/check-toolchain.sh # verify the Zig pin agrees across all three files
 ```
 
-Run a single test file while iterating:
+Run a subset of tests while iterating:
 
 ```bash
 zig build test -Dtest-filter="replaceable"
 ```
+
+Fuzz a target once the fuzz tests exist (Phase 1 onward). Zig's fuzzer is driven through the
+test runner rather than a separate step:
+
+```bash
+zig build test --fuzz
+```
+
+Added by later phases: `zig build bench` (the harness in `bench/`, Phase 6).
 
 ## Dependencies
 

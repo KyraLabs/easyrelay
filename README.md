@@ -2,9 +2,9 @@
 
 A [Nostr](https://github.com/nostr-protocol/nips) relay written in [Zig](https://ziglang.org).
 
-**Status: pre-alpha.** There is no working relay yet. This repository currently contains the
-design documentation only. See the [roadmap](docs/roadmap.md) for what is being built and in
-which order.
+**Status: pre-alpha.** There is no working relay yet. What exists is the project scaffold —
+build, tests, CI, release automation — and the design documentation. See the
+[roadmap](docs/roadmap.md) for what is being built and in which order.
 
 ## What it is
 
@@ -103,6 +103,20 @@ needs a container runtime.
 [mise](https://mise.jdx.dev). Still no system packages: the dependencies are vendored and
 compiled from source, and Zig ships its own C compiler. See
 [development.md](docs/development.md).
+
+## Contributing
+
+Start with [CONTRIBUTING.md](CONTRIBUTING.md). In short:
+
+```bash
+mise install     # pinned Zig 0.16.0
+zig build test
+```
+
+- [Development guide](docs/development.md) — commands, layout, code conventions
+- [Code of Conduct](CODE_OF_CONDUCT.md)
+- [Security policy](SECURITY.md) — report vulnerabilities privately, never as an issue
+- [Changelog](CHANGELOG.md)
 
 ## License
 
