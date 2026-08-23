@@ -74,8 +74,8 @@ Added by later phases: `zig build bench` (the harness in `bench/`, Phase 6).
 
 ## Dependencies
 
-Declared in `build.zig.zon`, every one pinned to an exact immutable revision with its hash. No
-branch references, no `main`.
+Declared in `build.zig.zon`, every one pinned to an exact revision with its content hash — a
+release tag where upstream publishes one. No branch references, no `main`.
 
 | Dependency | Purpose | Record |
 | --- | --- | --- |
