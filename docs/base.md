@@ -1,0 +1,92 @@
+# Relays de Nostr en Zig: ¿existen, es viable construir uno completo y qué se necesita?
+
+## TL;DR
+- **Sí existen relays de Nostr escritos en Zig, y más de uno.** El más maduro y activo es **Wisp** (privkeyio/wisp), un relay completo con almacenamiento LMDB que en agosto de 2026 va por la versión v0.5.11 e implementa 15 NIPs; también existe el experimental **mattn/zig-nostr-relay** (PostgreSQL, sin releases) y una librería de protocolo sólida, **zig-nostr/nostr**. El terreno ya está parcialmente desbrozado.
+- **Hacer un relay completo en Zig es realista hoy**, pero el punto de dolor no es la criptografía (se resuelve trivialmente enlazando la libsecp256k1 de C vía `@cImport`) sino la inmadurez del ecosistema de red/concurrencia: el nuevo modelo `std.Io` llegó con Zig 0.16 (lanzado el 14 de abril de 2026) y aún está estabilizándose, y el lenguaje sigue sin llegar a 1.0, con breaking changes en cada versión.
+- **La recomendación es imitar la arquitectura de strfry/nostrdb (LMDB + índices a medida)** en lugar de un backend SQL, usar `websocket.zig` de karlseguin sobre un thread-pool para el MVP, y avanzar por fases: primero NIP-01 en memoria, luego persistencia LMDB e índices, y solo al final los NIPs avanzados (42, 45, 50, 77).
+
+## Key Findings
+
+### 1. Implementaciones existentes en Zig
+Contra la intuición de que "nadie ha hecho esto todavía", el ecosistema Zig-Nostr ya tiene varios proyectos, aunque todos son pequeños en términos de estrellas de GitHub:
+
+- **Wisp (privkeyio/wisp)** — el relay en Zig más completo y activo. Almacenamiento LMDB (sin base de datos externa), binario único, ~11 MB de RAM en reposo, "spider mode" que sincroniza notas de la gente que sigues, import/export JSONL y métricas Prometheus en `GET /metrics`. Implementa los NIPs 1, 2, 9, 11, 13, 16, 33, 40, 42, 45, 50, 65, 70, 77 y 86. Requiere Zig 0.16.0 y enlaza `liblmdb-dev`, `libsecp256k1-dev` y `libssl-dev`. En agosto de 2026 va por la release v0.5.11 (julio de 2026), con 22 releases y ~181 commits: está en desarrollo activo. Tiene pocas estrellas (~13), lo que indica un proyecto joven pero real. Publica benchmarks propios (25.600 eventos/s, p99 0,28 ms, 11 MB RSS) afirmando ~9× el throughput de strfry, pero son cifras auto-reportadas con su propia herramienta nostr-bench y medidas en modo `sync = none` (no duradero); su modo por defecto es `sync = meta` (duradero), y strfry/nostr-rs-relay escriben de forma duradera por defecto, así que la comparación directa no es del todo equivalente.
+- **mattn/zig-nostr-relay** — relay experimental de Yasuhiro Matsumoto (mattn). Usa PostgreSQL vía `pg.zig`, `websocket.zig` de karlseguin y `struct-env` para configuración. No tiene releases (versión "0.0.0"), ~12 estrellas, y parece un proyecto de exploración más que de producción (los relays mantenidos de mattn son el de Go y el de C++ "cagliostr"). Sirve como referencia de "cómo cablear las piezas" en Zig.
+- **zig-nostr/nostr** — no es un relay sino la **librería de protocolo Nostr para Zig**, descrita por sus autores como "a foundational Nostr protocol library for Zig — keys and signatures, events, relay transport with the outbox model, a zero-copy local-first event store, and the NIP-46 remote-signing protocol" (análoga a rust-nostr). El estado de versión es ambiguo entre fuentes: el README/GitHub describe el proyecto como **"Status: pre-alpha (v0.3.5)"**, mientras que la copia en vivo consultada más recientemente indicaba v0.12.0 ("early"); en cualquier caso es un proyecto **activo pero pre-1.0** cuya API puede cambiar. Tiene ~8 estrellas. Aporta lo más difícil: "secp256k1 keys and BIP-340 Schnorr signatures via bitcoin-core's libsecp256k1, passing the full official test-vector suite (19/19)", el modelo de evento NIP-01 con hashing canónico del id, NIP-19 bech32, NIP-06, NIP-49, NIP-44, NIP-46, NIP-42 y NIP-65, transporte WebSocket cliente, y un **event store local zero-copy sobre LMDB** modelado según nostrdb. Vendoriza y compila libsecp256k1 y LMDB desde fuente (no requiere paquetes de sistema). No es un relay servidor, pero su store y su cripto son directamente reutilizables.
+- **nostr-noop-relays (akiomik)** — colección de relays "noop" mínimos para comparar lenguajes/frameworks; incluye una implementación en Zig usando `zap`. Es un proof-of-concept para medir overhead mínimo, no un relay funcional.
+
+Conclusión: **sí hay relays en Zig** (Wisp es usable hoy), y además existe una librería de protocolo (zig-nostr/nostr) que resuelve la criptografía y el modelo de evento, más un binding libsecp256k1 orientado a Ethereum (jsign/zig-eth-secp256k1) reutilizable.
+
+### 2. Estado del ecosistema Zig para un relay (2026)
+- **Versión del lenguaje.** La estable en 2026 es **Zig 0.16.0, lanzada el 14 de abril de 2026** (según el anuncio oficial en ziglang.org, "This release features 8 months of work: changes from 244 different contributors, spread among 1183 commits" y "debuts I/O as an Interface"; 0.15.2 fue de octubre de 2025). Zig sigue sin ser 1.0 deliberadamente y **hay breaking changes en cada release**; hay que fijar la versión del compilador por proyecto. El cambio más disruptivo de 0.16 es precisamente `std.Io`: se eliminaron `GenericReader`, `AnyReader` y `FixedBufferStream`, se rediseñó por completo cómo se abstrae la I/O, y APIs específicas del SO como buena parte de `std.posix` fueron retiradas —una migración no trivial que ya afectó a proyectos grandes como ghostty.
+- **Servidores WebSocket.** La opción de facto es **`websocket.zig` de karlseguin** (480 estrellas y 71 forks según GitHub, la más usada), que ahora es no-bloqueante en Linux/macOS/BSD y garantiza procesar un solo mensaje por conexión a la vez. Se integra con `http.zig` (mismo autor). Alternativa: **`zap`** (wrapper de la C facil.io, muy robusto pero fijado a Zig 0.13 y sin Windows). `std.http` de la stdlib trae servidor pero históricamente sin WebSocket servidor completo.
+- **Criptografía.** `std.crypto` de Zig **no** trae Schnorr/BIP-340 listo para Nostr (tiene ed25519, SHA-256, y primitivas de curva secp256k1 pero con bugs históricos reportados). La ruta correcta y probada es **enlazar la libsecp256k1 de bitcoin-core vía `@cImport`**, exactamente lo que hacen tanto zig-nostr/nostr como Wisp. SHA-256 sí está nativo y listo en `std.crypto`.
+- **JSON.** `std.json` existe, pero el problema real es la **serialización canónica que exige NIP-01** para calcular el id: hay que emitir `[0,pubkey,created_at,kind,tags,content]` en UTF-8, sin espacios, con reglas de escape muy concretas (solo se escapan `\n`, `\"`, `\\`, `\r`, `\t`, `\b`, `\f` y el resto de caracteres van verbatim). El serializador estándar no garantiza esto, así que casi siempre hay que escribir un serializador a medida para el id.
+- **Bases de datos.** Hay bindings maduros de **SQLite** (zqlite.zig de karlseguin, ya con soporte Zig 0.16; y vrischmann/zig-sqlite) y de **LMDB** (nDimensional/zig-lmdb con release para Zig 0.16, lithdew/lmdb-zig, Syndica/lmdb-zig). LMDB es la elección natural si se quiere imitar a strfry/nostrdb.
+- **Async/concurrencia.** Este es el punto crítico. Zig **eliminó** el async/await antiguo y lo está reintroduciendo con la interfaz **`std.Io`**, que llegó en 0.16: se pasa un `Io` como parámetro igual que un `Allocator`, resolviendo el problema del "color de función". Según daily.dev, "A new std.Io interface supports both threaded and event-driven backends (io_uring for Linux, GCD for macOS), removing the need for function coloring." Pero el backend `Io.Threaded` (thread pool) es el único feature-complete; `Io.Evented` (event loop con io_uring/GCD) es **experimental** en 0.16. Para escalar a miles de conexiones ya, existe **`zio` de lalinsky**, un runtime async (coroutines M:N sobre io_uring/epoll/kqueue) que implementa `std.Io`, de modo que el código escrito contra `std.Io` corre sin cambios sobre él.
+
+### 3. Qué requiere un relay de Nostr completo
+Un relay es, en el fondo, un servidor WebSocket que valida eventos firmados y responde a filtros de suscripción. La especificación esencial es **NIP-01** (github.com/nostr-protocol/nips/blob/master/01.md); casi todo lo demás es opcional.
+
+**Estructura del evento (NIP-01):** un JSON con `id`, `pubkey`, `created_at`, `kind`, `tags`, `content`, `sig`. El `id` es el SHA-256 de la serialización canónica del array `[0,pubkey,created_at,kind,tags,content]`; el `sig` es una firma Schnorr BIP-340 sobre ese id. El relay debe recalcular el id y verificar la firma antes de aceptar nada.
+
+**Mensajes del protocolo:** cliente→relay son `EVENT` (publicar), `REQ` (suscribirse con filtros) y `CLOSE` (cerrar suscripción); relay→cliente son `EVENT`, `OK` (aceptado/rechazado con motivo), `EOSE` (fin de eventos almacenados), `CLOSED` (suscripción terminada) y `NOTICE` (mensaje legible). Los filtros combinan `ids`, `authors`, `kinds`, tags como `#e`/`#p`, `since`, `until` y `limit`. Los valores de `ids`, `authors`, `#e` y `#p` deben ser hex de 64 caracteres en minúsculas.
+
+**Semántica de kinds:** el relay debe tratar de forma distinta los eventos regulares (se almacenan todos), reemplazables (solo se guarda el más reciente por pubkey+kind), efímeros (no se persisten, solo se retransmiten) y direccionables/parametrizados-reemplazables (se guarda el más reciente por pubkey+kind+tag `d`). Manejar mal esto rompe la interoperabilidad.
+
+**NIPs adicionales (esenciales vs opcionales).** Esenciales para un relay útil: **NIP-11** (documento de información del relay, servido con cabecera `Accept: application/nostr+json`, que anuncia `supported_nips`, `limitation`, etc.) y **NIP-09** (borrado). Muy recomendados: **NIP-42** (autenticación mediante evento efímero kind 22242 con tags de relay y challenge), **NIP-40** (expiración), **NIP-13** (proof-of-work anti-spam), **NIP-70** (eventos protegidos). Avanzados/opcionales según ambición: **NIP-45** (COUNT), **NIP-50** (búsqueda), **NIP-77** (sincronización Negentropy entre relays) y **NIP-86** (API de gestión). Wisp ya cubre casi todos estos.
+
+**Modelo de datos e indexación.** Para que los filtros sean rápidos hacen falta índices por autor, por kind, por tag, y por `created_at` (orden temporal). La estrategia de strfry —copiada por nostrdb— es guardar el evento serializado en LMDB (acceso zero-copy vía mmap) y mantener índices secundarios a medida (no un motor SQL), porque las consultas de Nostr son un subconjunto acotado que no necesita un planificador SQL genérico. strfry envuelve LMDB con una capa (RasgueaDB) para poder hacer range-scans usando datos del value como índice, y usa un único hilo escritor porque LMDB tiene lock exclusivo de escritura.
+
+**Consideraciones operativas.** Rate limiting, límite de tamaño de evento (strfry usa `maxEventSize = 65536` bytes por defecto), rechazo de eventos con `created_at` demasiado futuro/antiguo, políticas de spam (plugins de write-policy), TLS mediante reverse proxy (Caddy/nginx), backups del directorio de datos y monitoreo (métricas Prometheus).
+
+### 4. Relays de referencia para estudiar
+- **strfry (C++, LMDB, negentropy)** — la referencia de rendimiento. Multi-proceso con un único hilo escritor, índices a medida sobre LMDB, y la característica estrella: reconciliación de conjuntos Negentropy (NIP-77) para sincronizar relays con mínimo ancho de banda. **Es el mejor modelo arquitectónico a imitar en Zig.** Es también, junto a nostr-rs-relay, uno de los relays más desplegados de la red.
+- **nostrdb (C, LMDB)** — no es un relay sino una librería embebible "SQLite para Nostr", copia casi exacta del diseño de índices de strfry. Como está en C, es directamente consumible desde Zig con `@cImport`; podría usarse como motor de almacenamiento.
+- **nostr-rs-relay (Rust, SQLite)** — uno de los relays más desplegados del mundo. SQLite con pool de conexiones (1 escritor, varios lectores), pensado para VPS pequeños y Raspberry Pi. Buen modelo si se prefiere SQL.
+- **rnostr (Rust, LMDB)** — alto rendimiento, con extensiones para NIP-45 y NIP-50; construido sobre una librería nostr-relay reutilizable.
+- **khatru (Go) y relayer (Go)** — frameworks de fiatjaf: aportas tu `StoreEvent`/`QueryEvents` y el framework maneja el protocolo. khatru se apoya en la librería `eventstore` (LMDB, Bolt, SQLite, Postgres, MMM). Excelente para ver cómo se abstrae la lógica del relay a una interfaz `Store`.
+- **nostream (TypeScript, Postgres)** — production-ready, con soporte de relay de pago.
+- **haven/Chorus/Citrine** — relays "soberanos" personales (inbox/outbox, web-of-trust).
+
+Para una implementación en Zig, el mejor modelo es **strfry/nostrdb**: LMDB + índices a medida encajan perfectamente con la filosofía de Zig (control de memoria, cero dependencias pesadas, binario único) y evitan arrastrar un motor SQL. De hecho, tanto Wisp como zig-nostr/nostr ya tomaron esa decisión.
+
+### 5. Viabilidad y plan
+**¿Es realista?** Sí. La criptografía —que parecería el mayor obstáculo— está resuelta porque la interoperabilidad con C es trivial en Zig (`@cImport` sobre libsecp256k1, exactamente lo que hacen los proyectos existentes). SHA-256 es nativo. Hay bindings maduros de LMDB y SQLite, y `websocket.zig` es una base sólida.
+
+**Puntos de dolor reales:**
+1. **Concurrencia en transición.** `std.Io` es nuevo (0.16), su backend evented es experimental, y para miles de conexiones concurrentes hay que decidir entre thread-pool (simple, funciona ya) o adoptar `zio` (io_uring, más escalable pero más joven).
+2. **Breaking changes del lenguaje.** Zig no es 1.0; cada release rompe cosas (la migración a 0.16 eliminó los antiguos readers/writers y reorganizó la I/O). Hay que fijar la versión del compilador.
+3. **JSON canónico.** Casi seguro requiere un serializador propio para el id, no basta `std.json`.
+4. **Ecosistema pequeño.** Menos librerías, menos ejemplos, más código propio.
+
+**Ventajas:** interop C trivial, control total de memoria (sin GC, latencias predecibles), binario único fácil de desplegar, y rendimiento comparable a C/C++/Rust.
+
+**Roadmap por fases sugerido:**
+- **Fase 0 – MVP en memoria (baja complejidad).** Servidor WebSocket con `websocket.zig`, parseo de `EVENT`/`REQ`/`CLOSE`, verificación de firma Schnorr (libsecp256k1 vía cImport o reusando zig-nostr/nostr), almacenamiento en un `HashMap` en memoria, respuestas `OK`/`EOSE`/`EVENT`. Cubre NIP-01. Esto es un fin de semana o dos para un programador intermedio.
+- **Fase 1 – Persistencia e índices (complejidad media).** LMDB como store, índices por autor/kind/tag/created_at, semántica correcta de kinds (regulares/reemplazables/efímeros/direccionables), NIP-11. Aquí está el grueso del trabajo real.
+- **Fase 2 – Robustez operativa (media).** Rate limiting, límites de tamaño, NIP-09 (borrado), NIP-40 (expiración), NIP-42 (auth), reverse proxy TLS, métricas.
+- **Fase 3 – Avanzado (alta).** NIP-45 (COUNT), NIP-50 (búsqueda full-text), NIP-13 (PoW), NIP-70, y finalmente NIP-77 (Negentropy) que es la parte más compleja pero también la más diferenciadora.
+- **Fase 4 – Escalado.** Migrar de thread-pool a un runtime evented (zio/io_uring) si se necesita manejar decenas de miles de conexiones.
+
+Un atajo pragmático: **empezar sobre zig-nostr/nostr** (que ya te da cripto + modelo de evento + store LMDB) y construir la capa de servidor/suscripciones encima, en lugar de partir de cero.
+
+## Recommendations
+1. **Antes de escribir código, fija cuatro decisiones:** versión de Zig (0.16.0 estable), librería WebSocket (`websocket.zig`), backend de almacenamiento (LMDB, imitando strfry), y estrategia de concurrencia inicial (thread-pool, no evented todavía). Estas decisiones condicionan todo lo demás.
+2. **Estudia el código de Wisp y de zig-nostr/nostr primero.** Wisp demuestra que un relay completo en Zig es posible y te da un mapa de dependencias; zig-nostr/nostr te da cripto y store reutilizables. No reinventes la firma Schnorr.
+3. **Para la criptografía, enlaza libsecp256k1 de C** vía `@cImport`; no intentes una implementación Schnorr nativa ni confíes en `std.crypto` para secp256k1.
+4. **Escribe un serializador canónico propio para el id** desde el día uno y testéalo contra vectores de eventos reales, porque un id mal calculado hace que ningún cliente acepte tus eventos.
+5. **Sigue el roadmap por fases:** no toques NIP-77/Negentropy hasta tener NIP-01 + persistencia + índices sólidos.
+6. **Umbrales que cambian la estrategia:** si el objetivo es un relay personal/comunitario (cientos de conexiones), el thread-pool basta; si apuntas a decenas de miles de conexiones concurrentes, planifica migrar a `zio`/io_uring. Si no quieres lidiar con la inmadurez de Zig, strfry (C++) o nostr-rs-relay (Rust) siguen siendo las opciones production-ready hoy.
+
+## Caveats
+- Todos los proyectos Zig-Nostr tienen **pocas estrellas (8–13)** y son jóvenes; no hay auditorías ni despliegues masivos conocidos, así que hay riesgo de bugs y de APIs cambiantes.
+- Los **benchmarks de Wisp son auto-reportados** con su propia herramienta y en modo no-duradero (`sync = none`); no son comparaciones independientes ni equivalentes a las de strfry/nostr-rs-relay en modo duradero.
+- El **estado de versión de zig-nostr/nostr es ambiguo entre fuentes** (el README indica "pre-alpha v0.3.5" mientras que una consulta en vivo más reciente mostró v0.12.0 "early"); en ambos casos es pre-1.0 y su API "may still change before 1.0".
+- El **estado de `std.Io`/async en Zig está en flujo**: el backend evented es experimental en 0.16 y puede cambiar en 0.17+. Cualquier decisión de concurrencia asumida hoy puede requerir reescritura.
+- Zig **no es 1.0**; espera breaking changes en cada release del compilador y de la stdlib.
+- No se pudo confirmar con exactitud la fecha del último commit ni la lista de NIPs de mattn/zig-nostr-relay (GitHub bloqueó esas páginas); se reporta como proyecto experimental sin releases, con PostgreSQL vía pg.zig y websocket.zig como dependencias confirmadas.
+
+---
+
+*Enlaces clave: especificación NIP-01 y todos los NIPs en github.com/nostr-protocol/nips · Wisp: github.com/privkeyio/wisp · librería: github.com/zig-nostr/nostr · relay experimental: github.com/mattn/zig-nostr-relay · websocket.zig: github.com/karlseguin/websocket.zig · LMDB para Zig: github.com/nDimensional/zig-lmdb · strfry (referencia): github.com/hoytech/strfry · nostrdb: github.com/damus-io/nostrdb · runtime async zio: github.com/lalinsky/zio · BIP-340 Schnorr: github.com/bitcoin/bips/blob/master/bip-0340.mediawiki*
