@@ -138,8 +138,13 @@ requirements for the storage engine, not query-performance tuning.
 modes exist and may be exposed as configuration, but they are never the default and never the
 basis of a published benchmark. See [testing.md](testing.md#benchmarks).
 
-**Backup.** The data directory can be copied while the relay runs, using LMDB's consistent
-snapshot, without stopping writes. Procedure in [operations.md](operations.md).
+**The store is a single file, not a directory.** The environment is opened with
+`MDB_NOSUBDIR`, so the store is one `.mdb` file plus its lock file. easyrelay still takes a
+data *directory* in configuration and places the file inside it, which keeps room for the
+search index and any future sibling data.
+
+**Backup.** The store can be copied while the relay runs, using LMDB's consistent snapshot,
+without stopping writes. Procedure in [operations.md](operations.md).
 
 ## References
 

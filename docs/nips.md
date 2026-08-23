@@ -11,7 +11,7 @@ Status values: `supported`, `in progress`, `planned`, `out of scope`.
 | NIP | Name | Status | Phase | Notes |
 | --- | --- | --- | --- | --- |
 | [01](https://github.com/nostr-protocol/nips/blob/master/01.md) | Basic protocol flow | planned | 1–2 | Events, filters, subscriptions, kind semantics. The whole of [protocol.md](protocol.md). |
-| [09](https://github.com/nostr-protocol/nips/blob/master/09.md) | Event deletion | planned | 3 | Author-scoped only; tombstones prevent reinstatement. |
+| [09](https://github.com/nostr-protocol/nips/blob/master/09.md) | Event deletion | planned | 2 | Author-scoped only; tombstones prevent reinstatement. Implemented by the storage dependency and [verified in Phase 0](research/2026-08-phase-0-validation.md#q2--deletion-is-complete-expiration-does-not-exist), so it lands with persistence rather than with hardening. |
 | [11](https://github.com/nostr-protocol/nips/blob/master/11.md) | Relay information document | planned | 2 | Served on `Accept: application/nostr+json`. Generated from configuration and from this table. |
 | [13](https://github.com/nostr-protocol/nips/blob/master/13.md) | Proof of work | planned | 4 | Configurable minimum difficulty; validates the committed `nonce` tag, not just leading zeroes. |
 | [40](https://github.com/nostr-protocol/nips/blob/master/40.md) | Expiration timestamp | planned | 3 | Reaper plus query-time filtering. |

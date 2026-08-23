@@ -49,7 +49,22 @@ of work that is not what makes this relay worth building. Retained as the docume
 
 **`std.http`.** No complete server-side WebSocket support. Not an option.
 
+## Outcome of the Phase 0 spike (2026-08-23)
+
+**Go.** The library compiled against Zig 0.16 on the first attempt despite its experimental
+label, held **3000 concurrent connections**, and echoed every message byte-for-byte and in order
+across roughly 13,000 connection lifecycles — zero dropped frames, zero corrupted frames, zero
+failed connections. Memory tracks peak concurrency rather than connections served, settling at
+about 3 KB per connection and staying flat once the high-water mark is reached.
+
+The fallback this record kept in reserve — a first-party RFC 6455 layer — stays unused.
+
+One caveat the spike did not clear: it exercised the happy path at scale, not malformed frames,
+hostile fragmentation, slow-loris handshakes, or a stalled reader. Those are Phase 3 work and
+are where an experimental transport is most likely to disappoint. The fallback is not deleted
+until they pass.
+
 ## Revisit when
 
-The Phase 0 transport spike reports, or `websocket.zig` marks its 0.16 support stable, or the
-Phase 6 migration finds it incompatible with the evented runtime.
+Phase 3's adversarial transport tests report, or `websocket.zig` marks its 0.16 support stable,
+or the Phase 6 migration finds it incompatible with the evented runtime.
