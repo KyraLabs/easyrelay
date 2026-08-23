@@ -87,13 +87,24 @@ load-bearing.
 ```zig
 // Shape only; the real signatures are settled in Phase 1.
 pub const Store = struct {
-    put: fn (event: Event) StoreError!PutResult,      // handles kind semantics
+    put: fn (event: Event) StoreError!PutResult,       // handles kind semantics
+    putBatch: fn (events: []const Event) StoreError![]PutResult, // one transaction
     query: fn (filters: []const Filter, out: *Sink) StoreError!void,
     count: fn (filters: []const Filter) StoreError!u64,
     delete: fn (target: EventId, by: PubKey) StoreError!bool,
-    expire: fn (now: i64) StoreError!usize,           // NIP-40 reaper
+    expire: fn (now: i64) StoreError!usize,            // NIP-40 reaper
 };
 ```
+
+`putBatch` is not an optimisation to add later. The
+[Phase 0 spike](research/2026-08-phase-0-validation.md#q4--the-write-transaction-boundary-no-and-this-is-the-important-one)
+measured one durable transaction per event at 92 events/s against 169,491 events/s for a single
+batched transaction — a factor of 1,842, entirely `fsync` per commit. The writer thread drains
+its queue in batches for that reason, and the interface has to admit it.
+
+`query` takes a *list* of filters because a NIP-01 `REQ` carries several, OR-ed, and the
+subscription's `limit` applies across the merged result rather than per filter. Getting that
+wrong returns plausible but incorrect events.
 
 ### Storage
 

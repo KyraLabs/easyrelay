@@ -22,5 +22,7 @@ versions may contain breaking changes; they will always be listed under `Changed
 - Community documentation: contributing guide, security policy, and code of conduct.
 - Dependabot updates for GitHub Actions, grouped and titled to satisfy the Conventional
   Commits check.
+- Phase 0 validation spike: a written go/no-go on the storage and transport dependencies, with
+  measurements, and the documentation corrections it forced.
 
 [Unreleased]: https://github.com/KyraLabs/easyrelay/commits/main

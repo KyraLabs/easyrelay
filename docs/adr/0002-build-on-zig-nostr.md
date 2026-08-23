@@ -78,7 +78,30 @@ is no-go, since it would be less work than a first-party schema. Not chosen now 
 a C store with a Zig protocol layer means two event representations and a conversion at the
 boundary, on the hot path.
 
+## Outcome of the Phase 0 spike (2026-08-23)
+
+The spike this record made the decision conditional on has reported: **go**. Full evidence in
+[the spike document](../research/2026-08-phase-0-validation.md).
+
+What the spike found better than assumed: NIP-09 deletion is complete and correct, the
+replacement tie-break and kind classification match [protocol.md](../protocol.md) exactly, and
+the query planner is already the bounded newest-first design [storage.md](../storage.md)
+specifies — a `limit: 500` query over 50,000 events examined exactly 500 index entries.
+
+What it found worse: writes commit one transaction per event, which is **92 events/s** durably
+on disk against **169,491 events/s** batched. The batch API that closes that gap skips the
+protocol semantics, so the library currently offers a correct path too slow for production and
+a fast path that is incorrect. No public API accepts an externally-owned transaction, so
+easyrelay's own indexes cannot commit atomically with the event. `OpenOptions` exposes neither
+`max_readers` nor the sync mode.
+
+The decision stands, with three upstream contributions attached — a protocol-aware batch
+ingest, caller-owned transactions, and the two missing options. They are additive and small,
+and far cheaper than the alternative this record rejected. If upstream declines them, easyrelay
+vendors the patch; [ADR-0008](0008-store-abstraction-boundary.md) is what keeps that contained.
+
 ## Revisit when
 
-The Phase 0 validation spike reports, or `zig-nostr/nostr` publishes a breaking release, or the
-project shows six months without maintenance activity.
+The three upstream conditions above are refused or go unanswered long enough to block Phase 2,
+or `zig-nostr/nostr` publishes a breaking release, or the project shows six months without
+maintenance activity.

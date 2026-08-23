@@ -28,6 +28,10 @@ calcified. [ADR-0009](adr/0009-deployment-experience.md) fixes what it commits t
 
 ## Phase 0 — Foundation and validation spike
 
+> **Complete.** Both spikes returned **go**. The verdict, the evidence and the three conditions
+> attached to the store are in the
+> [Phase 0 validation spike](research/2026-08-phase-0-validation.md).
+
 The purpose of this phase is to find out whether the plan's central bet is sound **before**
 anything is built on top of it.
 
@@ -112,6 +116,18 @@ A relay that a real client can publish to and read from, with no persistence.
 - NIP-11 relay information document, generated from configuration and from
   [nips.md](nips.md), served on `Accept: application/nostr+json`.
 - Configuration file loading, which closes [ADR-0007](adr/0007-configuration-format.md).
+- **Batched writes from the first commit, not as a later optimisation.** The writer thread
+  drains its queue into one transaction per batch. Phase 0 measured 92 events/s for one durable
+  transaction per event against 169,491 events/s batched; building on the per-event path and
+  optimising later would mean building on something that cannot carry traffic. If the upstream
+  dependency has not gained a protocol-aware batch ingest by then, easyrelay vendors the patch —
+  see the [spike's conditions](research/2026-08-phase-0-validation.md#verdict-and-conditions).
+- **Multi-filter `REQ` handling.** The storage dependency queries one filter at a time; a `REQ`
+  carries several, OR-ed. Results are merged, deduplicated by id, and the subscription's `limit`
+  is applied **across** the merge. Applying it per filter returns the wrong events, so this gets
+  a conformance test rather than a comment.
+- **NIP-09 deletion**, which the storage dependency already implements and Phase 0 verified.
+  It arrives here with persistence rather than in Phase 3.
 - **A complete default set.** Every setting in [configuration.md](configuration.md) has a
   default correct for a real deployment, not merely one that avoids a crash. Defaults are a
   correctness surface from this point on and are reviewed as such.
@@ -134,6 +150,13 @@ A relay that a real client can publish to and read from, with no persistence.
   the same query against a 10k-event dataset. Flat-as-it-grows is the property being tested,
   not any absolute number.
 - The NIP-11 `supported_nips` array matches [nips.md](nips.md) exactly, checked by a test.
+- NIP-09 conformance tests pass, including a deletion request targeting another author's event,
+  which must be ignored, and a re-submission of a deleted event, which must be refused.
+- A `REQ` carrying several filters returns the union, without duplicates, with the
+  subscription's `limit` applied across the merge and selecting the globally newest events.
+- Sustained durable write throughput is measured and recorded. Phase 0 puts the unbatched
+  ceiling at 92 events/s and the batched figure at 169,491; anything close to the former means
+  the batching is not actually in the write path.
 - The relay starts and persists data with no configuration file present.
 - `easyrelay init` output, fed back in unmodified, produces byte-identical behaviour to running
   with no file at all. Verified by a test, because a drifting `init` template is worse than none.
@@ -148,9 +171,16 @@ The phase that makes the relay safe to expose to the open internet.
 ### Deliverables
 
 - Rate limiting per connection and per pubkey, with the write queue as the final backstop.
+- An I/O pool bounded below LMDB's 126-reader ceiling, which the storage dependency does not
+  expose a way to raise. Exceeding it fails roughly a third of reads — measured in
+  [Phase 0](research/2026-08-phase-0-validation.md#q1--concurrent-readers-with-a-single-writer-yes-with-a-hard-ceiling).
+- One `Signer` per I/O thread. The dependency's signer is not thread-safe for concurrent use of
+  a single instance.
+- Adversarial transport testing: malformed frames, hostile fragmentation, slow-loris handshakes,
+  and a client that stops reading. Phase 0 exercised the transport's happy path at 3000
+  connections but none of these, and an experimental transport is likeliest to disappoint here.
 - Enforced structural limits from [protocol.md](protocol.md#structural-limits), all
   configurable and all advertised in NIP-11 `limitation`.
-- NIP-09 event deletion with tombstones.
 - NIP-40 expiration: reaper task plus query-time filtering.
 - NIP-42 authentication (kind 22242), configurable to gate writes, reads, or both.
 - NIP-70 protected events.
@@ -177,8 +207,7 @@ The phase that makes the relay safe to expose to the open internet.
   limit, with relay memory flat throughout.
 - `SIGTERM` during sustained writes loses no acknowledged event: every event that received
   `OK true` is present after restart.
-- NIP-09, NIP-40, NIP-42 and NIP-70 conformance tests pass, including a deletion request
-  targeting another author's event, which must be ignored.
+- NIP-40, NIP-42 and NIP-70 conformance tests pass.
 - The backup and restore runbook in [operations.md](operations.md) has been executed end to end
   against a running relay.
 - **The timed first-run test.** Someone who has not seen the project before, given only the
@@ -257,7 +286,15 @@ implementation exists; this is a port of the C++ reference.
   what makes this a backend swap rather than a rewrite; see
   [ADR-0005](adr/0005-concurrency-model.md).
 - Connection sharding across cores.
-- Write batching: multiple events per LMDB transaction under load.
+
+Phase 0 surfaced a constraint this phase has to solve rather than discover: the storage
+environment is opened without `MDB_NOTLS`, so LMDB reader slots are bound to threads. A
+coroutine runtime that migrates a task between threads mid-transaction is not safe against that
+API, and no option exposes it. Either upstream gains the flag, or the writer and reader
+transactions stay pinned to their threads under the evented runtime.
+
+Write batching is no longer part of this phase — it moved to Phase 2, where the measurements
+showed it belongs.
 
 ### Exit criteria
 

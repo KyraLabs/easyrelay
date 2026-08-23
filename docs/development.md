@@ -21,6 +21,28 @@ Nothing else is required. `libsecp256k1` and LMDB are vendored and compiled from
 dependency graph, and Zig ships its own C compiler, so there are no system packages to install
 and no `pkg-config` to satisfy.
 
+### Hosts with an SFrame `crt1.o`
+
+On a distribution recent enough to ship SFrame unwind data in its C runtime — Arch with
+gcc 16 / binutils 2.47 is one — a native build that links libc fails in the linker:
+
+```
+error: fatal linker error: unhandled relocation type R_X86_64_PC64 at offset 0x1c
+    note: in .../crt1.o:.sframe
+```
+
+Zig 0.16's ELF linker cannot relocate the host's `.sframe` section. Pass an explicit target so
+Zig uses its own bundled start files instead:
+
+```bash
+zig build -Dtarget=x86_64-linux-musl      # static, and what releases ship
+zig build -Dtarget=x86_64-linux-gnu.2.39
+```
+
+This only bites once the build links libc, which happens as soon as the `zig-nostr` dependency
+lands. CI runs Ubuntu and is unaffected. Diagnosed in the
+[Phase 0 validation spike](research/2026-08-phase-0-validation.md#an-environment-finding-that-affects-everyone-on-this-machine).
+
 ## Commands
 
 Available now:

@@ -68,7 +68,22 @@ implementation with extra indirection, and it would fail at precisely the moment
 differential oracle for the property tests, and a single-implementation interface drifts into
 leaking without anything to catch it.
 
+## Outcome of the Phase 0 spike (2026-08-23)
+
+The spike returned **go** on the store, so the replacement schema this boundary protects against
+is not needed. The boundary is nonetheless doing more work than anticipated, not less.
+
+Two of the spike's findings land squarely on it. The dependency commits one transaction per
+event, so the interface needs a batch entry point that easyrelay's writer thread drives — a
+shape the dependency does not currently offer, and which the adapter has to provide. And the
+dependency queries a single filter while a `REQ` carries several, so merging, deduplicating and
+applying `limit` across the merge is adapter work too.
+
+Both are exactly what rule 2 of this record anticipated: the interface is defined by what the
+relay needs, and `lmdb.zig` absorbs the difference. If the upstream conditions in
+[ADR-0002](0002-build-on-zig-nostr.md) are declined and easyrelay vendors a patch, this boundary
+is what keeps that a one-file change.
+
 ## Revisit when
 
-The Phase 0 validation spike reports, or a measured cost on the read path shows the boundary
-forcing copies that cannot be designed away.
+A measured cost on the read path shows the boundary forcing copies that cannot be designed away.
