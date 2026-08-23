@@ -18,7 +18,7 @@ jobs:
     name: Format and toolchain pin
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check the Zig version pin is consistent
         run: ./scripts/check-toolchain.sh
@@ -42,7 +42,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - id: zig
         run: echo "version=$(tr -d '[:space:]' < .zigversion)" >> "$GITHUB_OUTPUT"
@@ -70,7 +70,7 @@ jobs:
           - x86_64-macos
           - aarch64-macos
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - id: zig
         run: echo "version=$(tr -d '[:space:]' < .zigversion)" >> "$GITHUB_OUTPUT"

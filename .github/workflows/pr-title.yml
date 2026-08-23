@@ -19,7 +19,7 @@ jobs:
       # CONTRIBUTING.md requires Conventional Commits. Squash merges take the PR title
       # as the commit message, so validating the title is what actually keeps the
       # history conformant.
-      - uses: amannn/action-semantic-pull-request@v5
+      - uses: amannn/action-semantic-pull-request@v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
