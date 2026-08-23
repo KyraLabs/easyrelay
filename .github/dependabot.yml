@@ -1,0 +1,23 @@
+version: 2
+
+updates:
+  # Zig's package manager is not a Dependabot ecosystem, so build.zig.zon is updated by
+  # hand — see docs/development.md. GitHub Actions is where unattended supply-chain drift
+  # actually accumulates, and it is covered here.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    groups:
+      actions:
+        patterns:
+          - "*"
+    # Pull request titles are validated against Conventional Commits and become the
+    # squashed commit message. Without this prefix Dependabot opens "Bump actions/..."
+    # and its own pull requests fail the check.
+    commit-message:
+      prefix: ci
