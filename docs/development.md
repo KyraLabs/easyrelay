@@ -110,9 +110,10 @@ See [architecture.md](architecture.md#repository-layout). Two rules the layout e
 
 - **Layers depend downward only.** `server/` may call `relay/`, `relay/` may call `storage/`,
   never the reverse. A storage backend does not know what a WebSocket is.
-- **No dependency type crosses the `Store` boundary.** `zig-nostr` types stay inside
-  `storage/lmdb.zig`. Everything above sees easyrelay's own types. See
-  [ADR-0008](adr/0008-store-abstraction-boundary.md).
+- **No store type crosses the `Store` boundary.** `zig-nostr`'s store types stay inside
+  `storage/lmdb.zig`; everything above sees easyrelay's own `Store` types. Its protocol
+  primitives — events, filters, messages, keys — are shared vocabulary and may appear anywhere.
+  See [ADR-0008](adr/0008-store-abstraction-boundary.md).
 
 ## Conventions
 
