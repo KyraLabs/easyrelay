@@ -3,7 +3,7 @@
 //! This module is the relay itself. `src/main.zig` is only the command-line
 //! front end, so that the relay can also be embedded.
 //!
-//! Nothing is implemented yet. See docs/roadmap.md for the order of work and
+//! Little is implemented yet. See docs/roadmap.md for the order of work and
 //! docs/architecture.md for where each piece is meant to live.
 
 const std = @import("std");
@@ -11,6 +11,15 @@ const std = @import("std");
 /// Semantic version of the relay, reported by `easyrelay --version` and by the
 /// NIP-11 relay information document once that exists.
 pub const version = "0.0.0-dev";
+
+/// The storage layer. Everything above it reaches stored events through
+/// `store.Store` and through nothing else; see
+/// docs/adr/0008-store-abstraction-boundary.md.
+pub const store = @import("storage/store.zig");
+
+test {
+    _ = store;
+}
 
 test "version is a non-empty semantic version" {
     try std.testing.expect(version.len > 0);
