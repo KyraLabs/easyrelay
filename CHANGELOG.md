@@ -20,5 +20,7 @@ versions may contain breaking changes; they will always be listed under `Changed
   configuration reference, operations runbook, test strategy, and nine architecture decision
   records.
 - Community documentation: contributing guide, security policy, and code of conduct.
+- Dependabot updates for GitHub Actions, grouped and titled to satisfy the Conventional
+  Commits check.
 
 [Unreleased]: https://github.com/KyraLabs/easyrelay/commits/main
