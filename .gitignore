@@ -1,6 +1,8 @@
 # Zig build output and caches
 .zig-cache/
 zig-out/
+# Dependencies, unpacked here by the build system from the hashes in build.zig.zon
+zig-pkg/
 
 # Relay runtime state
 /data/

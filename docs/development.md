@@ -39,8 +39,8 @@ zig build -Dtarget=x86_64-linux-musl      # static, and what releases ship
 zig build -Dtarget=x86_64-linux-gnu.2.39
 ```
 
-This only bites once the build links libc, which happens as soon as the `zig-nostr` dependency
-lands. CI runs Ubuntu and is unaffected. Diagnosed in the
+The build links libc now that the `zig-nostr` dependency has landed, so on such a host this is
+every native build, tests included. CI runs Ubuntu and is unaffected. Diagnosed in the
 [Phase 0 validation spike](research/2026-08-phase-0-validation.md#an-environment-finding-that-affects-everyone-on-this-machine).
 
 ## Commands
@@ -53,7 +53,7 @@ zig build run                # build and run it
 zig build test               # run all tests
 zig build test --summary all # ... with a per-step summary
 zig build check              # type-check without producing artifacts (fast editor diagnostics)
-zig fmt --check .            # formatting gate, identical to CI
+zig fmt --check --exclude zig-pkg .   # formatting gate, identical to CI
 ./scripts/check-toolchain.sh # verify the Zig pin agrees across all three files
 ```
 
@@ -74,14 +74,20 @@ Added by later phases: `zig build bench` (the harness in `bench/`, Phase 6).
 
 ## Dependencies
 
-Declared in `build.zig.zon`, every one pinned to an exact release with its hash. No branch
-references, no `main`.
+Declared in `build.zig.zon`, every one pinned to an exact revision with its content hash — a
+release tag where upstream publishes one. No branch references, no `main`.
 
 | Dependency | Purpose | Record |
 | --- | --- | --- |
 | [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr) | Event model, canonical serialization, Schnorr, filters, LMDB store | [ADR-0002](adr/0002-build-on-zig-nostr.md) |
 | [`websocket.zig`](https://github.com/karlseguin/websocket.zig) | WebSocket server | [ADR-0004](adr/0004-websocket-transport.md) |
 | [`zig-lmdb`](https://github.com/nDimensional/zig-lmdb) | Direct LMDB access, if the first-party schema is needed | [ADR-0003](adr/0003-storage-engine-lmdb.md) |
+
+`websocket.zig` is pinned to a **commit** rather than a tag: its Zig 0.16 support lives on
+`master`, and its only release tag predates it. The pin is immutable and hashed, which is what
+the rule is there for, but an upgrade is a deliberate choice of a newer commit rather than a
+version bump, and there are no release notes to read before taking it.
+[ADR-0004](adr/0004-websocket-transport.md) already tracks when to revisit that.
 
 Adding a dependency requires an ADR. The cost of a dependency in a pre-1.0 language ecosystem is
 paid on every compiler upgrade, and that cost belongs in a written decision.
@@ -90,6 +96,7 @@ Upgrading one:
 
 ```bash
 zig fetch --save=nostr https://github.com/zig-nostr/nostr/archive/refs/tags/vX.Y.Z.tar.gz
+zig fetch --save=websocket https://github.com/karlseguin/websocket.zig/archive/<commit>.tar.gz
 zig build test
 ```
 

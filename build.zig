@@ -10,9 +10,21 @@ pub fn build(b: *std.Build) void {
         "Only run tests whose name matches one of these filters",
     ) orelse &.{};
 
+    // The protocol primitives (event model, canonical serialization, Schnorr via
+    // libsecp256k1, filters) and the WebSocket transport. Both are recorded
+    // decisions: docs/adr/0002-build-on-zig-nostr.md and
+    // docs/adr/0004-websocket-transport.md.
+    const nostr = b.dependency("nostr", .{ .target = target, .optimize = optimize });
+    const websocket = b.dependency("websocket", .{ .target = target, .optimize = optimize });
+
     const mod = b.addModule("easyrelay", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "nostr", .module = nostr.module("nostr") },
+            .{ .name = "websocket", .module = websocket.module("websocket") },
+        },
     });
 
     const exe = b.addExecutable(.{

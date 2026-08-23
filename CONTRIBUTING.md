@@ -38,7 +38,7 @@ one — it is the densest summary of the project's conventions.
 Run what CI runs:
 
 ```bash
-zig fmt --check .
+zig fmt --check --exclude zig-pkg .
 zig build test
 ./scripts/check-toolchain.sh
 ```

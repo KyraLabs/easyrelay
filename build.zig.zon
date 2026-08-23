@@ -4,7 +4,16 @@
     // Globally unique package id, generated once. Changing it has security and trust implications.
     .fingerprint = 0x8609f37b9c403b70,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .nostr = .{
+            .url = "https://github.com/zig-nostr/nostr/archive/refs/tags/v0.12.0.tar.gz",
+            .hash = "nostr-0.12.0-CMyPzRFwCACA_5_8Tk5io0a4RjCbvAeT-vzJPuf-UBqb",
+        },
+        .websocket = .{
+            .url = "https://github.com/karlseguin/websocket.zig/archive/efa879736bd438bea8b86a91f220ba408de57273.tar.gz",
+            .hash = "websocket-0.1.0-ZPISdWoTBQA8iviFsepUZiKrmT-oEyc-BwfbVzYwu7LO",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
