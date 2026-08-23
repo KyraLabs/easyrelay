@@ -1,0 +1,13 @@
+# Zig build output and caches
+.zig-cache/
+zig-out/
+
+# Relay runtime state
+/data/
+*.mdb
+easyrelay.zon
+
+# Editors
+.zls-cache/
+*.swp
+.DS_Store

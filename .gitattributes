@@ -1,0 +1,11 @@
+* text=auto eol=lf
+
+*.zig   text diff=zig
+*.zon   text
+*.md    text
+*.yml   text
+*.yaml  text
+*.sh    text eol=lf
+
+# Keep generated or vendored content out of language statistics and diffs
+docs/research/** linguist-documentation

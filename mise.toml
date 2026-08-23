@@ -1,0 +1,9 @@
+# Toolchain for this project. Run `mise install` to get it.
+#
+# The Zig version is pinned, not floored: see docs/adr/0001-language-and-toolchain.md.
+# It appears in three places that must agree — this file, .zigversion, and
+# `minimum_zig_version` in build.zig.zon. `scripts/check-toolchain.sh` enforces that,
+# and CI runs it.
+
+[tools]
+zig = "0.16.0"
