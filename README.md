@@ -1,0 +1,2 @@
+# easyrelay
+nostr relay wip
