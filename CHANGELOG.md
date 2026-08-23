@@ -13,6 +13,9 @@ versions may contain breaking changes; they will always be listed under `Changed
 
 - Project scaffold: `build.zig`, pinned Zig toolchain, and a command-line entry point that
   reports its version and refuses unknown arguments.
+- The two runtime dependencies, pinned and compiled from source: `zig-nostr/nostr` for the
+  event model, canonical serialization and Schnorr verification, and `websocket.zig` for the
+  transport.
 - Continuous integration: formatting gate, toolchain-pin consistency check, native tests on
   Linux and macOS, and cross-compilation of every published release target.
 - Release automation producing static Linux binaries and macOS binaries with checksums.

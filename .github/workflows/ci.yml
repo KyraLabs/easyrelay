@@ -31,8 +31,10 @@ jobs:
           version: ${{ steps.zig.outputs.version }}
           cache-key: lint
 
+      # zig-pkg/ is where the build system unpacks the dependencies. Excluding it
+      # keeps this command identical to the one contributors run after a build.
       - name: Check formatting
-        run: zig fmt --check .
+        run: zig fmt --check --exclude zig-pkg .
 
   test:
     name: Test (${{ matrix.os }})
