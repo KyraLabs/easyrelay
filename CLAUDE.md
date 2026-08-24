@@ -64,9 +64,13 @@ try w.flush();
 // Timing goes through Io. The monotonic clock is `.awake`, not `.monotonic`.
 const t0 = std.Io.Timestamp.now(io, .awake);
 const ns = t0.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+
+// Wall-clock time comes through Io as well, on the `.real` clock.
+const unix_seconds = std.Io.Timestamp.now(io, .real).toSeconds();
 ```
 
 Gone or renamed: `std.fs.cwd()` (filesystem moved under `std.Io`), `std.time.Timer`,
+`std.time.timestamp()`,
 `std.testing.refAllDeclsRecursive` (`refAllDecls` remains), `GeneralPurposeAllocator` (now
 `DebugAllocator`), `GenericReader` / `AnyReader` / `FixedBufferStream`.
 

@@ -36,6 +36,9 @@ pub const session = @import("relay/session.zig");
 /// How a failure explains itself to the client that caused it.
 pub const diagnostics = @import("relay/diagnostics.zig");
 
+/// The transport: sockets and frames, and nothing else.
+pub const server = @import("server/server.zig");
+
 test {
     _ = store;
     _ = memory;
@@ -44,6 +47,7 @@ test {
     _ = codec;
     _ = session;
     _ = diagnostics;
+    _ = server;
 }
 
 test "version is a non-empty semantic version" {
