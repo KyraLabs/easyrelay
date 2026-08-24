@@ -51,14 +51,17 @@ pub const Memory = struct {
         self.* = undefined;
     }
 
-    /// The `Store` interface over this backend. The returned value borrows
-    /// `self`, which must outlive it.
+    /// The `Store` interface over this backend, and the only way to reach its
+    /// events: `put`, `query` and `count` are deliberately private, so that a
+    /// caller holding a `*Memory` still goes through the boundary
+    /// (docs/adr/0008-store-abstraction-boundary.md). The returned value
+    /// borrows `self`, which must outlive it.
     pub fn store(self: *Memory) Store {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
     /// How many events are stored.
-    pub fn count(self: Memory) usize {
+    fn count(self: Memory) usize {
         return self.order.items.len;
     }
 
@@ -79,7 +82,7 @@ pub const Memory = struct {
         return self.query(filters, limit, sink);
     }
 
-    pub fn put(self: *Memory, event: *const Event) Error!PutResult {
+    fn put(self: *Memory, event: *const Event) Error!PutResult {
         if (self.ids.contains(event.id)) return .duplicate;
 
         // Reserve both slots before copying, so a failure leaves the store
@@ -95,7 +98,7 @@ pub const Memory = struct {
         return .stored;
     }
 
-    pub fn query(
+    fn query(
         self: *Memory,
         filters: []const Filter,
         limit: usize,
