@@ -54,9 +54,11 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 }
 
-// Writers are buffered and MUST be flushed.
+// Writers are buffered and MUST be flushed. Use `.initStreaming` for stdout and
+// stderr: `.init` writes positionally, with an offset of its own, and clobbers
+// anything else writing to the same file under `program > log 2>&1`.
 var buf: [4096]u8 = undefined;
-var file: std.Io.File.Writer = .init(.stdout(), io, &buf);
+var file: std.Io.File.Writer = .initStreaming(.stdout(), io, &buf);
 const w = &file.interface;
 try w.print("{s}\n", .{x});
 try w.flush();
