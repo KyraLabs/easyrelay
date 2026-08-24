@@ -170,6 +170,9 @@ fn decodeReq(
         return malformed(diagnostics, .wrong_shape, "REQ carries a subscription id and its filters", .{});
     }
     const subscription_id = try decodeSubscriptionId(array[1], limits, diagnostics);
+    // From here on the failure has a subscription id to name, which is what
+    // lets the caller answer `CLOSED` rather than `NOTICE`.
+    diagnostics.subject = subscription_id;
 
     const count = array.len - 2;
     if (count > limits.max_filters) {
@@ -205,7 +208,9 @@ fn decodeClose(
     if (array.len != 2) {
         return malformed(diagnostics, .wrong_shape, "CLOSE carries exactly one subscription id", .{});
     }
-    return .{ .close = .{ .subscription_id = try decodeSubscriptionId(array[1], limits, diagnostics) } };
+    const subscription_id = try decodeSubscriptionId(array[1], limits, diagnostics);
+    diagnostics.subject = subscription_id;
+    return .{ .close = .{ .subscription_id = subscription_id } };
 }
 
 fn decodeSubscriptionId(
@@ -296,16 +301,28 @@ pub fn writeEvent(
     event: Event,
 ) (std.Io.Writer.Error || error{OutOfMemory})!void {
     // The dependency serializes an event into an owned slice and offers no
-    // append-into-writer variant, so the relay pays one allocation per event
-    // sent. It comes from the per-request arena; whether it is worth removing
-    // is a question for Phase 6's benchmarks, not for a guess here.
+    // append-into-writer variant, so this costs one allocation. It comes from
+    // the per-request arena.
     const body = try nostr.event.toJson(gpa, event);
     defer gpa.free(body);
+    try writeEventEnvelope(writer, subscription_id, body);
+}
 
+/// The same message from an event that is already serialized.
+///
+/// Fan-out sends one event to many subscriptions, which differ only in the id
+/// they carry, so it serializes once and calls this for each. That path is the
+/// relay's hot one: every accepted event is written to every subscriber that
+/// wants it.
+pub fn writeEventEnvelope(
+    writer: *std.Io.Writer,
+    subscription_id: []const u8,
+    serialized_event: []const u8,
+) std.Io.Writer.Error!void {
     try writer.writeAll("[\"EVENT\",");
     try std.json.Stringify.encodeJsonString(subscription_id, .{}, writer);
     try writer.writeByte(',');
-    try writer.writeAll(body);
+    try writer.writeAll(serialized_event);
     try writer.writeByte(']');
 }
 
@@ -621,4 +638,21 @@ test "a subscription id with characters that need escaping survives the round tr
     var parsed = try nostr.message.parseRelayMessage(testing.allocator, out.written());
     defer parsed.deinit();
     try testing.expectEqualStrings(hostile, parsed.value.eose.subscription_id);
+}
+
+test "a REQ refused after its id was read names the subscription" {
+    var harness = Harness.init(.{ .max_filters = 1 });
+    defer harness.deinit();
+
+    try testing.expectError(error.MalformedMessage, harness.read("[\"REQ\",\"sub-1\",{},{}]"));
+    try testing.expectEqual(Reason.too_many_filters, harness.diagnostics.reason.?);
+    try testing.expectEqualStrings("sub-1", harness.diagnostics.subject.?);
+}
+
+test "a REQ refused before its id was read names nothing" {
+    var harness = Harness.init(.{});
+    defer harness.deinit();
+
+    try testing.expectError(error.MalformedMessage, harness.read("[\"REQ\",\"\",{}]"));
+    try testing.expectEqual(@as(?[]const u8, null), harness.diagnostics.subject);
 }

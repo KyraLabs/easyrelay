@@ -11,6 +11,10 @@ versions may contain breaking changes; they will always be listed under `Changed
 
 ### Added
 
+- A working relay: `easyrelay` with no arguments and no configuration file serves NIP-01 over
+  WebSocket on `ws://127.0.0.1:7777`. It accepts and validates events, answers subscriptions
+  from stored events, and fans accepted events out live to every matching subscription. Events
+  are held in memory; persistence arrives with the LMDB backend.
 - Project scaffold: `build.zig`, pinned Zig toolchain, and a command-line entry point that
   reports its version and refuses unknown arguments.
 - The two runtime dependencies, pinned and compiled from source: `zig-nostr/nostr` for the

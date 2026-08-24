@@ -54,9 +54,11 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(arena);
 }
 
-// Writers are buffered and MUST be flushed.
+// Writers are buffered and MUST be flushed. Use `.initStreaming` for stdout and
+// stderr: `.init` writes positionally, with an offset of its own, and clobbers
+// anything else writing to the same file under `program > log 2>&1`.
 var buf: [4096]u8 = undefined;
-var file: std.Io.File.Writer = .init(.stdout(), io, &buf);
+var file: std.Io.File.Writer = .initStreaming(.stdout(), io, &buf);
 const w = &file.interface;
 try w.print("{s}\n", .{x});
 try w.flush();
@@ -64,9 +66,18 @@ try w.flush();
 // Timing goes through Io. The monotonic clock is `.awake`, not `.monotonic`.
 const t0 = std.Io.Timestamp.now(io, .awake);
 const ns = t0.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
+
+// Wall-clock time comes through Io as well, on the `.real` clock.
+const unix_seconds = std.Io.Timestamp.now(io, .real).toSeconds();
+
+// Locks come from Io too, and take it on every operation.
+var mutex: std.Io.Mutex = .init;
+mutex.lockUncancelable(io);
+defer mutex.unlock(io);
 ```
 
 Gone or renamed: `std.fs.cwd()` (filesystem moved under `std.Io`), `std.time.Timer`,
+`std.time.timestamp()`, `std.Thread.Mutex` (now `std.Io.Mutex`),
 `std.testing.refAllDeclsRecursive` (`refAllDecls` remains), `GeneralPurposeAllocator` (now
 `DebugAllocator`), `GenericReader` / `AnyReader` / `FixedBufferStream`.
 

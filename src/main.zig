@@ -8,23 +8,16 @@ const usage =
     \\
     \\Usage: easyrelay [options]
     \\
+    \\With no options it serves a relay on ws://127.0.0.1:7777. There is nothing
+    \\to configure and no file to write first.
+    \\
     \\Options:
     \\  -h, --help       Show this message and exit
     \\  -V, --version    Show the version and exit
     \\
 ;
 
-const not_implemented =
-    \\easyrelay is pre-alpha: the relay is not implemented yet, so there is nothing to serve.
-    \\
-    \\What exists today is the project scaffold and the design documentation. The order of
-    \\work, and what each phase must satisfy before it is considered done, is in:
-    \\
-    \\  https://github.com/KyraLabs/easyrelay/blob/main/docs/roadmap.md
-    \\
-;
-
-const Action = enum { help, version, serve, unknown };
+const Action = enum { help, version, unknown };
 
 fn classify(arg: []const u8) Action {
     if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .help;
@@ -33,16 +26,23 @@ fn classify(arg: []const u8) Action {
 }
 
 pub fn main(init: std.process.Init) !void {
+    const gpa = init.gpa;
     const arena = init.arena.allocator();
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
 
+    // Streaming, not positional. `Io.File.Writer.init` defaults to positional
+    // writes, which carry their own offset and ignore the one the operating
+    // system shares between everything writing to the same file. Under
+    // `easyrelay > relay.log 2>&1` — systemd, Docker, nohup, every ordinary
+    // deployment — that made the startup message and the transport's log
+    // overwrite each other's bytes.
     var stdout_buffer: [4096]u8 = undefined;
-    var stdout_file: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    var stdout_file: Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file.interface;
 
     var stderr_buffer: [4096]u8 = undefined;
-    var stderr_file: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
+    var stderr_file: Io.File.Writer = .initStreaming(.stderr(), io, &stderr_buffer);
     const stderr = &stderr_file.interface;
 
     for (args[1..]) |arg| switch (classify(arg)) {
@@ -56,19 +56,55 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
             return;
         },
-        // Name the offending argument instead of dumping usage alone. An error the
-        // operator cannot act on is a bug: see docs/adr/0009-deployment-experience.md.
+        // Name the offending argument instead of dumping usage alone. An error
+        // the operator cannot act on is a bug: see
+        // docs/adr/0009-deployment-experience.md.
         .unknown => {
             try stderr.print("error: unknown argument '{s}'\n\n{s}", .{ arg, usage });
             try stderr.flush();
             std.process.exit(2);
         },
-        .serve => unreachable,
     };
 
-    try stderr.writeAll(not_implemented);
-    try stderr.flush();
-    std.process.exit(1);
+    try serve(gpa, io, stdout);
+}
+
+/// Starts the relay on the defaults and blocks.
+///
+/// Zero configuration is a commitment with its own exit criteria
+/// (docs/adr/0009-deployment-experience.md), and it is cheap to hold to here
+/// while the surface is small. Every setting below is a default in
+/// docs/configuration.md, not a value invented for this function.
+fn serve(gpa: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
+    var events = easyrelay.memory.Memory.init(gpa);
+    defer events.deinit();
+
+    var connections = easyrelay.hub.Hub.init(gpa, io);
+    defer connections.deinit();
+
+    const shared: easyrelay.session.Shared = .{
+        .io = io,
+        .store = events.store(),
+        .hub = &connections,
+    };
+    var app: easyrelay.server.App = .{ .gpa = gpa, .shared = &shared };
+
+    const options: easyrelay.server.Options = .{};
+    var relay = try easyrelay.server.init(gpa, &app, options);
+    defer relay.deinit();
+
+    try stdout.print(
+        "easyrelay {s} is serving ws://{s}:{d}\n",
+        .{ easyrelay.version, options.address, options.port },
+    );
+    // Said plainly, because the alternative is an operator discovering it
+    // after a restart. The full startup message — data directory, whether the
+    // relay is reachable from outside loopback, what to change — arrives with
+    // the configuration file in Phase 2.
+    try stdout.writeAll("events are held in memory only: a restart loses them\n");
+    try stdout.flush();
+
+    try relay.listen(&app);
 }
 
 test "classify recognises both spellings of every flag" {
@@ -89,4 +125,8 @@ test "usage text names every flag classify accepts" {
     for ([_][]const u8{ "-h", "--help", "-V", "--version" }) |flag| {
         try std.testing.expect(std.mem.indexOf(u8, usage, flag) != null);
     }
+}
+
+test "usage text says what happens with no arguments" {
+    try std.testing.expect(std.mem.indexOf(u8, usage, "ws://127.0.0.1:7777") != null);
 }

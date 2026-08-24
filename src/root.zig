@@ -30,8 +30,20 @@ pub const filter = @import("relay/filter.zig");
 /// The relay's half of the NIP-01 wire format.
 pub const codec = @import("relay/codec.zig");
 
+/// One client's conversation with the relay: what arrives, what is answered.
+pub const session = @import("relay/session.zig");
+
+/// The subscriptions one connection has open.
+pub const subscriptions = @import("relay/subscriptions.zig");
+
+/// Where an accepted event meets every subscription that wants it.
+pub const hub = @import("relay/hub.zig");
+
 /// How a failure explains itself to the client that caused it.
 pub const diagnostics = @import("relay/diagnostics.zig");
+
+/// The transport: sockets and frames, and nothing else.
+pub const server = @import("server/server.zig");
 
 test {
     _ = store;
@@ -39,7 +51,11 @@ test {
     _ = validation;
     _ = filter;
     _ = codec;
+    _ = session;
+    _ = subscriptions;
+    _ = hub;
     _ = diagnostics;
+    _ = server;
 }
 
 test "version is a non-empty semantic version" {
