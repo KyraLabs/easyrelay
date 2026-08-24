@@ -10,7 +10,7 @@ Status values: `supported`, `in progress`, `planned`, `out of scope`.
 
 | NIP | Name | Status | Phase | Notes |
 | --- | --- | --- | --- | --- |
-| [01](https://github.com/nostr-protocol/nips/blob/master/01.md) | Basic protocol flow | planned | 1–2 | Events, filters, subscriptions, kind semantics. The whole of [protocol.md](protocol.md). |
+| [01](https://github.com/nostr-protocol/nips/blob/master/01.md) | Basic protocol flow | in progress | 1–2 | Events, filters, subscriptions, kind semantics. The whole of [protocol.md](protocol.md). Phase 1 delivers the wire format, validation, filters and subscriptions in memory; Phase 2 adds persistence, kind semantics and the multi-filter merge, and only then does this become `supported`. |
 | [09](https://github.com/nostr-protocol/nips/blob/master/09.md) | Event deletion | planned | 2 | Author-scoped only; tombstones prevent reinstatement. Implemented by the storage dependency and [verified in Phase 0](research/2026-08-phase-0-validation.md#q2--deletion-is-complete-expiration-does-not-exist), so it lands with persistence rather than with hardening. |
 | [11](https://github.com/nostr-protocol/nips/blob/master/11.md) | Relay information document | planned | 2 | Served on `Accept: application/nostr+json`. Generated from configuration and from this table. |
 | [13](https://github.com/nostr-protocol/nips/blob/master/13.md) | Proof of work | planned | 4 | Configurable minimum difficulty; validates the committed `nonce` tag, not just leading zeroes. |
