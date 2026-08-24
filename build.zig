@@ -60,6 +60,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "nostr", .module = nostr.module("nostr") },
+                .{ .name = "easyrelay", .module = mod },
             },
         }),
         .filters = test_filters,

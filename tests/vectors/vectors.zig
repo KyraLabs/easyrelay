@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const nostr = @import("nostr");
+const easyrelay = @import("easyrelay");
 
 const testing = std.testing;
 
@@ -212,6 +213,32 @@ test "the collected events still cover the cases a JSON encoder gets wrong" {
     try testing.expect(empty_content);
     try testing.expect(empty_tags);
     try testing.expect(many_tags);
+}
+
+test "every collected event passes easyrelay's own validation" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const validator = easyrelay.validation.Validator{ .signer = signer };
+
+    // A fixed clock, later than every collected event and earlier than none:
+    // the corpus is historical, and no lower bound is configured by default.
+    const now: i64 = 2_000_000_000;
+
+    for (try parseEvents(arena)) |*event| {
+        const wire = try nostr.event.toJson(arena, event.*);
+        var diagnostics: easyrelay.validation.Diagnostics = .{};
+        validator.validate(arena, event, wire.len, now, &diagnostics) catch |err| {
+            std.debug.print(
+                "event {s} was rejected: {s}\n",
+                .{ std.fmt.bytesToHex(event.id, .lower), diagnostics.message() },
+            );
+            return err;
+        };
+    }
 }
 
 test "canonical serialization escapes exactly the seven characters NIP-01 names" {
