@@ -69,7 +69,9 @@ public key in `pubkey`. Verification uses `libsecp256k1`; see
 | `NEG-CLOSE` | `["NEG-CLOSE", <sub_id>]` | NIP-77 |
 
 `sub_id` is a non-empty string, at most 64 characters, scoped to the connection. A `REQ` reusing
-an open `sub_id` replaces that subscription.
+an open `sub_id` replaces that subscription. A `REQ` carrying no filters at all is a valid
+subscription that matches nothing: it is answered with `EOSE` and stays open, because zero
+filters OR-ed together is what it asks for.
 
 ### Relay to client
 
