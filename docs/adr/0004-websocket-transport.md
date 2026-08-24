@@ -64,6 +64,30 @@ hostile fragmentation, slow-loris handshakes, or a stalled reader. Those are Pha
 are where an experimental transport is most likely to disappoint. The fallback is not deleted
 until they pass.
 
+## What Phase 1 found (2026-08-24)
+
+Building the relay on it surfaced two lifecycle bugs the Phase 0 spike could not have seen,
+because that spike never closed connections while the server was shutting down.
+
+**`close` is not called exactly once.** The readme guarantees that it is. Two paths call the
+handler's `close` and they take different locks: the cleanup path releases the per-connection
+lock *before* calling it, while the shutdown path calls it *holding* that lock. A client
+disconnecting as the server stops reaches both, and easyrelay's handler then frees that
+connection's subscriptions twice. `std.testing.allocator` caught it as a double free.
+easyrelay's `close` is idempotent through an atomic exchange, which is cheap insurance whatever
+upstream decides.
+
+**Shutdown races with the thread pool.** Stopping the server while a connection is still being
+torn down lets one thread free a connection's state while a pool thread is still inside that
+connection's `close`, which faults. easyrelay's tests drain first — wait until every connection
+is gone, then stop — which is what Phase 3's graceful shutdown has to do for real anyway.
+
+Neither changes the decision. Both are in the shutdown path, both are contained by a few lines
+here, and the first-party frame layer this record keeps in reserve would still cost weeks. Both
+are worth reporting upstream. What they do change is the weight of Phase 3's adversarial
+testing: this class of bug is where an experimental transport was always most likely to
+disappoint, and it has now disappointed once before that phase started.
+
 ## Revisit when
 
 Phase 3's adversarial transport tests report, or `websocket.zig` marks its 0.16 support stable,

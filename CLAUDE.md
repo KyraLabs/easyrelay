@@ -67,10 +67,15 @@ const ns = t0.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds;
 
 // Wall-clock time comes through Io as well, on the `.real` clock.
 const unix_seconds = std.Io.Timestamp.now(io, .real).toSeconds();
+
+// Locks come from Io too, and take it on every operation.
+var mutex: std.Io.Mutex = .init;
+mutex.lockUncancelable(io);
+defer mutex.unlock(io);
 ```
 
 Gone or renamed: `std.fs.cwd()` (filesystem moved under `std.Io`), `std.time.Timer`,
-`std.time.timestamp()`,
+`std.time.timestamp()`, `std.Thread.Mutex` (now `std.Io.Mutex`),
 `std.testing.refAllDeclsRecursive` (`refAllDecls` remains), `GeneralPurposeAllocator` (now
 `DebugAllocator`), `GenericReader` / `AnyReader` / `FixedBufferStream`.
 

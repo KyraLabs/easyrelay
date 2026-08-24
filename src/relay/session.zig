@@ -16,6 +16,7 @@ const std = @import("std");
 const nostr = @import("nostr");
 
 const codec = @import("codec.zig");
+const hub = @import("hub.zig");
 const subscriptions = @import("subscriptions.zig");
 const validation = @import("validation.zig");
 const store = @import("../storage/store.zig");
@@ -60,7 +61,13 @@ pub const Limits = struct {
 /// What every session on this relay shares. Read-only for the duration of a
 /// connection, so it is safe to point every session at one instance.
 pub const Shared = struct {
+    /// Locking goes through `Io` in Zig 0.16, and the subscriber's lock is
+    /// taken here as well as by the hub.
+    io: std.Io,
     store: store.Store,
+    /// Where an accepted event meets the subscriptions of every connection,
+    /// this one included.
+    hub: *hub.Hub,
     limits: Limits = .{},
 };
 
@@ -77,8 +84,9 @@ pub const Context = struct {
 pub const Session = struct {
     shared: *const Shared,
     responder: Responder,
-    /// This connection's own, and no other connection's.
-    subscriptions: *subscriptions.Registry,
+    /// This connection as the rest of the relay sees it: its subscriptions and
+    /// the way back to its socket.
+    subscriber: *hub.Subscriber,
 
     pub fn handle(self: *Session, context: Context, data: []const u8) Error!void {
         var diagnostics: codec.Diagnostics = .{};
@@ -112,7 +120,11 @@ pub const Session = struct {
             .req => |req| try self.subscribe(context, req),
             // Closing a subscription that is not open is not an error, and
             // NIP-01 gives the relay nothing to say about it.
-            .close => |close| _ = self.subscriptions.close(close.subscription_id),
+            .close => |close| {
+                self.subscriber.mutex.lockUncancelable(self.shared.io);
+                defer self.subscriber.mutex.unlock(self.shared.io);
+                _ = self.subscriber.registry.close(close.subscription_id);
+            },
         }
     }
 
@@ -166,7 +178,13 @@ pub const Session = struct {
         };
 
         return switch (result) {
-            .stored => self.sendOk(.{ .event_id = event.id, .accepted = true }),
+            .stored => {
+                // Only after the store accepted it, so that a subscriber never
+                // receives an event a later read would fail to find
+                // (docs/architecture.md#concurrency-model).
+                self.shared.hub.broadcast(context.arena, &event);
+                return self.sendOk(.{ .event_id = event.id, .accepted = true });
+            },
             // `duplicate:` travels with true: the event the client sent is on
             // the relay, which is what it asked for (docs/protocol.md).
             .duplicate => self.sendOk(.{
@@ -181,7 +199,13 @@ pub const Session = struct {
     /// Opens or replaces a subscription, answers it from the store, and closes
     /// the stored phase with `EOSE`.
     fn subscribe(self: *Session, context: Context, req: codec.ClientMessage.Req) Error!void {
-        self.subscriptions.open(req.subscription_id, req.filters) catch |err| switch (err) {
+        // Held across the whole stored phase. A live event delivered in the
+        // middle of it would reach the client before `EOSE`, and
+        // docs/protocol.md promises that every stored event precedes it.
+        self.subscriber.mutex.lockUncancelable(self.shared.io);
+        defer self.subscriber.mutex.unlock(self.shared.io);
+
+        self.subscriber.registry.open(req.subscription_id, req.filters) catch |err| switch (err) {
             error.TooMany => return self.sendClosed(
                 req.subscription_id,
                 .blocked,
@@ -208,7 +232,7 @@ pub const Session = struct {
             error.OutOfMemory, error.Backend => {
                 // The subscription goes with the `CLOSED`: the client is told
                 // it is over, so the relay must not keep serving it.
-                _ = self.subscriptions.close(req.subscription_id);
+                _ = self.subscriber.registry.close(req.subscription_id);
                 return self.sendClosed(
                     req.subscription_id,
                     .internal,
@@ -341,41 +365,71 @@ const Recorder = struct {
 /// Two-phase on purpose: `shared` and `session` point into the harness, so
 /// they can only be built once it is at the address it will keep.
 const Harness = struct {
+    threaded: std.Io.Threaded,
     arena_state: std.heap.ArenaAllocator,
     signer: nostr.keys.Signer,
     backing: memory.Memory,
     recorder: Recorder,
-    registry: subscriptions.Registry,
+    /// What the hub handed this connection, as opposed to what the session
+    /// answered directly. The two are different paths and worth telling apart.
+    delivered: std.ArrayList([]u8),
     limits: Limits,
+    connections: hub.Hub = undefined,
+    subscriber: hub.Subscriber = undefined,
     shared: Shared = undefined,
     session: Session = undefined,
 
     fn init(limits: Limits) Harness {
         return .{
+            .threaded = .init(testing.allocator, .{}),
             .arena_state = std.heap.ArenaAllocator.init(testing.allocator),
             .signer = nostr.keys.Signer.init(),
             .backing = memory.Memory.init(testing.allocator),
             .recorder = Recorder.init(testing.allocator),
-            .registry = subscriptions.Registry.init(testing.allocator, limits.subscription),
+            .delivered = .empty,
             .limits = limits,
         };
     }
 
-    fn start(self: *Harness) void {
-        self.shared = .{ .store = self.backing.store(), .limits = self.limits };
+    /// Everything here points at the harness, so it can only be built once the
+    /// harness is at the address it will keep.
+    fn start(self: *Harness) !void {
+        const io = self.threaded.io();
+        self.connections = hub.Hub.init(testing.allocator, io);
+        self.subscriber = .{
+            .registry = subscriptions.Registry.init(testing.allocator, self.limits.subscription),
+            .delivery = .{ .ptr = self, .sendFn = record },
+        };
+        try self.connections.join(&self.subscriber);
+        self.shared = .{
+            .io = io,
+            .store = self.backing.store(),
+            .hub = &self.connections,
+            .limits = self.limits,
+        };
         self.session = .{
             .shared = &self.shared,
             .responder = self.recorder.responder(),
-            .subscriptions = &self.registry,
+            .subscriber = &self.subscriber,
         };
     }
 
+    fn record(ptr: *anyopaque, message: []const u8) void {
+        const self: *Harness = @ptrCast(@alignCast(ptr));
+        const copy = testing.allocator.dupe(u8, message) catch return;
+        self.delivered.append(testing.allocator, copy) catch testing.allocator.free(copy);
+    }
+
     fn deinit(self: *Harness) void {
-        self.registry.deinit();
+        for (self.delivered.items) |message| testing.allocator.free(message);
+        self.delivered.deinit(testing.allocator);
+        self.subscriber.registry.deinit();
+        self.connections.deinit();
         self.recorder.deinit();
         self.backing.deinit();
         self.signer.deinit();
         self.arena_state.deinit();
+        self.threaded.deinit();
     }
 
     fn arena(self: *Harness) std.mem.Allocator {
@@ -406,7 +460,7 @@ const Harness = struct {
 
 test "a well-formed event is stored and answered with OK true" {
     var harness = Harness.init(.{});
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     const event = try harness.signedEvent("hello");
@@ -419,7 +473,7 @@ test "a well-formed event is stored and answered with OK true" {
 
 test "the same event twice is answered with duplicate, and still with true" {
     var harness = Harness.init(.{});
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     const event = try harness.signedEvent("hello");
@@ -434,7 +488,7 @@ test "the same event twice is answered with duplicate, and still with true" {
 
 test "an event whose signature does not verify is answered with invalid" {
     var harness = Harness.init(.{});
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     var event = try harness.signedEvent("hello");
@@ -447,7 +501,7 @@ test "an event whose signature does not verify is answered with invalid" {
 
 test "an event over the size limit is refused with the limit in the reason" {
     var harness = Harness.init(.{ .event = .{ .max_event_size = 32 } });
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     const event = try harness.signedEvent("hello");
@@ -460,7 +514,7 @@ test "an event over the size limit is refused with the limit in the reason" {
 
 test "a rejected event is not stored" {
     var harness = Harness.init(.{});
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     var event = try harness.signedEvent("hello");
@@ -479,7 +533,7 @@ test "a rejected event is not stored" {
 
 test "input that is not a message is answered with NOTICE" {
     var harness = Harness.init(.{});
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     try harness.handle("not a message");
@@ -488,7 +542,7 @@ test "input that is not a message is answered with NOTICE" {
 
 test "a message type this relay does not implement is answered with NOTICE" {
     var harness = Harness.init(.{});
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     try harness.handle("[\"COUNT\",\"sub\",{}]");
@@ -497,7 +551,7 @@ test "a message type this relay does not implement is answered with NOTICE" {
 
 test "a REQ answers with the stored events, newest first, and then EOSE" {
     var harness = Harness.init(.{});
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     const older = try harness.signedEvent("older");
@@ -518,7 +572,7 @@ test "a REQ answers with the stored events, newest first, and then EOSE" {
 
 test "a REQ that matches nothing still ends with EOSE" {
     var harness = Harness.init(.{});
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     try harness.handle("[\"REQ\",\"sub-1\",{\"kinds\":[9999]}]");
@@ -527,33 +581,33 @@ test "a REQ that matches nothing still ends with EOSE" {
 
 test "a REQ reusing an open id replaces that subscription" {
     var harness = Harness.init(.{});
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     try harness.handle("[\"REQ\",\"sub-1\",{\"kinds\":[1]}]");
     try harness.handle("[\"REQ\",\"sub-1\",{\"kinds\":[7]}]");
 
-    try testing.expectEqual(@as(usize, 1), harness.registry.count());
-    const open_subscription = harness.registry.find("sub-1").?;
+    try testing.expectEqual(@as(usize, 1), harness.subscriber.registry.count());
+    const open_subscription = harness.subscriber.registry.find("sub-1").?;
     try testing.expectEqual(@as(u16, 7), open_subscription.filters[0].kinds.?[0]);
 }
 
 test "CLOSE ends the subscription and says nothing" {
     var harness = Harness.init(.{});
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     try harness.handle("[\"REQ\",\"sub-1\",{}]");
     harness.recorder.clear();
 
     try harness.handle("[\"CLOSE\",\"sub-1\"]");
-    try testing.expectEqual(@as(usize, 0), harness.registry.count());
+    try testing.expectEqual(@as(usize, 0), harness.subscriber.registry.count());
     try testing.expectEqual(@as(usize, 0), harness.recorder.messages.items.len);
 }
 
 test "closing a subscription that was never open is not an error" {
     var harness = Harness.init(.{});
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     try harness.handle("[\"CLOSE\",\"never-opened\"]");
@@ -562,7 +616,7 @@ test "closing a subscription that was never open is not an error" {
 
 test "one subscription too many is refused with CLOSED and blocked" {
     var harness = Harness.init(.{ .subscription = .{ .max_subscriptions = 1 } });
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     try harness.handle("[\"REQ\",\"sub-1\",{}]");
@@ -571,12 +625,12 @@ test "one subscription too many is refused with CLOSED and blocked" {
 
     const answer = harness.recorder.only();
     try testing.expect(std.mem.startsWith(u8, answer, "[\"CLOSED\",\"sub-2\",\"blocked:"));
-    try testing.expectEqual(@as(usize, 1), harness.registry.count());
+    try testing.expectEqual(@as(usize, 1), harness.subscriber.registry.count());
 }
 
 test "a REQ refused by the codec is answered with CLOSED naming the subscription" {
     var harness = Harness.init(.{ .message = .{ .max_filters = 1 } });
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     try harness.handle("[\"REQ\",\"sub-1\",{},{}]");
@@ -588,7 +642,7 @@ test "a REQ refused by the codec is answered with CLOSED naming the subscription
 
 test "a filter in a REQ decides what the subscription is answered with" {
     var harness = Harness.init(.{});
-    harness.start();
+    try harness.start();
     defer harness.deinit();
 
     try harness.handle(try harness.eventMessage(try harness.signedEvent("kept")));
@@ -599,4 +653,54 @@ test "a filter in a REQ decides what the subscription is answered with" {
     try testing.expectEqual(@as(usize, 2), sent.len);
     try testing.expect(std.mem.indexOf(u8, sent[0], "kept") != null);
     try testing.expectEqualStrings("[\"EOSE\",\"sub-1\"]", sent[1]);
+}
+
+test "an accepted event reaches an open subscription that matches it" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{\"kinds\":[1]}]");
+    try harness.handle(try harness.eventMessage(try harness.signedEvent("live")));
+
+    try testing.expectEqual(@as(usize, 1), harness.delivered.items.len);
+    const delivered = harness.delivered.items[0];
+    try testing.expect(std.mem.startsWith(u8, delivered, "[\"EVENT\",\"sub-1\","));
+    try testing.expect(std.mem.indexOf(u8, delivered, "live") != null);
+}
+
+test "an accepted event reaches nothing when no filter matches it" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{\"kinds\":[7]}]");
+    try harness.handle(try harness.eventMessage(try harness.signedEvent("live")));
+
+    try testing.expectEqual(@as(usize, 0), harness.delivered.items.len);
+}
+
+test "an event already stored is not delivered a second time" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{}]");
+    const wire = try harness.eventMessage(try harness.signedEvent("once"));
+    try harness.handle(wire);
+    try harness.handle(wire);
+
+    try testing.expectEqual(@as(usize, 1), harness.delivered.items.len);
+}
+
+test "a closed subscription stops receiving" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{}]");
+    try harness.handle("[\"CLOSE\",\"sub-1\"]");
+    try harness.handle(try harness.eventMessage(try harness.signedEvent("after")));
+
+    try testing.expectEqual(@as(usize, 0), harness.delivered.items.len);
 }
