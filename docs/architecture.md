@@ -183,7 +183,7 @@ src/
   main.zig            entry point, startup, signal handling
   config.zig          configuration loading and validation
   server/             transport: websocket handlers, HTTP endpoints
-  relay/              protocol codec, validation, subscription registry
+  relay/              protocol codec, validation, session, subscription registry
   policy/             rate limiting, PoW, auth, allow/deny lists
   storage/
     store.zig         the Store interface
