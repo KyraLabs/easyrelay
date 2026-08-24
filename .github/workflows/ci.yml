@@ -60,6 +60,39 @@ jobs:
       - name: Test
         run: zig build test --summary all
 
+  interop:
+    name: Interop (nak)
+    runs-on: ubuntu-latest
+    # The version is pinned: an interop test that follows a moving client tells
+    # you something changed, not which side changed it.
+    env:
+      NAK_VERSION: v0.20.6
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: zig
+        run: echo "version=$(tr -d '[:space:]' < .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig.outputs.version }}
+          cache-key: interop
+
+      - name: Install nak
+        run: |
+          curl -fsSLo "$RUNNER_TEMP/nak" \
+            "https://github.com/fiatjaf/nak/releases/download/$NAK_VERSION/nak-$NAK_VERSION-linux-amd64"
+          chmod +x "$RUNNER_TEMP/nak"
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Build
+        run: zig build
+
+      # docs/testing.md: conformance checks the relay against this project's
+      # reading of NIP-01, interop checks it against what a client actually does.
+      - name: Publish and read back with nak
+        run: ./scripts/interop-nak.sh
+
   cross:
     name: Cross-compile ${{ matrix.target }}
     runs-on: ubuntu-latest

@@ -55,7 +55,13 @@ zig build test --summary all # ... with a per-step summary
 zig build check              # type-check without producing artifacts (fast editor diagnostics)
 zig fmt --check --exclude zig-pkg .   # formatting gate, identical to CI
 ./scripts/check-toolchain.sh # verify the Zig pin agrees across all three files
+./scripts/interop-nak.sh     # publish and read back with nak, against the built binary
 ```
+
+The interop script needs [`nak`](https://github.com/fiatjaf/nak) on `PATH` and a relay binary in
+`zig-out/bin/`. It starts the relay on its default port, so nothing else may be listening on
+7777 while it runs — the transport sets `SO_REUSEPORT`, so the script checks rather than
+discovering it as a confusing failure.
 
 Run a subset of tests while iterating:
 

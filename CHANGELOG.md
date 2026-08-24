@@ -20,6 +20,9 @@ versions may contain breaking changes; they will always be listed under `Changed
 - The two runtime dependencies, pinned and compiled from source: `zig-nostr/nostr` for the
   event model, canonical serialization and Schnorr verification, and `websocket.zig` for the
   transport.
+- A conformance suite that drives the relay over a real WebSocket connection, and an interop
+  check in CI that publishes an event with [`nak`](https://github.com/fiatjaf/nak) and reads it
+  back.
 - Continuous integration: formatting gate, toolchain-pin consistency check, native tests on
   Linux and macOS, and cross-compilation of every published release target.
 - Release automation producing static Linux binaries and macOS binaries with checksums.

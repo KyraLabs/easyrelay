@@ -70,6 +70,10 @@ anything is built on top of it.
 
 ## Phase 1 — NIP-01 in memory
 
+> **Complete.** Every exit criterion below was verified, and what it verified with is recorded
+> in [what Phase 1 delivered](#what-phase-1-delivered). Two gaps are named there rather than
+> left to be discovered.
+
 A relay that a real client can publish to and read from, with no persistence.
 
 ### Deliverables
@@ -101,6 +105,30 @@ A relay that a real client can publish to and read from, with no persistence.
 - A clean checkout builds and `./easyrelay` serves a client, with no file created or edited
   first.
 
+### What Phase 1 delivered
+
+| Exit criterion | Verified by |
+| --- | --- |
+| `nak` publishes and reads back | `scripts/interop-nak.sh`, run in CI against the built binary |
+| One connection subscribes, another publishes, the first receives it live | `tests/conformance/nip01.zig`, over two real WebSocket connections |
+| Every canonical-id and Schnorr vector passes | `tests/vectors/`: the official BIP-340 suite including its ten rejection cases, and six real events from public relays |
+| A tampered id and a bad signature are both rejected with `invalid:` | `tests/conformance/nip01.zig`, which also checks the rejected event was not stored |
+| `EOSE` after the stored events and before any live one | `tests/conformance/nip01.zig` |
+| A clean checkout serves a client with no file written first | The built binary driven by an external WebSocket client, and by `nak` |
+
+Two gaps, both deliberate and neither hidden:
+
+**A live event can arrive twice.** An event stored while a subscription's stored phase is
+running can appear both in that phase and again in the live delivery that follows `EOSE`, which
+[protocol.md](protocol.md#messages) says should carry only what arrived afterwards. Closing it
+needs a monotonic watermark from the store, which Phase 2 has and the in-memory interface does
+not. Clients key events by id, so the practical cost is a duplicate rather than a wrong answer.
+
+**The conformance suite covers a subset.** Nine rules from [protocol.md](protocol.md) are
+checked on the wire; the rest are covered by unit tests or belong to a phase that has not
+implemented them. The suite grows with each phase. The fuzz targets
+[testing.md](testing.md#fuzzing) calls for do not exist yet either.
+
 ---
 
 ## Phase 2 — Persistence and indexes
@@ -128,6 +156,11 @@ A relay that a real client can publish to and read from, with no persistence.
   a conformance test rather than a comment.
 - **NIP-09 deletion**, which the storage dependency already implements and Phase 0 verified.
   It arrives here with persistence rather than in Phase 3.
+- **A watermark that closes Phase 1's duplicate window.** An event stored while a subscription's
+  stored phase runs can be delivered twice. The store's monotonic local id is the watermark that
+  fixes it: a subscription records the newest id its stored phase saw, and live delivery skips
+  anything at or below it. This is why the gap was left open rather than worked around in
+  memory.
 - **A complete default set.** Every setting in [configuration.md](configuration.md) has a
   default correct for a real deployment, not merely one that avoids a crash. Defaults are a
   correctness surface from this point on and are reviewed as such.

@@ -138,4 +138,7 @@ and contained by the boundary in [ADR-0008](adr/0008-store-abstraction-boundary.
 
 ## Current state
 
-Documentation only. Phase 0 of the [roadmap](roadmap.md) delivers the first executable code.
+Phase 1 of the [roadmap](roadmap.md) is complete: the relay serves NIP-01 over WebSocket from an
+in-memory store, and `easyrelay` with no arguments and no configuration file starts it. Phase 2
+adds persistence and the kind semantics that come with it. Nothing here is ready to expose to
+the internet until Phase 3.
