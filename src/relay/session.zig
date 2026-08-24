@@ -16,6 +16,7 @@ const std = @import("std");
 const nostr = @import("nostr");
 
 const codec = @import("codec.zig");
+const subscriptions = @import("subscriptions.zig");
 const validation = @import("validation.zig");
 const store = @import("../storage/store.zig");
 
@@ -53,6 +54,7 @@ pub const Error = Responder.Error || error{OutOfMemory};
 pub const Limits = struct {
     event: validation.Limits = .{},
     message: codec.Limits = .{},
+    subscription: subscriptions.Limits = .{},
 };
 
 /// What every session on this relay shares. Read-only for the duration of a
@@ -75,6 +77,8 @@ pub const Context = struct {
 pub const Session = struct {
     shared: *const Shared,
     responder: Responder,
+    /// This connection's own, and no other connection's.
+    subscriptions: *subscriptions.Registry,
 
     pub fn handle(self: *Session, context: Context, data: []const u8) Error!void {
         var diagnostics: codec.Diagnostics = .{};
@@ -88,6 +92,12 @@ pub const Session = struct {
             // subscription id to answer against, so `NOTICE` is all NIP-01
             // leaves: `OK` and `CLOSED` both need something to name.
             error.MalformedMessage, error.UnsupportedMessage => {
+                // A failure the client can tie to a subscription is answered
+                // with `CLOSED` naming it. Anything else has nothing to name,
+                // and NIP-01 leaves only `NOTICE`.
+                if (diagnostics.subject) |subscription_id| {
+                    return self.sendClosed(subscription_id, .invalid, diagnostics.message());
+                }
                 return self.sendNotice(diagnostics.message());
             },
             error.OutOfMemory => return self.sendNotice("the relay is out of memory"),
@@ -99,7 +109,10 @@ pub const Session = struct {
             // parsing the event a second time to measure it exactly would cost
             // more than the shade is worth.
             .event => |event| try self.publish(context, event, data.len),
-            .req, .close => try self.sendNotice("this relay cannot serve subscriptions yet"),
+            .req => |req| try self.subscribe(context, req),
+            // Closing a subscription that is not open is not an error, and
+            // NIP-01 gives the relay nothing to say about it.
+            .close => |close| _ = self.subscriptions.close(close.subscription_id),
         }
     }
 
@@ -165,6 +178,78 @@ pub const Session = struct {
         };
     }
 
+    /// Opens or replaces a subscription, answers it from the store, and closes
+    /// the stored phase with `EOSE`.
+    fn subscribe(self: *Session, context: Context, req: codec.ClientMessage.Req) Error!void {
+        self.subscriptions.open(req.subscription_id, req.filters) catch |err| switch (err) {
+            error.TooMany => return self.sendClosed(
+                req.subscription_id,
+                .blocked,
+                "this connection already holds as many subscriptions as it may",
+            ),
+            error.OutOfMemory => return self.sendClosed(
+                req.subscription_id,
+                .internal,
+                "the relay ran out of memory opening this subscription",
+            ),
+        };
+
+        var sink: EventSink = .{
+            .session = self,
+            .arena = context.arena,
+            .subscription_id = req.subscription_id,
+        };
+        const limit = subscriptions.resolveLimit(req.filters, self.shared.limits.subscription);
+
+        self.shared.store.query(req.filters, limit, sink.sink()) catch |err| switch (err) {
+            // The sink stops the query when it cannot send, and the reason it
+            // could not is worth more than the fact that it stopped.
+            error.Abort => return sink.failure orelse error.WriteFailed,
+            error.OutOfMemory, error.Backend => {
+                // The subscription goes with the `CLOSED`: the client is told
+                // it is over, so the relay must not keep serving it.
+                _ = self.subscriptions.close(req.subscription_id);
+                return self.sendClosed(
+                    req.subscription_id,
+                    .internal,
+                    "the store could not answer this subscription",
+                );
+            },
+        };
+
+        // Every stored event precedes this, and every event after it arrived
+        // afterwards (docs/protocol.md).
+        try self.sendEose(req.subscription_id);
+    }
+
+    fn sendEvent(
+        self: *Session,
+        arena: std.mem.Allocator,
+        subscription_id: []const u8,
+        event: Event,
+    ) Error!void {
+        const writer = try self.responder.begin();
+        try codec.writeEvent(writer, arena, subscription_id, event);
+        try self.responder.send();
+    }
+
+    fn sendEose(self: *Session, subscription_id: []const u8) Error!void {
+        const writer = try self.responder.begin();
+        try codec.writeEose(writer, subscription_id);
+        try self.responder.send();
+    }
+
+    fn sendClosed(
+        self: *Session,
+        subscription_id: []const u8,
+        prefix: codec.Prefix,
+        reason: []const u8,
+    ) Error!void {
+        const writer = try self.responder.begin();
+        try codec.writeClosed(writer, subscription_id, prefix, reason);
+        try self.responder.send();
+    }
+
     fn sendOk(self: *Session, ok: codec.Ok) Error!void {
         const writer = try self.responder.begin();
         try codec.writeOk(writer, ok);
@@ -175,6 +260,29 @@ pub const Session = struct {
         const writer = try self.responder.begin();
         try codec.writeNotice(writer, message);
         try self.responder.send();
+    }
+};
+
+/// Turns the store's stream of matching events into `EVENT` messages.
+///
+/// A sink may only stop a query, not fail it, so a send that fails is kept
+/// here and re-raised by the caller once the query has unwound.
+const EventSink = struct {
+    session: *Session,
+    arena: std.mem.Allocator,
+    subscription_id: []const u8,
+    failure: ?Error = null,
+
+    fn sink(self: *EventSink) store.Sink {
+        return .{ .ptr = self, .emitFn = emit };
+    }
+
+    fn emit(ptr: *anyopaque, event: *const Event) store.Sink.Abort!void {
+        const self: *EventSink = @ptrCast(@alignCast(ptr));
+        self.session.sendEvent(self.arena, self.subscription_id, event.*) catch |err| {
+            self.failure = err;
+            return error.Abort;
+        };
     }
 };
 
@@ -219,6 +327,11 @@ const Recorder = struct {
         self.messages.append(self.gpa, message) catch return error.WriteFailed;
     }
 
+    fn clear(self: *Recorder) void {
+        for (self.messages.items) |message| self.gpa.free(message);
+        self.messages.clearRetainingCapacity();
+    }
+
     fn only(self: *Recorder) []const u8 {
         std.debug.assert(self.messages.items.len == 1);
         return self.messages.items[0];
@@ -232,6 +345,7 @@ const Harness = struct {
     signer: nostr.keys.Signer,
     backing: memory.Memory,
     recorder: Recorder,
+    registry: subscriptions.Registry,
     limits: Limits,
     shared: Shared = undefined,
     session: Session = undefined,
@@ -242,16 +356,22 @@ const Harness = struct {
             .signer = nostr.keys.Signer.init(),
             .backing = memory.Memory.init(testing.allocator),
             .recorder = Recorder.init(testing.allocator),
+            .registry = subscriptions.Registry.init(testing.allocator, limits.subscription),
             .limits = limits,
         };
     }
 
     fn start(self: *Harness) void {
         self.shared = .{ .store = self.backing.store(), .limits = self.limits };
-        self.session = .{ .shared = &self.shared, .responder = self.recorder.responder() };
+        self.session = .{
+            .shared = &self.shared,
+            .responder = self.recorder.responder(),
+            .subscriptions = &self.registry,
+        };
     }
 
     fn deinit(self: *Harness) void {
+        self.registry.deinit();
         self.recorder.deinit();
         self.backing.deinit();
         self.signer.deinit();
@@ -271,8 +391,12 @@ const Harness = struct {
     }
 
     fn signedEvent(self: *Harness, content: []const u8) !Event {
+        return self.signedEventAt(test_now, content);
+    }
+
+    fn signedEventAt(self: *Harness, created_at: i64, content: []const u8) !Event {
         const keypair = try self.signer.keyPairFromSecretKey([_]u8{3} ** 32);
-        return nostr.event.create(self.arena(), self.signer, keypair, test_now, 1, &.{}, content, null);
+        return nostr.event.create(self.arena(), self.signer, keypair, created_at, 1, &.{}, content, null);
     }
 
     fn eventMessage(self: *Harness, event: Event) ![]u8 {
@@ -371,11 +495,108 @@ test "a message type this relay does not implement is answered with NOTICE" {
     try testing.expect(std.mem.indexOf(u8, harness.recorder.only(), "does not support COUNT") != null);
 }
 
-test "subscriptions are not served yet" {
+test "a REQ answers with the stored events, newest first, and then EOSE" {
     var harness = Harness.init(.{});
     harness.start();
     defer harness.deinit();
 
-    try harness.handle("[\"REQ\",\"sub\",{}]");
-    try testing.expect(std.mem.indexOf(u8, harness.recorder.only(), "NOTICE") != null);
+    const older = try harness.signedEvent("older");
+    var newer = try harness.signedEventAt(test_now + 10, "newer");
+    try harness.handle(try harness.eventMessage(older));
+    try harness.handle(try harness.eventMessage(newer));
+    harness.recorder.clear();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{}]");
+
+    const sent = harness.recorder.messages.items;
+    try testing.expectEqual(@as(usize, 3), sent.len);
+    try testing.expect(std.mem.indexOf(u8, sent[0], "newer") != null);
+    try testing.expect(std.mem.indexOf(u8, sent[1], "older") != null);
+    try testing.expectEqualStrings("[\"EOSE\",\"sub-1\"]", sent[2]);
+    newer = undefined;
+}
+
+test "a REQ that matches nothing still ends with EOSE" {
+    var harness = Harness.init(.{});
+    harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{\"kinds\":[9999]}]");
+    try testing.expectEqualStrings("[\"EOSE\",\"sub-1\"]", harness.recorder.only());
+}
+
+test "a REQ reusing an open id replaces that subscription" {
+    var harness = Harness.init(.{});
+    harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{\"kinds\":[1]}]");
+    try harness.handle("[\"REQ\",\"sub-1\",{\"kinds\":[7]}]");
+
+    try testing.expectEqual(@as(usize, 1), harness.registry.count());
+    const open_subscription = harness.registry.find("sub-1").?;
+    try testing.expectEqual(@as(u16, 7), open_subscription.filters[0].kinds.?[0]);
+}
+
+test "CLOSE ends the subscription and says nothing" {
+    var harness = Harness.init(.{});
+    harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{}]");
+    harness.recorder.clear();
+
+    try harness.handle("[\"CLOSE\",\"sub-1\"]");
+    try testing.expectEqual(@as(usize, 0), harness.registry.count());
+    try testing.expectEqual(@as(usize, 0), harness.recorder.messages.items.len);
+}
+
+test "closing a subscription that was never open is not an error" {
+    var harness = Harness.init(.{});
+    harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"CLOSE\",\"never-opened\"]");
+    try testing.expectEqual(@as(usize, 0), harness.recorder.messages.items.len);
+}
+
+test "one subscription too many is refused with CLOSED and blocked" {
+    var harness = Harness.init(.{ .subscription = .{ .max_subscriptions = 1 } });
+    harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{}]");
+    harness.recorder.clear();
+    try harness.handle("[\"REQ\",\"sub-2\",{}]");
+
+    const answer = harness.recorder.only();
+    try testing.expect(std.mem.startsWith(u8, answer, "[\"CLOSED\",\"sub-2\",\"blocked:"));
+    try testing.expectEqual(@as(usize, 1), harness.registry.count());
+}
+
+test "a REQ refused by the codec is answered with CLOSED naming the subscription" {
+    var harness = Harness.init(.{ .message = .{ .max_filters = 1 } });
+    harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{},{}]");
+
+    const answer = harness.recorder.only();
+    try testing.expect(std.mem.startsWith(u8, answer, "[\"CLOSED\",\"sub-1\",\"invalid:"));
+    try testing.expect(std.mem.indexOf(u8, answer, "over the limit of 1") != null);
+}
+
+test "a filter in a REQ decides what the subscription is answered with" {
+    var harness = Harness.init(.{});
+    harness.start();
+    defer harness.deinit();
+
+    try harness.handle(try harness.eventMessage(try harness.signedEvent("kept")));
+    harness.recorder.clear();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{\"kinds\":[1]},{\"kinds\":[7]}]");
+    const sent = harness.recorder.messages.items;
+    try testing.expectEqual(@as(usize, 2), sent.len);
+    try testing.expect(std.mem.indexOf(u8, sent[0], "kept") != null);
+    try testing.expectEqualStrings("[\"EOSE\",\"sub-1\"]", sent[1]);
 }

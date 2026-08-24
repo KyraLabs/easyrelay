@@ -33,6 +33,9 @@ pub const codec = @import("relay/codec.zig");
 /// One client's conversation with the relay: what arrives, what is answered.
 pub const session = @import("relay/session.zig");
 
+/// The subscriptions one connection has open.
+pub const subscriptions = @import("relay/subscriptions.zig");
+
 /// How a failure explains itself to the client that caused it.
 pub const diagnostics = @import("relay/diagnostics.zig");
 
@@ -46,6 +49,7 @@ test {
     _ = filter;
     _ = codec;
     _ = session;
+    _ = subscriptions;
     _ = diagnostics;
     _ = server;
 }

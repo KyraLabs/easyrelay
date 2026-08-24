@@ -11,6 +11,7 @@ const nostr = @import("nostr");
 const ws = @import("websocket");
 
 const session = @import("../relay/session.zig");
+const subscriptions = @import("../relay/subscriptions.zig");
 
 /// The transport, parameterised by this relay's connection handler.
 pub const Server = ws.Server(Connection);
@@ -19,6 +20,10 @@ pub const Server = ws.Server(Connection);
 /// through it in Zig 0.16 and each message needs one reading of it.
 pub const App = struct {
     io: std.Io,
+    /// For connection-lifetime state. Never an arena: a connection's
+    /// subscriptions come and go, and memory a client can make grow without
+    /// bound is a memory it can exhaust.
+    gpa: std.mem.Allocator,
     shared: *const session.Shared,
 };
 
@@ -73,12 +78,23 @@ fn signer() nostr.keys.Signer {
 pub const Connection = struct {
     app: *App,
     conn: *ws.Conn,
+    /// This connection's subscriptions, and no other connection's.
+    subscriptions: subscriptions.Registry,
 
     pub fn init(handshake: *ws.Handshake, conn: *ws.Conn, app: *App) !Connection {
         // Nothing in the handshake decides anything yet. NIP-42 and the
         // admission policy are Phase 3, and they arrive here.
         _ = handshake;
-        return .{ .app = app, .conn = conn };
+        return .{
+            .app = app,
+            .conn = conn,
+            .subscriptions = subscriptions.Registry.init(app.gpa, app.shared.limits.subscription),
+        };
+    }
+
+    /// Called exactly once, whatever ends the connection.
+    pub fn close(self: *Connection) void {
+        self.subscriptions.deinit();
     }
 
     /// `websocket.zig` guarantees one message at a time per connection, so
@@ -90,6 +106,7 @@ pub const Connection = struct {
         var current: session.Session = .{
             .shared = self.app.shared,
             .responder = frames.responder(),
+            .subscriptions = &self.subscriptions,
         };
         try current.handle(.{
             .arena = arena,
@@ -153,7 +170,7 @@ test "a client publishes over a real connection and is answered OK" {
     var backing = memory.Memory.init(testing.allocator);
     defer backing.deinit();
     const shared: session.Shared = .{ .store = backing.store() };
-    var app: App = .{ .io = io, .shared = &shared };
+    var app: App = .{ .io = io, .gpa = testing.allocator, .shared = &shared };
 
     var server = try init(testing.allocator, &app, .{
         .port = test_port,
@@ -170,6 +187,9 @@ test "a client publishes over a real connection and is answered OK" {
         .host = "127.0.0.1",
     });
     defer client.deinit();
+    // Closing properly rather than dropping the socket keeps the library from
+    // logging a torn-down connection as a handshake failure.
+    defer client.close(.{}) catch {};
     try client.handshake("/", .{ .timeout_ms = 2000, .headers = "Host: 127.0.0.1" });
 
     var signer_instance = nostr.keys.Signer.init();

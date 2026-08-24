@@ -146,7 +146,9 @@ Matching rules:
 - Events are streamed newest-first by `created_at`, tie-broken by ascending id.
 
 The relay caps `limit` at its configured `max_limit` and applies `default_limit` when the field
-is absent. Both are advertised in the NIP-11 document.
+is absent. Both are advertised in the NIP-11 document. When several filters in one `REQ` name
+different limits, the largest applies across the merged result, so that no filter is served
+fewer events than it asked for.
 
 ## Kind semantics
 

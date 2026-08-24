@@ -170,6 +170,9 @@ fn decodeReq(
         return malformed(diagnostics, .wrong_shape, "REQ carries a subscription id and its filters", .{});
     }
     const subscription_id = try decodeSubscriptionId(array[1], limits, diagnostics);
+    // From here on the failure has a subscription id to name, which is what
+    // lets the caller answer `CLOSED` rather than `NOTICE`.
+    diagnostics.subject = subscription_id;
 
     const count = array.len - 2;
     if (count > limits.max_filters) {
@@ -205,7 +208,9 @@ fn decodeClose(
     if (array.len != 2) {
         return malformed(diagnostics, .wrong_shape, "CLOSE carries exactly one subscription id", .{});
     }
-    return .{ .close = .{ .subscription_id = try decodeSubscriptionId(array[1], limits, diagnostics) } };
+    const subscription_id = try decodeSubscriptionId(array[1], limits, diagnostics);
+    diagnostics.subject = subscription_id;
+    return .{ .close = .{ .subscription_id = subscription_id } };
 }
 
 fn decodeSubscriptionId(
@@ -621,4 +626,21 @@ test "a subscription id with characters that need escaping survives the round tr
     var parsed = try nostr.message.parseRelayMessage(testing.allocator, out.written());
     defer parsed.deinit();
     try testing.expectEqualStrings(hostile, parsed.value.eose.subscription_id);
+}
+
+test "a REQ refused after its id was read names the subscription" {
+    var harness = Harness.init(.{ .max_filters = 1 });
+    defer harness.deinit();
+
+    try testing.expectError(error.MalformedMessage, harness.read("[\"REQ\",\"sub-1\",{},{}]"));
+    try testing.expectEqual(Reason.too_many_filters, harness.diagnostics.reason.?);
+    try testing.expectEqualStrings("sub-1", harness.diagnostics.subject.?);
+}
+
+test "a REQ refused before its id was read names nothing" {
+    var harness = Harness.init(.{});
+    defer harness.deinit();
+
+    try testing.expectError(error.MalformedMessage, harness.read("[\"REQ\",\"\",{}]"));
+    try testing.expectEqual(@as(?[]const u8, null), harness.diagnostics.subject);
 }

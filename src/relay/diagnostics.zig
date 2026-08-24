@@ -25,6 +25,12 @@ pub fn Diagnostics(comptime Reason: type) type {
 
         /// Null until something fails.
         reason: ?Reason = null,
+        /// What the failure is about, when there is something the caller can
+        /// name in its answer. A `REQ` refused after its subscription id was
+        /// read is answered with `CLOSED` naming that id, rather than with a
+        /// bare `NOTICE` the client cannot tie to anything. Borrowed from the
+        /// message being decoded, so it lives exactly as long as that does.
+        subject: ?[]const u8 = null,
         message_buffer: [capacity]u8 = undefined,
         message_length: usize = 0,
 
