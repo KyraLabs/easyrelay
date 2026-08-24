@@ -66,10 +66,29 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
 
+    // The conformance suite: docs/protocol.md driven through a real WebSocket
+    // connection, which is what docs/testing.md asks of it. A separate artifact
+    // because it links the relay, the transport and a client together, and none
+    // of that belongs in a unit test's module.
+    const conformance_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/conformance/conformance.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "easyrelay", .module = mod },
+                .{ .name = "nostr", .module = nostr.module("nostr") },
+                .{ .name = "websocket", .module = websocket.module("websocket") },
+            },
+        }),
+        .filters = test_filters,
+    });
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
     test_step.dependOn(&b.addRunArtifact(vector_tests).step);
+    test_step.dependOn(&b.addRunArtifact(conformance_tests).step);
 
     // Compiles everything without installing it, so an editor can get diagnostics
     // without racing the real build over the output directory.
@@ -78,4 +97,5 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&mod_tests.step);
     check_step.dependOn(&exe_tests.step);
     check_step.dependOn(&vector_tests.step);
+    check_step.dependOn(&conformance_tests.step);
 }
