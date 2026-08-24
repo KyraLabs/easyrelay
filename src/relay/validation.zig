@@ -16,6 +16,8 @@
 const std = @import("std");
 const nostr = @import("nostr");
 
+const diag = @import("diagnostics.zig");
+
 const Event = nostr.event.Event;
 
 pub const Error = error{
@@ -54,40 +56,21 @@ pub const Reason = enum {
 };
 
 /// Carries the reason a validation failed back to the caller, which turns it
-/// into the `OK` message. Machine-readable in `reason`, human-readable in
-/// `message`: a test that asserts on prose breaks when the prose improves.
-pub const Diagnostics = struct {
-    reason: ?Reason = null,
-    message_buffer: [capacity]u8 = undefined,
-    message_length: usize = 0,
+/// into the `OK` message.
+pub const Diagnostics = diag.Diagnostics(Reason);
 
-    /// Long enough for every message below with its numbers substituted.
-    const capacity = 160;
-
-    /// What goes after `invalid: ` in the `OK` message. Empty until a check
-    /// fails.
-    pub fn message(self: *const Diagnostics) []const u8 {
-        return self.message_buffer[0..self.message_length];
-    }
-
-    fn fail(
-        self: *Diagnostics,
-        reason: Reason,
-        comptime format: []const u8,
-        args: anytype,
-    ) Error {
-        self.reason = reason;
-        const written = std.fmt.bufPrint(&self.message_buffer, format, args) catch blk: {
-            // Unreachable with the formats used here, all of which are short.
-            // If a future one is not, the client still learns what failed.
-            const name = @tagName(reason);
-            @memcpy(self.message_buffer[0..name.len], name);
-            break :blk self.message_buffer[0..name.len];
-        };
-        self.message_length = written.len;
-        return error.Invalid;
-    }
-};
+/// Records the reason and returns the module's error in one expression, so
+/// that a check reads as a single statement and cannot record a failure
+/// without returning one.
+fn invalid(
+    into: *Diagnostics,
+    reason: Reason,
+    comptime format: []const u8,
+    args: anytype,
+) Error {
+    into.fail(reason, format, args);
+    return error.Invalid;
+}
 
 pub const Validator = struct {
     limits: Limits = .{},
@@ -114,21 +97,24 @@ pub const Validator = struct {
         diagnostics: *Diagnostics,
     ) Error!void {
         if (serialized_length > self.limits.max_event_size) {
-            return diagnostics.fail(
+            return invalid(
+                diagnostics,
                 .event_too_large,
                 "event is {d} bytes, over the {d} byte limit",
                 .{ serialized_length, self.limits.max_event_size },
             );
         }
         if (event.tags.len > self.limits.max_event_tags) {
-            return diagnostics.fail(
+            return invalid(
+                diagnostics,
                 .too_many_tags,
                 "event carries {d} tags, over the limit of {d}",
                 .{ event.tags.len, self.limits.max_event_tags },
             );
         }
         if (event.content.len > self.limits.max_content_length) {
-            return diagnostics.fail(
+            return invalid(
+                diagnostics,
                 .content_too_large,
                 "content is {d} bytes, over the {d} byte limit",
                 .{ event.content.len, self.limits.max_content_length },
@@ -138,7 +124,8 @@ pub const Validator = struct {
         // Saturating, because both bounds are configured and `now` is not: an
         // overflow here would be a rejection turning into an acceptance.
         if (event.created_at > now +| self.limits.created_at_upper_limit_s) {
-            return diagnostics.fail(
+            return invalid(
+                diagnostics,
                 .created_at_too_far_ahead,
                 "created_at is more than {d} seconds in the future",
                 .{self.limits.created_at_upper_limit_s},
@@ -146,7 +133,8 @@ pub const Validator = struct {
         }
         if (self.limits.created_at_lower_limit_s) |lower| {
             if (event.created_at < now -| lower) {
-                return diagnostics.fail(
+                return invalid(
+                    diagnostics,
                     .created_at_too_far_behind,
                     "created_at is more than {d} seconds in the past",
                     .{lower},
@@ -163,7 +151,8 @@ pub const Validator = struct {
             event.content,
         );
         if (!std.mem.eql(u8, &recomputed, &event.id)) {
-            return diagnostics.fail(
+            return invalid(
+                diagnostics,
                 .id_mismatch,
                 "id does not match the canonical serialization of the event",
                 .{},
@@ -171,7 +160,8 @@ pub const Validator = struct {
         }
 
         if (!self.signer.verifyId(event.sig, event.id, event.pubkey)) {
-            return diagnostics.fail(
+            return invalid(
+                diagnostics,
                 .bad_signature,
                 "signature does not verify against the event's pubkey",
                 .{},

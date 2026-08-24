@@ -24,10 +24,18 @@ pub const memory = @import("storage/memory.zig");
 /// Validation of inbound events, in the order docs/architecture.md fixes.
 pub const validation = @import("relay/validation.zig");
 
+/// Decoding the filters a `REQ` carries, with docs/protocol.md's strictness.
+pub const filter = @import("relay/filter.zig");
+
+/// How a failure explains itself to the client that caused it.
+pub const diagnostics = @import("relay/diagnostics.zig");
+
 test {
     _ = store;
     _ = memory;
     _ = validation;
+    _ = filter;
+    _ = diagnostics;
 }
 
 test "version is a non-empty semantic version" {
