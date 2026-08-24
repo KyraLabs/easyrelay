@@ -21,9 +21,25 @@ pub const store = @import("storage/store.zig");
 /// tests hold the indexed backend to afterwards.
 pub const memory = @import("storage/memory.zig");
 
+/// Validation of inbound events, in the order docs/architecture.md fixes.
+pub const validation = @import("relay/validation.zig");
+
+/// Decoding the filters a `REQ` carries, with docs/protocol.md's strictness.
+pub const filter = @import("relay/filter.zig");
+
+/// The relay's half of the NIP-01 wire format.
+pub const codec = @import("relay/codec.zig");
+
+/// How a failure explains itself to the client that caused it.
+pub const diagnostics = @import("relay/diagnostics.zig");
+
 test {
     _ = store;
     _ = memory;
+    _ = validation;
+    _ = filter;
+    _ = codec;
+    _ = diagnostics;
 }
 
 test "version is a non-empty semantic version" {

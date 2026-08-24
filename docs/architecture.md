@@ -50,9 +50,18 @@ request carries `Accept: application/nostr+json`, `GET /metrics`, and `GET /heal
 
 ### Protocol
 
-Decodes and encodes the Nostr wire format, and validates events. Message parsing, filter
-representation and event structure come from `zig-nostr/nostr`'s `message.zig`, `filter.zig`
-and `event.zig`; this layer adapts them to the relay's needs rather than reimplementing them.
+Decodes and encodes the Nostr wire format, and validates events. The event structure, the
+filter model and filter matching come from `zig-nostr/nostr`'s `event.zig` and `filter.zig`;
+this layer adapts them rather than reimplementing them.
+
+Reading the wire is first-party, and not by choice. The dependency's `message.zig` encodes what
+a client sends and parses what a relay answers; the relay needs exactly the opposite direction,
+and `filter.zig` has no decoder at all, because a client library writes filters and reads
+events. So easyrelay decodes `EVENT`, `REQ` and `CLOSE` and encodes `EVENT`, `OK`, `EOSE`,
+`CLOSED` and `NOTICE` itself. That is where the untrusted input arrives, which is the right side
+of the boundary to own. The dependency's client-side codec earns its keep here as the test
+oracle: a message easyrelay encodes is parsed back with `parseRelayMessage`, and a message
+easyrelay decodes was built with `encodeReq`.
 
 Validation of an inbound event, in order and short-circuiting on first failure:
 

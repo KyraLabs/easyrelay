@@ -69,7 +69,9 @@ public key in `pubkey`. Verification uses `libsecp256k1`; see
 | `NEG-CLOSE` | `["NEG-CLOSE", <sub_id>]` | NIP-77 |
 
 `sub_id` is a non-empty string, at most 64 characters, scoped to the connection. A `REQ` reusing
-an open `sub_id` replaces that subscription.
+an open `sub_id` replaces that subscription. A `REQ` carrying no filters at all is a valid
+subscription that matches nothing: it is answered with `EOSE` and stays open, because zero
+filters OR-ed together is what it asks for.
 
 ### Relay to client
 
@@ -127,9 +129,16 @@ Matching rules:
 - Within one field, values are **OR**-ed. Across fields, conditions are **AND**-ed.
 - An absent field imposes no constraint. An empty array matches nothing.
 - `since` and `until` are inclusive: `since <= created_at <= until`.
-- Tag filters use a single-letter key (`a`-`z`, `A`-`Z`) and match the tag's **first value**.
+- Tag filters use a single-letter key (`a`-`z`, `A`-`Z`) and match the tag's **first value**. A
+  `#` key that is not exactly one letter is a malformed filter. Ignoring it would widen the
+  result set, and answering a narrower question with more events is worse than refusing it.
 - `ids`, `authors`, `#e` and `#p` must be exactly 64 lowercase hex characters. Anything else is
   a malformed filter, not a filter that matches nothing.
+- Numeric fields must be integers within range: a `kind` outside 0–65535, or a negative `limit`,
+  is a malformed filter rather than a clamped one. Truncating 65537 into kind 1 would subscribe
+  the client to something it did not ask for.
+- A field NIP-01 does not define is ignored, so that a client sending a field for a NIP this
+  relay does not implement still gets an answer.
 - Multiple filters in one `REQ` are OR-ed against each other; an event matching any of them is
   sent once.
 - `limit` applies **only to the stored-event phase** and selects the *most recent* matching
