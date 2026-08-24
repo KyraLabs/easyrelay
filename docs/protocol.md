@@ -1,7 +1,9 @@
 # Protocol reference
 
-This is the behavioural contract easyrelay implements. Every rule here is backed by a test in
-`tests/conformance/`. Where this document and the
+This is the behavioural contract easyrelay implements. Every rule here that the relay implements
+is backed by a test — by a conformance test in `tests/conformance/` where the rule is observable
+on the wire, and by a unit test where it is not. The conformance suite grows with each phase;
+[roadmap.md](roadmap.md) records where it stands. Where this document and the
 [NIPs](https://github.com/nostr-protocol/nips) disagree, the NIPs win and this document is a
 bug.
 

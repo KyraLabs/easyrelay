@@ -2,8 +2,10 @@
 
 A [Nostr](https://github.com/nostr-protocol/nips) relay written in [Zig](https://ziglang.org).
 
-**Status: pre-alpha.** There is no working relay yet. What exists is the project scaffold —
-build, tests, CI, release automation — and the design documentation. See the
+**Status: pre-alpha.** The relay works and is not ready to run for anyone else yet. It speaks
+NIP-01 over WebSocket — publishing, subscriptions, live delivery, full event validation — and it
+keeps everything in memory, so a restart loses it. Persistence and kind semantics are Phase 2;
+the rate limits, authentication and distribution a public relay needs are Phase 3. See the
 [roadmap](docs/roadmap.md) for what is being built and in which order.
 
 ## What it is
@@ -33,9 +35,10 @@ the admission policy layer, and the operational surface.
 
 ## Quick start
 
-> **Not available yet.** This is the experience the project is built toward, written down here
-> as a contract rather than an aspiration — it is what the Phase 2 and Phase 3 exit criteria in
-> the [roadmap](docs/roadmap.md) test for.
+> **Partly available.** Running the relay with no arguments works today. The data directory,
+> the released binaries and the compose file below do not exist yet: they are what the Phase 2
+> and Phase 3 exit criteria in the [roadmap](docs/roadmap.md) test for, written down here as a
+> contract rather than an aspiration.
 
 Run it:
 
