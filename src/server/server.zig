@@ -22,11 +22,21 @@ pub const Server = ws.Server(Connection);
 /// Shared by every connection. `io` is here because the wall clock comes
 /// through it in Zig 0.16 and each message needs one reading of it.
 pub const App = struct {
-    /// For connection-lifetime state. Never an arena: a connection's
-    /// subscriptions come and go, and memory a client can make grow without
-    /// bound is a memory it can exhaust.
+    /// For connection-lifetime state. Never one arena for the whole
+    /// connection: its subscriptions come and go, an arena never gives memory
+    /// back, and a client that reopens a subscription in a loop would make it
+    /// grow without bound. Each subscription owns an arena instead, which is
+    /// where docs/development.md's rule lands once replacement is a real
+    /// operation — see src/relay/subscriptions.zig.
     gpa: std.mem.Allocator,
     shared: *const session.Shared,
+    /// Connections that have started and not finished closing.
+    ///
+    /// A connection leaves the hub at the top of its `close`, so the hub's own
+    /// count reaches zero while a pool thread may still be inside that `close`.
+    /// Anything that waits for connections to be gone — the tests, and Phase
+    /// 3's graceful shutdown — has to wait for this instead.
+    live: std.atomic.Value(usize) = .init(0),
 };
 
 /// Mirrors the `network` section of docs/configuration.md, spelling included,
@@ -53,8 +63,13 @@ pub fn init(gpa: std.mem.Allocator, app: *App, options: Options) !Server {
         .handshake = .{
             // The library counts the handshake timeout in whole seconds while
             // docs/configuration.md publishes milliseconds. Round up, so that a
-            // configured timeout is never shorter than what was asked for.
-            .timeout = @intCast((options.handshake_timeout_ms + 999) / 1000),
+            // configured timeout is never shorter than what was asked for, and
+            // widen first: rounding a millisecond value near the top of a u32
+            // would otherwise overflow and panic before the relay ever binds.
+            .timeout = @intCast(@min(
+                (@as(u64, options.handshake_timeout_ms) + 999) / 1000,
+                std.math.maxInt(u32),
+            )),
             .max_headers = 0,
         },
         .thread_pool = .{ .count = options.message_threads },
@@ -95,6 +110,9 @@ pub const Connection = struct {
         // Nothing in the handshake decides anything yet. NIP-42 and the
         // admission policy are Phase 3, and they arrive here.
         _ = handshake;
+        // Paired with the decrement at the end of `close`, which the transport
+        // runs for every connection whose `init` returned.
+        _ = app.live.fetchAdd(1, .monotonic);
         return .{
             .app = app,
             .conn = conn,
@@ -125,6 +143,7 @@ pub const Connection = struct {
         // next line frees.
         self.app.shared.hub.leave(&self.subscriber);
         self.subscriber.registry.deinit();
+        _ = self.app.live.fetchSub(1, .release);
     }
 
     /// Called from other connections' threads. `websocket.zig` documents
@@ -201,16 +220,20 @@ const memory = @import("../storage/memory.zig");
 /// and does not report back which port it got, so this cannot be zero.
 const test_port = 47_777;
 
-/// Waits until the relay has seen every connection go.
+/// Waits until every connection has finished closing.
 ///
 /// Stopping while a connection is still being torn down walks into a race in
 /// `websocket.zig`: one thread frees a connection's state while a pool thread
 /// is still running that connection's `close`. Draining first keeps the test
 /// out of that window, and it is what Phase 3's graceful shutdown will do for
 /// real — stop accepting, let the connections finish, then close.
-fn drain(io: std.Io, connections: *hub.Hub) !void {
+///
+/// It waits on `App.live` rather than on the hub's count, because a connection
+/// leaves the hub before its `close` has finished: the count would go to zero
+/// with a thread still inside the code this is waiting for.
+fn drain(io: std.Io, app: *App) !void {
     for (0..200) |_| {
-        if (connections.count() == 0) return;
+        if (app.live.load(.acquire) == 0) return;
         try io.sleep(.fromMilliseconds(10), .awake);
     }
     return error.ConnectionsDidNotClose;
@@ -278,7 +301,7 @@ test "a client publishes over a real connection and is answered OK" {
     try testing.expectEqualStrings(expected, reply.data);
 
     try client.close(.{});
-    try drain(io, &connections);
+    try drain(io, &app);
 }
 
 test "one connection subscribes, another publishes, and the first receives it live" {
@@ -360,5 +383,5 @@ test "one connection subscribes, another publishes, and the first receives it li
 
     try reader.close(.{});
     try writer.close(.{});
-    try drain(io, &connections);
+    try drain(io, &app);
 }

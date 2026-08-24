@@ -229,3 +229,26 @@ test "the stored bound is the largest a filter asked for, capped by max_limit" {
     try testing.expectEqual(@as(usize, 100), resolveLimit(&.{.{ .limit = 5000 }}, limits));
     try testing.expectEqual(@as(usize, 0), resolveLimit(&.{.{ .limit = 0 }}, limits));
 }
+
+test "a replacement that cannot be built leaves the old subscription serving" {
+    var registry = Registry.init(testing.allocator, .{});
+    defer registry.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try registry.open("sub-1", &[_]Filter{try testFilter(arena.allocator(), 1, "original")});
+
+    // The replacement's first allocation fails. The allocator goes back
+    // afterwards, so the entries this registry already owns are freed by the
+    // one that allocated them.
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    registry.gpa = failing.allocator();
+    const replacement = [_]Filter{try testFilter(arena.allocator(), 7, "replacement")};
+    try testing.expectError(error.OutOfMemory, registry.open("sub-1", &replacement));
+    registry.gpa = testing.allocator;
+
+    const surviving = registry.find("sub-1").?;
+    try testing.expectEqual(@as(usize, 1), registry.count());
+    try testing.expectEqual(@as(u16, 1), surviving.filters[0].kinds.?[0]);
+    try testing.expectEqualStrings("original", surviving.filters[0].tags.?[0].values[0]);
+}

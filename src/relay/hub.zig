@@ -100,13 +100,37 @@ pub const Hub = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
+        // Serialized once for the whole fan-out rather than once per
+        // subscription: they differ only in the id they carry, and this is the
+        // path every accepted event takes to every subscriber that wants it.
+        // Lazily, so that an event nothing matches costs nothing.
+        var serialized: ?[]const u8 = null;
+
         for (self.members.items) |member| {
             member.mutex.lockUncancelable(self.io);
             defer member.mutex.unlock(self.io);
 
             for (member.registry.items()) |subscription| {
                 if (!matchesAny(subscription.filters, event)) continue;
-                deliver(arena, member, subscription.id, event);
+
+                const body = serialized orelse body: {
+                    const rendered = nostr.event.toJson(arena, event.*) catch |err| {
+                        // Not silently: a delivery that did not happen is
+                        // invisible to everyone but the operator. The event
+                        // itself is stored and a later query will find it,
+                        // which is why this does not undo the acceptance the
+                        // publisher was already given. Phase 3 gives it a
+                        // metric next to the structured logging.
+                        log.warn(
+                            "dropping the fan-out of event {s}: {t}",
+                            .{ std.fmt.bytesToHex(event.id, .lower), err },
+                        );
+                        return;
+                    };
+                    serialized = rendered;
+                    break :body rendered;
+                };
+                deliver(arena, member, subscription.id, body);
             }
         }
     }
@@ -123,15 +147,12 @@ fn deliver(
     arena: std.mem.Allocator,
     member: *Subscriber,
     subscription_id: []const u8,
-    event: *const Event,
+    serialized_event: []const u8,
 ) void {
     var message: std.Io.Writer.Allocating = .init(arena);
     defer message.deinit();
 
-    codec.writeEvent(&message.writer, arena, subscription_id, event.*) catch |err| {
-        // Not silently: an event that could not be composed is a delivery that
-        // did not happen, and the operator is the only one who can see it.
-        // Phase 3 gives this a metric alongside the structured logging.
+    codec.writeEventEnvelope(&message.writer, subscription_id, serialized_event) catch |err| {
         log.warn("dropping a delivery to subscription {s}: {t}", .{ subscription_id, err });
         return;
     };

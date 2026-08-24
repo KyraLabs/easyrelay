@@ -301,16 +301,28 @@ pub fn writeEvent(
     event: Event,
 ) (std.Io.Writer.Error || error{OutOfMemory})!void {
     // The dependency serializes an event into an owned slice and offers no
-    // append-into-writer variant, so the relay pays one allocation per event
-    // sent. It comes from the per-request arena; whether it is worth removing
-    // is a question for Phase 6's benchmarks, not for a guess here.
+    // append-into-writer variant, so this costs one allocation. It comes from
+    // the per-request arena.
     const body = try nostr.event.toJson(gpa, event);
     defer gpa.free(body);
+    try writeEventEnvelope(writer, subscription_id, body);
+}
 
+/// The same message from an event that is already serialized.
+///
+/// Fan-out sends one event to many subscriptions, which differ only in the id
+/// they carry, so it serializes once and calls this for each. That path is the
+/// relay's hot one: every accepted event is written to every subscriber that
+/// wants it.
+pub fn writeEventEnvelope(
+    writer: *std.Io.Writer,
+    subscription_id: []const u8,
+    serialized_event: []const u8,
+) std.Io.Writer.Error!void {
     try writer.writeAll("[\"EVENT\",");
     try std.json.Stringify.encodeJsonString(subscription_id, .{}, writer);
     try writer.writeByte(',');
-    try writer.writeAll(body);
+    try writer.writeAll(serialized_event);
     try writer.writeByte(']');
 }
 

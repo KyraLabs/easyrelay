@@ -374,6 +374,9 @@ const Harness = struct {
     /// answered directly. The two are different paths and worth telling apart.
     delivered: std.ArrayList([]u8),
     limits: Limits,
+    /// Set before `start` to answer from something other than the memory
+    /// backend.
+    override_store: ?store.Store = null,
     connections: hub.Hub = undefined,
     subscriber: hub.Subscriber = undefined,
     shared: Shared = undefined,
@@ -403,7 +406,7 @@ const Harness = struct {
         try self.connections.join(&self.subscriber);
         self.shared = .{
             .io = io,
-            .store = self.backing.store(),
+            .store = self.override_store orelse self.backing.store(),
             .hub = &self.connections,
             .limits = self.limits,
         };
@@ -703,4 +706,70 @@ test "a closed subscription stops receiving" {
     try harness.handle(try harness.eventMessage(try harness.signedEvent("after")));
 
     try testing.expectEqual(@as(usize, 0), harness.delivered.items.len);
+}
+
+/// Fails on demand. `memory.Memory` never fails, so without this the paths that
+/// answer `error:` are unreachable and untested — and they are the paths a real
+/// storage engine will take.
+const FailingStore = struct {
+    put_error: ?store.Error = null,
+    query_error: ?store.Error = null,
+
+    const vtable: store.Store.VTable = .{ .put = put, .query = query };
+
+    fn interface(self: *FailingStore) store.Store {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn put(ptr: *anyopaque, event: *const Event) store.Error!store.PutResult {
+        const self: *FailingStore = @ptrCast(@alignCast(ptr));
+        _ = event;
+        if (self.put_error) |failure| return failure;
+        return .stored;
+    }
+
+    fn query(
+        ptr: *anyopaque,
+        filters: []const nostr.filter.Filter,
+        limit: usize,
+        sink: store.Sink,
+    ) store.QueryError!void {
+        const self: *FailingStore = @ptrCast(@alignCast(ptr));
+        _ = .{ filters, limit, sink };
+        if (self.query_error) |failure| return failure;
+    }
+};
+
+test "an event the store cannot accept is answered with error:" {
+    for ([_]store.Error{ error.Backend, error.OutOfMemory }) |failure| {
+        var failing: FailingStore = .{ .put_error = failure };
+        var harness = Harness.init(.{});
+        harness.override_store = failing.interface();
+        try harness.start();
+        defer harness.deinit();
+
+        try harness.handle(try harness.eventMessage(try harness.signedEvent("refused")));
+
+        const answer = harness.recorder.only();
+        try testing.expect(std.mem.indexOf(u8, answer, ",false,\"error:") != null);
+        try testing.expectEqual(@as(usize, 0), harness.delivered.items.len);
+    }
+}
+
+test "a subscription the store cannot answer is closed, not left open" {
+    for ([_]store.Error{ error.Backend, error.OutOfMemory }) |failure| {
+        var failing: FailingStore = .{ .query_error = failure };
+        var harness = Harness.init(.{});
+        harness.override_store = failing.interface();
+        try harness.start();
+        defer harness.deinit();
+
+        try harness.handle("[\"REQ\",\"sub-1\",{}]");
+
+        const answer = harness.recorder.only();
+        try testing.expect(std.mem.startsWith(u8, answer, "[\"CLOSED\",\"sub-1\",\"error:"));
+        // Telling the client the subscription is over and continuing to serve
+        // it are contradictory; the registry has to agree with the message.
+        try testing.expectEqual(@as(usize, 0), harness.subscriber.registry.count());
+    }
 }
