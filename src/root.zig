@@ -17,8 +17,13 @@ pub const version = "0.0.0-dev";
 /// docs/adr/0008-store-abstraction-boundary.md.
 pub const store = @import("storage/store.zig");
 
+/// The in-memory backend: what Phase 1 runs on, and the oracle the property
+/// tests hold the indexed backend to afterwards.
+pub const memory = @import("storage/memory.zig");
+
 test {
     _ = store;
+    _ = memory;
 }
 
 test "version is a non-empty semantic version" {
