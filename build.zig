@@ -50,9 +50,25 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{ .root_module = mod, .filters = test_filters });
     const exe_tests = b.addTest(.{ .root_module = exe.root_module, .filters = test_filters });
 
+    // The vector suite runs on every build, which is the point of it: it is
+    // the tripwire on the dependency's canonical serialization and signature
+    // behaviour. See tests/vectors/README.md.
+    const vector_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tests/vectors/vectors.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "nostr", .module = nostr.module("nostr") },
+            },
+        }),
+        .filters = test_filters,
+    });
+
     const test_step = b.step("test", "Run all tests");
     test_step.dependOn(&b.addRunArtifact(mod_tests).step);
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
+    test_step.dependOn(&b.addRunArtifact(vector_tests).step);
 
     // Compiles everything without installing it, so an editor can get diagnostics
     // without racing the real build over the output directory.
@@ -60,4 +76,5 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&exe.step);
     check_step.dependOn(&mod_tests.step);
     check_step.dependOn(&exe_tests.step);
+    check_step.dependOn(&vector_tests.step);
 }
