@@ -11,11 +11,13 @@ pub fn build(b: *std.Build) void {
     ) orelse &.{};
 
     // The protocol primitives (event model, canonical serialization, Schnorr via
-    // libsecp256k1, filters) and the WebSocket transport. Both are recorded
-    // decisions: docs/adr/0002-build-on-zig-nostr.md and
-    // docs/adr/0004-websocket-transport.md.
+    // libsecp256k1, filters), the WebSocket transport, and LMDB. All three are
+    // recorded decisions: docs/adr/0002-build-on-zig-nostr.md,
+    // docs/adr/0004-websocket-transport.md and
+    // docs/adr/0010-first-party-lmdb-store.md.
     const nostr = b.dependency("nostr", .{ .target = target, .optimize = optimize });
     const websocket = b.dependency("websocket", .{ .target = target, .optimize = optimize });
+    const lmdb = b.dependency("lmdb", .{ .target = target, .optimize = optimize });
 
     const mod = b.addModule("easyrelay", .{
         .root_source_file = b.path("src/root.zig"),
@@ -24,6 +26,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "nostr", .module = nostr.module("nostr") },
             .{ .name = "websocket", .module = websocket.module("websocket") },
+            .{ .name = "lmdb", .module = lmdb.module("lmdb") },
         },
     });
 

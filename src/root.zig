@@ -64,13 +64,13 @@ test "version is a non-empty semantic version" {
 }
 
 // The dependencies are imported by the layers that need them rather than
-// re-exported here; nothing from `zig-nostr`'s store crosses the `Store`
-// boundary (docs/adr/0008-store-abstraction-boundary.md).
+// re-exported here; no LMDB type crosses the `Store` boundary
+// (docs/adr/0008-store-abstraction-boundary.md).
 //
 // What follows proves the dependency graph builds, links and runs. That is a
-// real question and not a formality: `zig-nostr` compiles libsecp256k1 and
-// LMDB from C source, and `websocket.zig`'s Zig 0.16 support is upstream-
-// flagged as experimental.
+// real question and not a formality: `zig-nostr` compiles libsecp256k1 from C
+// source, `zig-lmdb` compiles liblmdb, and `websocket.zig`'s Zig 0.16 support
+// is upstream-flagged as experimental.
 
 test "the canonical serialization is NIP-01's, not a general JSON encoder's" {
     const nostr = @import("nostr");
@@ -123,4 +123,35 @@ test "websocket.zig frames a text message" {
 
     const framed = websocket.frameText("hi");
     try std.testing.expectEqualSlices(u8, &.{ 0x81, 2, 'h', 'i' }, &framed);
+}
+
+test "liblmdb commits durably and reads back after reopening" {
+    const lmdb = @import("lmdb");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buffer: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, buffer[0..std.Io.Dir.max_path_bytes]);
+    buffer[len] = 0;
+    const path = buffer[0..len :0];
+
+    {
+        const env = try lmdb.Environment.init(path, .{});
+        defer env.deinit();
+
+        const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
+        errdefer txn.abort();
+        try txn.set("k", "v");
+        try txn.commit();
+    }
+
+    // Reopening is the half that matters: it is what Phase 2's first exit
+    // criterion asks of the store.
+    const env = try lmdb.Environment.init(path, .{});
+    defer env.deinit();
+
+    const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadOnly });
+    defer txn.abort();
+    try std.testing.expectEqualStrings("v", (try txn.get("k")).?);
 }

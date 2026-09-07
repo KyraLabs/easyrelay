@@ -13,6 +13,10 @@
             .url = "https://github.com/karlseguin/websocket.zig/archive/efa879736bd438bea8b86a91f220ba408de57273.tar.gz",
             .hash = "websocket-0.1.0-ZPISdWoTBQA8iviFsepUZiKrmT-oEyc-BwfbVzYwu7LO",
         },
+        .lmdb = .{
+            .url = "https://github.com/nDimensional/zig-lmdb/archive/refs/tags/v0.4.0%2B0.9.35.tar.gz",
+            .hash = "lmdb-0.4.0+0.9.35-6TpzoEpFAABUiMMYWrEAoyozQ4V2ViYBXFaMDQeoLQx7",
+        },
     },
     .paths = .{
         "build.zig",
