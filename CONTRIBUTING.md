@@ -73,9 +73,11 @@ docs(adr): amend 0004 after the transport spike
 test(conformance): cover replaceable tie-break by id
 ```
 
-Pull requests are squash-merged, so **the pull request title becomes the commit message** and
-is validated by CI against this format. Explain why in the body when the diff does not make it
-obvious.
+Pull requests are merged with a merge commit, so **every commit in the branch reaches the
+history as it was written** and each one has to follow this format on its own. Keep them
+focused: one logical change per commit, because they are what a later `git bisect` walks. The
+pull request title is validated by CI against the same format. Explain why in the body when the
+diff does not make it obvious.
 
 ## Code review
 
