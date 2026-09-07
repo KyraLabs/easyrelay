@@ -85,9 +85,9 @@ release tag where upstream publishes one. No branch references, no `main`.
 
 | Dependency | Purpose | Record |
 | --- | --- | --- |
-| [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr) | Event model, canonical serialization, Schnorr, filters, LMDB store | [ADR-0002](adr/0002-build-on-zig-nostr.md) |
+| [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr) | Event model, canonical serialization, Schnorr, filters | [ADR-0002](adr/0002-build-on-zig-nostr.md) |
 | [`websocket.zig`](https://github.com/karlseguin/websocket.zig) | WebSocket server | [ADR-0004](adr/0004-websocket-transport.md) |
-| [`zig-lmdb`](https://github.com/nDimensional/zig-lmdb) | Direct LMDB access, if the first-party schema is needed | [ADR-0003](adr/0003-storage-engine-lmdb.md) |
+| [`zig-lmdb`](https://github.com/nDimensional/zig-lmdb) | LMDB, under easyrelay's own store schema | [ADR-0010](adr/0010-first-party-lmdb-store.md) |
 
 `websocket.zig` is pinned to a **commit** rather than a tag: its Zig 0.16 support lives on
 `master`, and its only release tag predates it. The pin is immutable and hashed, which is what
@@ -116,10 +116,10 @@ See [architecture.md](architecture.md#repository-layout). Two rules the layout e
 
 - **Layers depend downward only.** `server/` may call `relay/`, `relay/` may call `storage/`,
   never the reverse. A storage backend does not know what a WebSocket is.
-- **No store type crosses the `Store` boundary.** `zig-nostr`'s store types stay inside
-  `storage/lmdb.zig`; everything above sees easyrelay's own `Store` types. Its protocol
-  primitives — events, filters, messages, keys — are shared vocabulary and may appear anywhere.
-  See [ADR-0008](adr/0008-store-abstraction-boundary.md).
+- **No store type crosses the `Store` boundary.** LMDB handles, transactions and cursors stay
+  inside `storage/lmdb.zig`; everything above sees easyrelay's own `Store` types. The protocol
+  primitives from `zig-nostr` — events, filters, messages, keys — are shared vocabulary and may
+  appear anywhere. See [ADR-0008](adr/0008-store-abstraction-boundary.md).
 
 ## Conventions
 

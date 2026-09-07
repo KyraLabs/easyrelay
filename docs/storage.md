@@ -6,11 +6,14 @@ LMDB, embedded. No external database process, no SQL engine, no query planner be
 NIP-01 filter language needs. The reasoning is in [ADR-0003](adr/0003-storage-engine-lmdb.md);
 the concurrency consequences are in [architecture.md](architecture.md#concurrency-model).
 
-The backend is `zig-nostr/nostr`'s zero-copy store, reached through easyrelay's own `Store`
-interface ([ADR-0008](adr/0008-store-abstraction-boundary.md)). This document describes the
-data model that backend must satisfy. It is written independently of that dependency so that it
-also serves as the specification for a replacement, should Phase 0's validation spike return a
-no-go.
+The backend is easyrelay's own, in `src/storage/lmdb.zig`, built on
+[`zig-lmdb`](https://github.com/nDimensional/zig-lmdb) and reached through the `Store` interface
+([ADR-0008](adr/0008-store-abstraction-boundary.md)). It was `zig-nostr/nostr`'s store until
+Phase 2 read that store against this document; [ADR-0010](adr/0010-first-party-lmdb-store.md)
+records what the comparison found and why the store is now first-party.
+
+This document is therefore a specification that is implemented, not a model a third-party backend
+is expected to approximate. Where the code and this file disagree, one of them is a bug.
 
 ## Data model
 
@@ -47,29 +50,6 @@ positioned at `until` and walked backwards yields exactly the newest-first order
 `by_author_kind` is a deliberate denormalisation: the `authors` + `kinds` combination is the
 single most common shape in real client traffic, and serving it from one cursor rather than
 intersecting two is the difference between a scan and a seek.
-
-### Where the current backend diverges
-
-The model above is the specification, written so that it also serves a replacement backend.
-`zig-nostr/nostr` v0.12.0, the backend [ADR-0003](adr/0003-storage-engine-lmdb.md) selects, does
-not implement all of it. The differences are recorded here because they were found at the start
-of Phase 2, and because a reader who took the model above for a description would design against
-something that is not there.
-
-**There is no local id.** The backend keys events by their 32-byte event id and orders them
-through a `[created_at][event_id]` index. It has no monotonic insertion counter anywhere.
-Anything specified in terms of insertion order therefore has no foundation today, including the
-subscription watermark in [roadmap.md](roadmap.md#phase-2--persistence-and-indexes), which was
-written assuming one. `created_at` is not a substitute: it is client-supplied, and two events can
-share it.
-
-**`by_address` and `by_replaceable` are one index.** The backend keeps a single replacement index
-keyed by the coordinate `pubkey, kind, d_value` — `d_value` absent for replaceable kinds — whose
-value is the id of the event currently occupying that coordinate. The two rows above describe one
-structure, not two.
-
-**`by_expiration` does not exist.** NIP-40 is not Phase 2 work, and the index arrives with the
-reaper that needs it.
 
 ### Query planning
 
