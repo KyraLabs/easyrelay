@@ -48,6 +48,29 @@ positioned at `until` and walked backwards yields exactly the newest-first order
 single most common shape in real client traffic, and serving it from one cursor rather than
 intersecting two is the difference between a scan and a seek.
 
+### Where the current backend diverges
+
+The model above is the specification, written so that it also serves a replacement backend.
+`zig-nostr/nostr` v0.12.0, the backend [ADR-0003](adr/0003-storage-engine-lmdb.md) selects, does
+not implement all of it. The differences are recorded here because they were found at the start
+of Phase 2, and because a reader who took the model above for a description would design against
+something that is not there.
+
+**There is no local id.** The backend keys events by their 32-byte event id and orders them
+through a `[created_at][event_id]` index. It has no monotonic insertion counter anywhere.
+Anything specified in terms of insertion order therefore has no foundation today, including the
+subscription watermark in [roadmap.md](roadmap.md#phase-2--persistence-and-indexes), which was
+written assuming one. `created_at` is not a substitute: it is client-supplied, and two events can
+share it.
+
+**`by_address` and `by_replaceable` are one index.** The backend keeps a single replacement index
+keyed by the coordinate `pubkey, kind, d_value` — `d_value` absent for replaceable kinds — whose
+value is the id of the event currently occupying that coordinate. The two rows above describe one
+structure, not two.
+
+**`by_expiration` does not exist.** NIP-40 is not Phase 2 work, and the index arrives with the
+reaper that needs it.
+
 ### Query planning
 
 For each filter the planner picks one index — the most selective one whose key prefix the filter

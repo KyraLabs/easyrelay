@@ -122,6 +122,31 @@ through a first-party interface — is untouched. What changed is a supporting r
 overreached past the risk it was written to contain, which is the correction of a factual error
 the [records README](README.md) allows.
 
+## Amendment (2026-09-07): two corrections of fact from Phase 2
+
+Reading `zig-nostr/nostr` v0.12.0 at the start of Phase 2 showed two statements above to be
+imprecise. Neither touches the decision.
+
+**The batch entry point exists; what is missing is a semantics-aware one.** The outcome above
+calls the batch shape one "the dependency does not currently offer". `putEventBatch` does offer
+it, and commits the whole batch in a single transaction. It documents itself as the low-level
+path that applies neither replaceable nor deletion semantics, while `ingest` applies them and
+opens a transaction per event through helpers that accept no external transaction. The gap is not
+a missing batch call but the absence of any way to have both at once — which is what
+[ADR-0002](0002-build-on-zig-nostr.md) already records accurately, and what its upstream
+conditions ask for. The adapter's job is unchanged.
+
+**The read path copies, within the query's bound.** This record requires the interface to stream
+through a sink "so that zero-copy reads stay zero-copy". The dependency's `query` returns a
+`QueryResult` owning an arena that holds the matched events, so an adapter streams out of a copy
+rather than out of the map. The copy is bounded by `limit` rather than by the store's size, so
+the property the bounded-scan rules exist to protect still holds; the zero-copy claim does not,
+and should not be repeated until an upstream streaming read makes it true.
+
+A third finding belongs to [storage.md](../storage.md#where-the-current-backend-diverges) rather
+than here: the backend has no monotonic local id, so the data model this boundary is meant to
+present is not the one underneath it.
+
 ## Revisit when
 
 A measured cost on the read path shows the boundary forcing copies that cannot be designed away.
