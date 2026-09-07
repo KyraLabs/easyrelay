@@ -6,6 +6,8 @@ pub const store = @import("storage/store.zig");
 
 pub const memory = @import("storage/memory.zig");
 
+pub const lmdb = @import("storage/lmdb.zig");
+
 pub const validation = @import("relay/validation.zig");
 
 pub const filter = @import("relay/filter.zig");
@@ -25,6 +27,7 @@ pub const server = @import("server/server.zig");
 test {
     _ = store;
     _ = memory;
+    _ = lmdb;
     _ = validation;
     _ = filter;
     _ = codec;
@@ -91,7 +94,7 @@ test "websocket.zig frames a text message" {
 }
 
 test "liblmdb commits durably and reads back after reopening" {
-    const lmdb = @import("lmdb");
+    const liblmdb = @import("lmdb");
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -102,10 +105,10 @@ test "liblmdb commits durably and reads back after reopening" {
     const path = buffer[0..len :0];
 
     {
-        const env = try lmdb.Environment.init(path, .{});
+        const env = try liblmdb.Environment.init(path, .{});
         defer env.deinit();
 
-        const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
+        const txn = try liblmdb.Transaction.init(env, .{ .mode = .ReadWrite });
         txn.set("k", "v") catch |err| {
             txn.abort();
             return err;
@@ -115,10 +118,10 @@ test "liblmdb commits durably and reads back after reopening" {
 
     // Reopening is the half that matters: it is what Phase 2's first exit
     // criterion asks of the store.
-    const env = try lmdb.Environment.init(path, .{});
+    const env = try liblmdb.Environment.init(path, .{});
     defer env.deinit();
 
-    const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadOnly });
+    const txn = try liblmdb.Transaction.init(env, .{ .mode = .ReadOnly });
     defer txn.abort();
     try std.testing.expectEqualStrings("v", (try txn.get("k")).?);
 }
