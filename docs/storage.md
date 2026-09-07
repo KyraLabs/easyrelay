@@ -62,22 +62,33 @@ per-request arena. The event bytes are never copied on the read path.
 
 ### Indexes
 
-Every index key ends with `created_at` descending and then `local_id`, so that a cursor
-positioned at `until` and walked backwards yields exactly the newest-first order that
-[protocol.md](protocol.md#filters) requires, and can stop the moment `limit` is reached.
+Every index key ends with `created_at` in a **descending encoding** and then the `event_id`, and
+every index value is the `local_id`. A cursor walked *forwards* from `until` then yields exactly
+the order [protocol.md](protocol.md#filters) requires — newest `created_at` first, ties broken by
+ascending id — and can stop the moment `limit` is reached.
+
+The descending encoding flips `created_at`'s sign bit, so the two's-complement range sorts, and
+inverts the result. The inversion is what puts the tie-break the right way round. An ascending
+time key walked backwards gives descending time, but it gives *descending* ids inside a tie,
+which is the opposite of what protocol.md asks for; and sorting each tie group afterwards is not
+available, because nothing bounds how many events may share one `created_at`.
 
 | Index | Key | Serves |
 | --- | --- | --- |
 | `by_id` | `event_id` (32 B) | `ids` filters, duplicate detection |
-| `by_created_at` | `created_at`, `local_id` | filters with only `since`/`until` |
-| `by_author` | `pubkey`, `created_at`, `local_id` | `authors` |
-| `by_kind` | `kind`, `created_at`, `local_id` | `kinds` |
-| `by_author_kind` | `pubkey`, `kind`, `created_at`, `local_id` | `authors` + `kinds` |
-| `by_tag` | `tag_name` (1 B), `tag_value`, `created_at`, `local_id` | `#<letter>` |
+| `by_created_at` | `created_at`, `event_id` | filters with only `since`/`until` |
+| `by_author` | `pubkey`, `created_at`, `event_id` | `authors` |
+| `by_kind` | `kind`, `created_at`, `event_id` | `kinds` |
+| `by_author_kind` | `pubkey`, `kind`, `created_at`, `event_id` | `authors` + `kinds` |
+| `by_tag` | `tag_name` (1 B), `tag_value`, `created_at`, `event_id` | `#<letter>` |
 | `by_address` | `pubkey`, `kind`, `d_value` | addressable replacement |
 | `by_replaceable` | `pubkey`, `kind` | replaceable replacement |
-| `by_expiration` | `expires_at`, `local_id` | NIP-40 reaper |
+| `by_expiration` | `expires_at`, `event_id` | NIP-40 reaper |
 | `deleted` | `event_id` (32 B) | NIP-09 tombstones |
+
+The `event_id` in the key costs 32 bytes an entry where the `local_id` would have cost 8. That
+is the price of the tie-break being a property of the key order rather than of a sort, and it is
+worth paying: it is what keeps a query streaming.
 
 `by_author_kind` is a deliberate denormalisation: the `authors` + `kinds` combination is the
 single most common shape in real client traffic, and serving it from one cursor rather than
