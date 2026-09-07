@@ -25,6 +25,9 @@ pub const memory = @import("storage/memory.zig");
 /// docs/adr/0010-first-party-lmdb-store.md.
 pub const lmdb = @import("storage/lmdb.zig");
 
+/// The on-disk event record the LMDB backend stores and serves.
+pub const record = @import("storage/record.zig");
+
 /// Validation of inbound events, in the order docs/architecture.md fixes.
 pub const validation = @import("relay/validation.zig");
 
@@ -53,6 +56,7 @@ test {
     _ = store;
     _ = memory;
     _ = lmdb;
+    _ = record;
     _ = validation;
     _ = filter;
     _ = codec;
