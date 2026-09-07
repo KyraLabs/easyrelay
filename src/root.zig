@@ -89,3 +89,36 @@ test "websocket.zig frames a text message" {
     const framed = websocket.frameText("hi");
     try std.testing.expectEqualSlices(u8, &.{ 0x81, 2, 'h', 'i' }, &framed);
 }
+
+test "liblmdb commits durably and reads back after reopening" {
+    const lmdb = @import("lmdb");
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var buffer: [std.Io.Dir.max_path_bytes + 1]u8 = undefined;
+    const len = try tmp.dir.realPath(std.testing.io, buffer[0..std.Io.Dir.max_path_bytes]);
+    buffer[len] = 0;
+    const path = buffer[0..len :0];
+
+    {
+        const env = try lmdb.Environment.init(path, .{});
+        defer env.deinit();
+
+        const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
+        txn.set("k", "v") catch |err| {
+            txn.abort();
+            return err;
+        };
+        try txn.commit();
+    }
+
+    // Reopening is the half that matters: it is what Phase 2's first exit
+    // criterion asks of the store.
+    const env = try lmdb.Environment.init(path, .{});
+    defer env.deinit();
+
+    const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadOnly });
+    defer txn.abort();
+    try std.testing.expectEqualStrings("v", (try txn.get("k")).?);
+}
