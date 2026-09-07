@@ -15,7 +15,8 @@
 - [ ] `docs/protocol.md` updated, if wire behaviour changed
 - [ ] `docs/nips.md` updated, if a NIP's status changed
 - [ ] An ADR added or amended, if this adds a dependency or changes an architectural decision
-- [ ] The PR title follows Conventional Commits — it becomes the squashed commit message
+- [ ] Every commit in the branch follows Conventional Commits — the merge preserves them all
+- [ ] The PR title follows Conventional Commits — CI validates it
 
 ## For reviewers
 

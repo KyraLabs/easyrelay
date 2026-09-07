@@ -16,9 +16,10 @@ jobs:
     name: Conventional Commits
     runs-on: ubuntu-latest
     steps:
-      # CONTRIBUTING.md requires Conventional Commits. Squash merges take the PR title
-      # as the commit message, so validating the title is what actually keeps the
-      # history conformant.
+      # CONTRIBUTING.md requires Conventional Commits. Merge commits preserve every commit
+      # in the branch, so the commits themselves are what keep the history conformant and
+      # this check does not see them. It guards the pull request list and the merge commit
+      # subject, which is why it stays.
       - uses: amannn/action-semantic-pull-request@v6
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -16,8 +16,8 @@ updates:
       actions:
         patterns:
           - "*"
-    # Pull request titles are validated against Conventional Commits and become the
-    # squashed commit message. Without this prefix Dependabot opens "Bump actions/..."
-    # and its own pull requests fail the check.
+    # Pull request titles are validated against Conventional Commits, and the commits
+    # Dependabot writes reach the history unchanged. Without this prefix Dependabot opens
+    # "Bump actions/..." and its own pull requests fail the check.
     commit-message:
       prefix: ci
