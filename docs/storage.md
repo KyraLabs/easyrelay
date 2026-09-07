@@ -28,6 +28,15 @@ events:  local_id (u64 BE)  ->  serialized event bytes
 Local ids are dense and increase with insertion order, which makes them a natural tie-break and
 keeps index entries small. They are internal and never leave the process.
 
+They start at 1, leaving zero to mean "before every event" — which is what a subscription's
+watermark holds until its stored phase has read anything. The next id to hand out lives in a
+`meta` database beside the indexes rather than being re-derived at startup from the newest
+surviving key, because deleting the newest event must not put its id back into circulation.
+
+An id allocated by a transaction that then aborts is skipped, never reissued. Skipping costs
+nothing. Reissuing would let a live event arrive at or below a watermark that had already passed
+it, and the subscription would drop the event it was waiting for.
+
 ### The event record
 
 The value in `events` is a fixed header, then the tags, then the content. Little-endian
