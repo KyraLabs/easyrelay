@@ -28,6 +28,29 @@ events:  local_id (u64 BE)  ->  serialized event bytes
 Local ids are dense and increase with insertion order, which makes them a natural tie-break and
 keeps index entries small. They are internal and never leave the process.
 
+### The event record
+
+The value in `events` is a fixed header, then the tags, then the content. Little-endian
+throughout: these bytes are a value and never a key, so nothing sorts on them.
+
+| offset | size | field |
+| --- | --- | --- |
+| 0 | 32 | `id` |
+| 32 | 32 | `pubkey` |
+| 64 | 64 | `sig` |
+| 128 | 8 | `created_at`, signed |
+| 136 | 2 | `kind` |
+| 138 | 2 | tag count |
+| 140 | 4 | `content` length |
+
+The header is 144 bytes. After it comes one block per tag — a 2-byte field count, then each
+field as a 4-byte length followed by its bytes — and then the content.
+
+The scalars sit at constant offsets so that reading one costs no parsing, and `content` and
+every tag field come back as slices into the memory map. A decode allocates only the slice
+structure describing the tags, which `limits.max_event_tags` bounds and which belongs to the
+per-request arena. The event bytes are never copied on the read path.
+
 ### Indexes
 
 Every index key ends with `created_at` descending and then `local_id`, so that a cursor

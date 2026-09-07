@@ -8,6 +8,8 @@ pub const memory = @import("storage/memory.zig");
 
 pub const lmdb = @import("storage/lmdb.zig");
 
+pub const record = @import("storage/record.zig");
+
 pub const validation = @import("relay/validation.zig");
 
 pub const filter = @import("relay/filter.zig");
@@ -28,6 +30,7 @@ test {
     _ = store;
     _ = memory;
     _ = lmdb;
+    _ = record;
     _ = validation;
     _ = filter;
     _ = codec;
