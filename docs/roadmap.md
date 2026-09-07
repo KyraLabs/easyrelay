@@ -157,10 +157,13 @@ implemented them. The suite grows with each phase. The fuzz targets
 - **NIP-09 deletion**, which the storage dependency already implements and Phase 0 verified.
   It arrives here with persistence rather than in Phase 3.
 - **A watermark that closes Phase 1's duplicate window.** An event stored while a subscription's
-  stored phase runs can be delivered twice. The store's monotonic local id is the watermark that
-  fixes it: a subscription records the newest id its stored phase saw, and live delivery skips
-  anything at or below it. This is why the gap was left open rather than worked around in
-  memory.
+  stored phase runs can be delivered twice, so a subscription needs to know what its stored phase
+  already delivered in order for live delivery to skip it. This was specified against the store's
+  monotonic local id, which the chosen backend turns out not to have
+  ([storage.md](storage.md#where-the-current-backend-diverges)). The mechanism is therefore open
+  — a counter upstream, one maintained by the adapter, or tracking the delivered ids per
+  subscription — and choosing it is part of this phase. The gap was still right to leave open in
+  Phase 1: it needs persistence to close, whatever carries the watermark.
 - **A complete default set.** Every setting in [configuration.md](configuration.md) has a
   default correct for a real deployment, not merely one that avoids a crash. Defaults are a
   correctness surface from this point on and are reviewed as such.
