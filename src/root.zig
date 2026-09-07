@@ -21,6 +21,10 @@ pub const store = @import("storage/store.zig");
 /// tests hold the indexed backend to afterwards.
 pub const memory = @import("storage/memory.zig");
 
+/// The LMDB backend: easyrelay's own schema, per
+/// docs/adr/0010-first-party-lmdb-store.md.
+pub const lmdb = @import("storage/lmdb.zig");
+
 /// Validation of inbound events, in the order docs/architecture.md fixes.
 pub const validation = @import("relay/validation.zig");
 
@@ -48,6 +52,7 @@ pub const server = @import("server/server.zig");
 test {
     _ = store;
     _ = memory;
+    _ = lmdb;
     _ = validation;
     _ = filter;
     _ = codec;
@@ -126,7 +131,7 @@ test "websocket.zig frames a text message" {
 }
 
 test "liblmdb commits durably and reads back after reopening" {
-    const lmdb = @import("lmdb");
+    const liblmdb = @import("lmdb");
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -137,10 +142,10 @@ test "liblmdb commits durably and reads back after reopening" {
     const path = buffer[0..len :0];
 
     {
-        const env = try lmdb.Environment.init(path, .{});
+        const env = try liblmdb.Environment.init(path, .{});
         defer env.deinit();
 
-        const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
+        const txn = try liblmdb.Transaction.init(env, .{ .mode = .ReadWrite });
         errdefer txn.abort();
         try txn.set("k", "v");
         try txn.commit();
@@ -148,10 +153,10 @@ test "liblmdb commits durably and reads back after reopening" {
 
     // Reopening is the half that matters: it is what Phase 2's first exit
     // criterion asks of the store.
-    const env = try lmdb.Environment.init(path, .{});
+    const env = try liblmdb.Environment.init(path, .{});
     defer env.deinit();
 
-    const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadOnly });
+    const txn = try liblmdb.Transaction.init(env, .{ .mode = .ReadOnly });
     defer txn.abort();
     try std.testing.expectEqualStrings("v", (try txn.get("k")).?);
 }

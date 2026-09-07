@@ -141,10 +141,15 @@ requirements for the storage engine, not query-performance tuning.
 modes exist and may be exposed as configuration, but they are never the default and never the
 basis of a published benchmark. See [testing.md](testing.md#benchmarks).
 
-**The store is a single file, not a directory.** The environment is opened with
-`MDB_NOSUBDIR`, so the store is one `.mdb` file plus its lock file. easyrelay still takes a
-data *directory* in configuration and places the file inside it, which keeps room for the
-search index and any future sibling data.
+**The store is a subdirectory of the data directory.** The environment lives at
+`<storage.path>/events`, holding LMDB's `data.mdb` and its lock file. The data directory itself
+stays free for the search index and any future sibling data, which is the property this rule
+exists to protect.
+
+It was specified as a single `.mdb` file opened with `MDB_NOSUBDIR`. `zig-lmdb` exposes no flag
+for that ([ADR-0010](adr/0010-first-party-lmdb-store.md)), and the difference is one directory
+level rather than anything an operator or a backup depends on, so the specification follows the
+code here. Adding the flag upstream is two lines if a reason to prefer the flat layout appears.
 
 **Backup.** The store can be copied while the relay runs, using LMDB's consistent snapshot,
 without stopping writes. Procedure in [operations.md](operations.md).
