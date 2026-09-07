@@ -121,8 +121,10 @@ Two implementations behind that interface:
 
 - **`memory`** — a hash map plus a sorted index. Exists for tests and for Phase 1. It is not a
   deployment option and is not tuned.
-- **`lmdb`** — the real backend, backed by `zig-nostr/nostr`'s zero-copy LMDB store. The data
-  model and index design are in [storage.md](storage.md).
+- **`lmdb`** — the real backend, easyrelay's own zero-copy schema over
+  [`zig-lmdb`](https://github.com/nDimensional/zig-lmdb)
+  ([ADR-0010](adr/0010-first-party-lmdb-store.md)). The data model and index design are in
+  [storage.md](storage.md).
 
 ## Concurrency model
 

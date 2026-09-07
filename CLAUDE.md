@@ -26,7 +26,7 @@ Architectural decisions are recorded, not re-litigated. Read the relevant record
 | --- | --- |
 | Anything | [docs/roadmap.md](docs/roadmap.md) — phase order and exit criteria |
 | Wire behaviour | [docs/protocol.md](docs/protocol.md) — the behavioural contract |
-| Storage, indexes | [docs/storage.md](docs/storage.md) + [ADR-0003](docs/adr/0003-storage-engine-lmdb.md) |
+| Storage, indexes | [docs/storage.md](docs/storage.md) + [ADR-0003](docs/adr/0003-storage-engine-lmdb.md) + [ADR-0010](docs/adr/0010-first-party-lmdb-store.md) |
 | The `zig-nostr` dependency | [ADR-0002](docs/adr/0002-build-on-zig-nostr.md) + the [Phase 0 spike](docs/research/2026-08-phase-0-validation.md) |
 | Anything crossing into storage | [ADR-0008](docs/adr/0008-store-abstraction-boundary.md) |
 | Transport, connections | [ADR-0004](docs/adr/0004-websocket-transport.md), [ADR-0005](docs/adr/0005-concurrency-model.md) |
@@ -97,7 +97,7 @@ zig build test               # all tests
 zig build test --summary all
 zig build test --fuzz        # fuzzing runs through the test runner, not a separate step
 zig build check              # type-check without artifacts, for editor diagnostics
-zig fmt --check .            # CI gate; zig fmt is the authority on style
+zig fmt --check --exclude zig-pkg .   # CI gate; zig fmt is the authority on style
 ./scripts/check-toolchain.sh
 ```
 

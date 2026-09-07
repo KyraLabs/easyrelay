@@ -124,8 +124,9 @@ The relevant prior art, and what easyrelay takes from each:
 - **strfry** (C++, LMDB) is the architectural model: custom indexes over LMDB instead of a SQL
   engine, a single writer thread, and Negentropy-based relay-to-relay sync. The storage design
   in [storage.md](storage.md) follows it.
-- **nostrdb** (C, LMDB) demonstrates the same index design as an embeddable library, and is the
-  model `zig-nostr/nostr`'s store follows.
+- **nostrdb** (C, LMDB) demonstrates the same index design as an embeddable library. It is the
+  model `zig-nostr/nostr`'s store follows, and a second reading of the design easyrelay's own
+  store implements ([ADR-0010](adr/0010-first-party-lmdb-store.md)).
 - **Wisp** (Zig, LMDB) is proof that a complete relay in Zig is achievable, and a useful map of
   the dependency surface.
 - **`zig-nostr/nostr`** is a direct dependency rather than a reference. See

@@ -100,8 +100,26 @@ ingest, caller-owned transactions, and the two missing options. They are additiv
 and far cheaper than the alternative this record rejected. If upstream declines them, easyrelay
 vendors the patch; [ADR-0008](0008-store-abstraction-boundary.md) is what keeps that contained.
 
+## Amendment (2026-09-07): the storage clause is superseded
+
+The three upstream conditions above were never filed. Upstream has no open pull requests and no
+issue matching any of them, and `src/store.zig` is unchanged between v0.12.0 and v0.13.0. Nothing
+was refused; nothing was asked. Recorded here because the sentence "with three upstream
+contributions attached" describes a state that never existed, and a reader would otherwise take
+it for one.
+
+Phase 2 found further gaps between the dependency's store and what
+[storage.md](../storage.md) specifies, the largest being that no monotonic local id exists.
+[ADR-0010](0010-first-party-lmdb-store.md) is the result: easyrelay implements its own LMDB store
+and **the storage clause of the decision above no longer holds**.
+
+What stands is the rest of it, which is most of it. `zig-nostr/nostr` remains the protocol layer
+— event handling, canonical serialization, signature verification, filter matching — and the
+reasoning in Context and Consequences applies to it unchanged. The vector suite remains the
+tripwire on exactly that surface.
+
 ## Revisit when
 
-The three upstream conditions above are refused or go unanswered long enough to block Phase 2,
-or `zig-nostr/nostr` publishes a breaking release, or the project shows six months without
-maintenance activity.
+`zig-nostr/nostr` publishes a breaking release, or the project shows six months without
+maintenance activity. The storage conditions are no longer a trigger: they were resolved by
+[ADR-0010](0010-first-party-lmdb-store.md) rather than by upstream.

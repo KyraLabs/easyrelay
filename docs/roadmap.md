@@ -145,25 +145,26 @@ implemented them. The suite grows with each phase. The fuzz targets
   [nips.md](nips.md), served on `Accept: application/nostr+json`.
 - Configuration file loading, which closes [ADR-0007](adr/0007-configuration-format.md).
 - **Batched writes from the first commit, not as a later optimisation.** The writer thread
-  drains its queue into one transaction per batch. Phase 0 measured 92 events/s for one durable
-  transaction per event against 169,491 events/s batched; building on the per-event path and
-  optimising later would mean building on something that cannot carry traffic. If the upstream
-  dependency has not gained a protocol-aware batch ingest by then, easyrelay vendors the patch —
-  see the [spike's conditions](research/2026-08-phase-0-validation.md#verdict-and-conditions).
-- **Multi-filter `REQ` handling.** The storage dependency queries one filter at a time; a `REQ`
-  carries several, OR-ed. Results are merged, deduplicated by id, and the subscription's `limit`
-  is applied **across** the merge. Applying it per filter returns the wrong events, so this gets
-  a conformance test rather than a comment.
-- **NIP-09 deletion**, which the storage dependency already implements and Phase 0 verified.
-  It arrives here with persistence rather than in Phase 3.
+  drains its queue into one transaction per batch, applying kind semantics inside that same
+  transaction. Phase 0 measured 92 events/s for one durable transaction per event against 169,491
+  events/s batched; building on the per-event path and optimising later would mean building on
+  something that cannot carry traffic. Being unable to have batching and kind semantics at once
+  is one of the findings behind [ADR-0010](adr/0010-first-party-lmdb-store.md).
+- **Multi-filter `REQ` handling.** A `REQ` carries several filters, OR-ed. Results are merged,
+  deduplicated by id, and the subscription's `limit` is applied **across** the merge. Applying it
+  per filter returns the wrong events, so this gets a conformance test rather than a comment. The
+  `Store` interface already specifies this contract and the memory backend already honours it.
+- **NIP-09 deletion.** Written here rather than inherited: the dependency implemented it and
+  Phase 0 verified it, but [ADR-0010](adr/0010-first-party-lmdb-store.md) moved the store
+  in-house, so the tombstone table, the author check and the refusal of a re-submitted deleted
+  event are all ours. Conformance tests come from the NIP text before the code.
 - **A watermark that closes Phase 1's duplicate window.** An event stored while a subscription's
-  stored phase runs can be delivered twice, so a subscription needs to know what its stored phase
-  already delivered in order for live delivery to skip it. This was specified against the store's
-  monotonic local id, which the chosen backend turns out not to have
-  ([storage.md](storage.md#where-the-current-backend-diverges)). The mechanism is therefore open
-  — a counter upstream, one maintained by the adapter, or tracking the delivered ids per
-  subscription — and choosing it is part of this phase. The gap was still right to leave open in
-  Phase 1: it needs persistence to close, whatever carries the watermark.
+  stored phase runs can be delivered twice. The store's monotonic local id is the watermark that
+  fixes it: a subscription records the newest id its stored phase saw, and live delivery skips
+  anything at or below it. This is why the gap was left open rather than worked around in memory.
+  Assigning that local id is easyrelay's own job as of
+  [ADR-0010](adr/0010-first-party-lmdb-store.md); the store it was originally specified against
+  had no such counter.
 - **A complete default set.** Every setting in [configuration.md](configuration.md) has a
   default correct for a real deployment, not merely one that avoids a crash. Defaults are a
   correctness surface from this point on and are reviewed as such.
@@ -207,8 +208,10 @@ The phase that makes the relay safe to expose to the open internet.
 ### Deliverables
 
 - Rate limiting per connection and per pubkey, with the write queue as the final backstop.
-- An I/O pool bounded below LMDB's 126-reader ceiling, which the storage dependency does not
-  expose a way to raise. Exceeding it fails roughly a third of reads — measured in
+- An I/O pool bounded below LMDB's 126-reader ceiling. Raising it is now easyrelay's own call
+  through `max_readers` ([ADR-0010](adr/0010-first-party-lmdb-store.md)); the pool is still
+  bounded, because a ceiling that is merely higher is still a ceiling. Exceeding it fails roughly
+  a third of reads — measured in
   [Phase 0](research/2026-08-phase-0-validation.md#q1--concurrent-readers-with-a-single-writer-yes-with-a-hard-ceiling).
 - One `Signer` per I/O thread. The dependency's signer is not thread-safe for concurrent use of
   a single instance.
