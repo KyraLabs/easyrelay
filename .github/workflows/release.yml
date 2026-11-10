@@ -51,7 +51,7 @@ jobs:
           cp zig-out/bin/easyrelay "dist/${name}/"
           cp LICENSE README.md "dist/${name}/"
           tar -C dist -czf "dist/${name}.tar.gz" "${name}"
-          sha256sum "dist/${name}.tar.gz" > "dist/${name}.tar.gz.sha256"
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
 
       - uses: actions/upload-artifact@v7
         with:
@@ -81,6 +81,7 @@ jobs:
           cd dist
           cat ./*.sha256 > SHA256SUMS
           rm -f ./*.sha256
+          sha256sum -c SHA256SUMS
           ls -la
 
       - name: Create release
