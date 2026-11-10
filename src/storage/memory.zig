@@ -78,20 +78,27 @@ pub const Memory = struct {
             if (left.* != 0) open += 1;
         }
 
-        self.lock.lockSharedUncancelable(self.io);
-        defer self.lock.unlockShared(self.io);
+        // Shallow copies stay valid after unlocking: stored events are freed only by deinit.
+        var matched: std.ArrayList(Event) = .empty;
+        defer matched.deinit(self.gpa);
+        {
+            self.lock.lockSharedUncancelable(self.io);
+            defer self.lock.unlockShared(self.io);
 
-        for (self.order.items) |*event| {
-            if (open == 0) break;
-            var wanted = false;
-            for (filters, remaining) |filter, *left| {
-                if (left.* == 0 or !filter.matches(event.*)) continue;
-                left.* -= 1;
-                if (left.* == 0) open -= 1;
-                wanted = true;
+            for (self.order.items) |event| {
+                if (open == 0) break;
+                var wanted = false;
+                for (filters, remaining) |filter, *left| {
+                    if (left.* == 0 or !filter.matches(event)) continue;
+                    left.* -= 1;
+                    if (left.* == 0) open -= 1;
+                    wanted = true;
+                }
+                if (wanted) try matched.append(self.gpa, event);
             }
-            if (wanted) try sink.emit(event);
         }
+
+        for (matched.items) |*event| try sink.emit(event);
     }
 
     fn insertionIndex(self: Memory, event: *const Event) usize {
@@ -457,4 +464,36 @@ test "concurrent puts and queries keep every event" {
     for (readers) |thread| thread.join();
 
     try testing.expectEqual(@as(usize, 2000), memory.count());
+}
+
+const Republisher = struct {
+    memory: *Memory,
+    emitted: usize = 0,
+
+    fn sink(self: *Republisher) Sink {
+        return .{ .ptr = self, .emitFn = emit };
+    }
+
+    fn emit(ptr: *anyopaque, event: *const Event) Sink.Abort!void {
+        const self: *Republisher = @ptrCast(@alignCast(ptr));
+        var newer = event.*;
+        newer.id[31] ^= 0xff;
+        newer.created_at += 1;
+        _ = self.memory.store().put(&newer) catch return error.Abort;
+        self.emitted += 1;
+    }
+};
+
+test "a query does not hold the lock while its sink runs" {
+    var memory = Memory.init(testing.allocator, testing.io);
+    defer memory.deinit();
+
+    const event = testEvent(1, 1700000000, 1);
+    _ = try memory.store().put(&event);
+
+    var republisher: Republisher = .{ .memory = &memory };
+    try memory.store().query(&.{.{}}, republisher.sink());
+
+    try testing.expectEqual(@as(usize, 1), republisher.emitted);
+    try testing.expectEqual(@as(usize, 2), memory.count());
 }
