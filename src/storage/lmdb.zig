@@ -1,5 +1,6 @@
 const std = @import("std");
 const lmdb = @import("lmdb");
+const lmdb_c = @import("lmdb_c");
 const nostr = @import("nostr");
 
 const index = @import("index.zig");
@@ -26,6 +27,7 @@ pub const Options = struct {
     map_size: usize = 10 * 1024 * 1024 * 1024,
     max_readers: u32 = 126,
     max_scan: usize = 100_000,
+    durable: bool = true,
 };
 
 pub const subdirectory = "events";
@@ -278,6 +280,7 @@ pub const Lmdb = struct {
             .max_dbs = max_databases,
         }) catch return error.Backend;
         errdefer env.deinit();
+        if (!options.durable and lmdb_c.mdb_env_set_flags(env.ptr, lmdb_c.MDB_NOSYNC, 1) != 0) return error.Backend;
 
         createTables(env) catch return error.Backend;
         return .{ .gpa = gpa, .env = env, .max_scan = options.max_scan };
@@ -1318,6 +1321,22 @@ test "a query on a store that has never been written answers nothing" {
     var collector: Collector = .{};
     try fixture.backend.store().query(&.{ .{}, .{ .kinds = &.{1} }, .{ .authors = &.{[_]u8{1} ** 32} } }, collector.sink());
     try testing.expectEqual(@as(usize, 0), collector.len);
+}
+
+test "a non-durable store still stores and reads back" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{ .durable = false });
+    defer backend.close();
+
+    var flags: c_uint = 0;
+    try testing.expectEqual(@as(c_int, 0), lmdb_c.mdb_env_get_flags(backend.env.ptr, &flags));
+    try testing.expect(flags & lmdb_c.MDB_NOSYNC != 0);
+
+    const event = kindEvent(1, 1700000000, 1);
+    try testing.expectEqual(PutResult.stored, try backend.store().put(&event));
 }
 
 test "two handles on one environment never reuse a local id" {

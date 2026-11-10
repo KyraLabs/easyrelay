@@ -21,7 +21,8 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "nostr", .module = nostr.module("nostr") },
             .{ .name = "websocket", .module = websocket.module("websocket") },
-            .{ .name = "lmdb", .module = lmdb },
+            .{ .name = "lmdb", .module = lmdb.wrapper },
+            .{ .name = "lmdb_c", .module = lmdb.header },
         },
     });
 
@@ -90,7 +91,7 @@ pub fn build(b: *std.Build) void {
 }
 
 /// zig-lmdb's wrapper without its own liblmdb: the copy zig-nostr links, built without UBSan, is the only one.
-fn lmdbModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+fn lmdbModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) struct { wrapper: *std.Build.Module, header: *std.Build.Module } {
     const wrapper = b.dependency("lmdb", .{ .target = target, .optimize = optimize });
     const liblmdb = wrapper.builder.dependency("lmdb", .{});
     const header = b.addTranslateC(.{
@@ -105,6 +106,7 @@ fn lmdbModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
         .optimize = optimize,
         .link_libc = true,
     });
-    module.addImport("c", header.createModule());
-    return module;
+    const header_module = header.createModule();
+    module.addImport("c", header_module);
+    return .{ .wrapper = module, .header = header_module };
 }
