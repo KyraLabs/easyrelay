@@ -201,6 +201,33 @@ implemented them. The suite grows with each phase. The fuzz targets
 
 ---
 
+### Phase 2 progress
+
+> **Open.** Every exit criterion below except NIP-11 holds. NIP-11 needs a plain HTTP answer on
+> the WebSocket listener, which the transport does not offer.
+
+| Exit criterion | Verified by |
+| --- | --- |
+| Events published before a restart are queryable after it | `scripts/interop-nak.sh` restarts the built binary between publishing and reading; LMDB restart tests |
+| Replaceable and addressable semantics, both tie-break paths, the three empty `d` forms | `tests/conformance/kinds.zig`; LMDB unit tests |
+| A superseded event is gone, not hidden | An LMDB test counting the entries of every table after replacement |
+| Ephemeral events are fanned out and never persisted | `tests/conformance/kinds.zig` |
+| `limit: 500` latency flat from 10k to 100k events | Measured 2026-11-10, below |
+| NIP-11 `supported_nips` matches nips.md | Not yet: NIP-11 is not served |
+| NIP-09, including another author's target and a re-submission | `tests/conformance/nip09.zig` |
+| A multi-filter `REQ` returns the union with each filter's `limit` | `tests/conformance/nip01.zig`, and the memory-versus-LMDB property test |
+| Sustained durable write throughput, measured | Measured 2026-11-10, below |
+| The relay starts and persists with no configuration file | `scripts/interop-nak.sh`, run from an empty directory |
+| `easyrelay init` fed back in equals no file | `src/config.zig`, and a test that the defaults equal each component's |
+| Every configuration error names its key | `src/config.zig` |
+
+Measurements: Intel i5-10400F, btrfs on a SATA SSD, LMDB durable (sync on commit), ReleaseSafe.
+
+- **Writes**, four producers into the writer thread: one transaction per event sustained 42 to
+  137 events/s; batched through the writer, 21,388 to 41,635 events/s over 50,000 events.
+- **Reads**, median of 41 `limit: 500` queries: `{}` 135 µs at 10k events and 145 µs at 100k;
+  `kinds` 150 and 160 µs. Author-scoped shapes cost the same per event at both sizes.
+
 ## Phase 3 — Operational hardening
 
 The phase that makes the relay safe to expose to the open internet.
