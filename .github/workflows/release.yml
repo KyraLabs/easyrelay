@@ -37,8 +37,6 @@ jobs:
           version: ${{ steps.zig.outputs.version }}
           cache-key: release-${{ matrix.target }}
 
-      # Linux targets use musl so the binary is static and runs anywhere, which is
-      # what the "nothing to install" promise in docs/overview.md actually requires.
       - name: Build
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe
 

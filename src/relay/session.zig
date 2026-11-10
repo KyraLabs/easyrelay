@@ -1,17 +1,3 @@
-//! One client's conversation with the relay: what arrives, what is answered.
-//!
-//! The session is deliberately ignorant of sockets. It reads a message's bytes
-//! and writes its answers through a `Responder`, which the transport
-//! implements over a WebSocket frame and the tests implement over a buffer.
-//! That is what makes the relay's behaviour testable without a network, and it
-//! keeps the layering docs/architecture.md describes: the transport owns
-//! sockets and nothing else.
-//!
-//! Everything that varies per message — the arena, the signer, the clock —
-//! arrives in a `Context` rather than being reached for. The signer because
-//! `keys.Signer` is not thread-safe and each I/O thread owns one, the clock
-//! because a bound that reads the time itself cannot be tested.
-
 const std = @import("std");
 const nostr = @import("nostr");
 
@@ -23,21 +9,14 @@ const store = @import("../storage/store.zig");
 
 const Event = nostr.event.Event;
 
-/// Where a session's answers go. One `begin`/`send` pair is one message on the
-/// wire, because a `REQ` is answered with many.
 pub const Responder = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
 
-    /// A failed send is a dead connection: the transport closes it rather than
-    /// retrying, and the detail belongs to the transport's log.
     pub const Error = std.Io.Writer.Error;
 
     pub const VTable = struct {
-        /// Starts a message and returns the writer to compose it into. The
-        /// writer is valid until `send`.
         begin: *const fn (ptr: *anyopaque) std.Io.Writer.Error!*std.Io.Writer,
-        /// Sends what was composed since `begin`.
         send: *const fn (ptr: *anyopaque) std.Io.Writer.Error!void,
     };
 
@@ -58,34 +37,22 @@ pub const Limits = struct {
     subscription: subscriptions.Limits = .{},
 };
 
-/// What every session on this relay shares. Read-only for the duration of a
-/// connection, so it is safe to point every session at one instance.
 pub const Shared = struct {
-    /// Locking goes through `Io` in Zig 0.16, and the subscriber's lock is
-    /// taken here as well as by the hub.
     io: std.Io,
     store: store.Store,
-    /// Where an accepted event meets the subscriptions of every connection,
-    /// this one included.
     hub: *hub.Hub,
     limits: Limits = .{},
 };
 
-/// Supplied by the transport once per message.
 pub const Context = struct {
-    /// Reset after the message is answered: nothing allocated here survives.
     arena: std.mem.Allocator,
-    /// The calling thread's own. Never shared between threads.
     signer: nostr.keys.Signer,
-    /// Unix seconds, read once per message.
     now: i64,
 };
 
 pub const Session = struct {
     shared: *const Shared,
     responder: Responder,
-    /// This connection as the rest of the relay sees it: its subscriptions and
-    /// the way back to its socket.
     subscriber: *hub.Subscriber,
 
     pub fn handle(self: *Session, context: Context, data: []const u8) Error!void {
@@ -96,13 +63,7 @@ pub const Session = struct {
             self.shared.limits.message,
             &diagnostics,
         ) catch |err| switch (err) {
-            // A message the relay cannot even parse has no event id and no
-            // subscription id to answer against, so `NOTICE` is all NIP-01
-            // leaves: `OK` and `CLOSED` both need something to name.
             error.MalformedMessage, error.UnsupportedMessage => {
-                // A failure the client can tie to a subscription is answered
-                // with `CLOSED` naming it. Anything else has nothing to name,
-                // and NIP-01 leaves only `NOTICE`.
                 if (diagnostics.subject) |subscription_id| {
                     self.subscriber.mutex.lockUncancelable(self.shared.io);
                     defer self.subscriber.mutex.unlock(self.shared.io);
@@ -115,14 +76,8 @@ pub const Session = struct {
         };
 
         switch (message) {
-            // The whole message bounds the event, which is the event plus a
-            // ten-byte wrapper. Counting the wrapper rejects a shade early;
-            // parsing the event a second time to measure it exactly would cost
-            // more than the shade is worth.
             .event => |event| try self.publish(context, event, data.len),
             .req => |req| try self.subscribe(context, req),
-            // Closing a subscription that is not open is not an error, and
-            // NIP-01 gives the relay nothing to say about it.
             .close => |close| {
                 self.subscriber.mutex.lockUncancelable(self.shared.io);
                 defer self.subscriber.mutex.unlock(self.shared.io);
@@ -155,8 +110,6 @@ pub const Session = struct {
                 .prefix = .invalid,
                 .reason = diagnostics.message(),
             }),
-            // Out of memory is an answer, not a crash: the client is told the
-            // relay failed and may try again.
             error.OutOfMemory => return self.sendOk(.{
                 .event_id = event.id,
                 .accepted = false,
@@ -182,14 +135,9 @@ pub const Session = struct {
 
         return switch (result) {
             .stored => {
-                // Only after the store accepted it, so that a subscriber never
-                // receives an event a later read would fail to find
-                // (docs/architecture.md#concurrency-model).
                 self.shared.hub.broadcast(context.arena, &event);
                 return self.sendOk(.{ .event_id = event.id, .accepted = true });
             },
-            // `duplicate:` travels with true: the event the client sent is on
-            // the relay, which is what it asked for (docs/protocol.md).
             .duplicate => self.sendOk(.{
                 .event_id = event.id,
                 .accepted = true,
@@ -199,12 +147,7 @@ pub const Session = struct {
         };
     }
 
-    /// Opens or replaces a subscription, answers it from the store, and closes
-    /// the stored phase with `EOSE`.
     fn subscribe(self: *Session, context: Context, req: codec.ClientMessage.Req) Error!void {
-        // Held across the whole stored phase. A live event delivered in the
-        // middle of it would reach the client before `EOSE`, and
-        // docs/protocol.md promises that every stored event precedes it.
         self.subscriber.mutex.lockUncancelable(self.shared.io);
         defer self.subscriber.mutex.unlock(self.shared.io);
 
@@ -238,12 +181,8 @@ pub const Session = struct {
         };
 
         self.shared.store.query(bounded, sink.sink()) catch |err| switch (err) {
-            // The sink stops the query when it cannot send, and the reason it
-            // could not is worth more than the fact that it stopped.
             error.Abort => return sink.failure orelse error.WriteFailed,
             error.OutOfMemory, error.Backend => {
-                // The subscription goes with the `CLOSED`: the client is told
-                // it is over, so the relay must not keep serving it.
                 _ = self.subscriber.registry.close(req.subscription_id);
                 return self.sendClosed(
                     req.subscription_id,
@@ -253,8 +192,6 @@ pub const Session = struct {
             },
         };
 
-        // Every stored event precedes this, and every event after it arrived
-        // afterwards (docs/protocol.md).
         try self.sendEose(req.subscription_id);
     }
 
@@ -294,10 +231,6 @@ pub const Session = struct {
     }
 };
 
-/// Turns the store's stream of matching events into `EVENT` messages.
-///
-/// A sink may only stop a query, not fail it, so a send that fails is kept
-/// here and re-raised by the caller once the query has unwound.
 const EventSink = struct {
     session: *Session,
     subscription_id: []const u8,
@@ -321,8 +254,6 @@ const memory = @import("../storage/memory.zig");
 
 const test_now: i64 = 1_700_000_000;
 
-/// Records every message a session sends, so a test can assert on the bytes
-/// that would have gone out without opening a socket.
 const Recorder = struct {
     gpa: std.mem.Allocator,
     current: std.Io.Writer.Allocating,
@@ -368,20 +299,14 @@ const Recorder = struct {
     }
 };
 
-/// Two-phase on purpose: `shared` and `session` point into the harness, so
-/// they can only be built once it is at the address it will keep.
 const Harness = struct {
     threaded: std.Io.Threaded,
     arena_state: std.heap.ArenaAllocator,
     signer: nostr.keys.Signer,
     backing: memory.Memory,
     recorder: Recorder,
-    /// What the hub handed this connection, as opposed to what the session
-    /// answered directly. The two are different paths and worth telling apart.
     delivered: std.ArrayList([]u8),
     limits: Limits,
-    /// Set before `start` to answer from something other than the memory
-    /// backend.
     override_store: ?store.Store = null,
     connections: hub.Hub = undefined,
     subscriber: hub.Subscriber = undefined,
@@ -400,8 +325,6 @@ const Harness = struct {
         };
     }
 
-    /// Everything here points at the harness, so it can only be built once the
-    /// harness is at the address it will keep.
     fn start(self: *Harness) !void {
         const io = self.threaded.io();
         self.connections = hub.Hub.init(testing.allocator, io);
@@ -531,8 +454,6 @@ test "a rejected event is not stored" {
     const wire = try harness.eventMessage(event);
     try harness.handle(wire);
 
-    // Sending the repaired event afterwards must be stored rather than
-    // reported as a duplicate of the one that was refused.
     event.sig[0] ^= 0xff;
     try harness.handle(try harness.eventMessage(event));
 
@@ -746,9 +667,6 @@ test "a closed subscription stops receiving" {
     try testing.expectEqual(@as(usize, 0), harness.delivered.items.len);
 }
 
-/// Fails on demand. `memory.Memory` never fails, so without this the paths that
-/// answer `error:` are unreachable and untested — and they are the paths a real
-/// storage engine will take.
 const FailingStore = struct {
     put_error: ?store.Error = null,
     query_error: ?store.Error = null,
@@ -801,8 +719,6 @@ test "a subscription the store cannot answer is closed, not left open" {
 
         const answer = harness.recorder.only();
         try testing.expect(std.mem.startsWith(u8, answer, "[\"CLOSED\",\"sub-1\",\"error:"));
-        // Telling the client the subscription is over and continuing to serve
-        // it are contradictory; the registry has to agree with the message.
         try testing.expectEqual(@as(usize, 0), harness.subscriber.registry.count());
     }
 }

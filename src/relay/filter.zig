@@ -1,18 +1,3 @@
-//! Decoding NIP-01 filters from the JSON a client sends, with the strictness
-//! docs/protocol.md#filters requires.
-//!
-//! This is first-party code rather than an adaptation. `zig-nostr` models a
-//! filter and matches events against one, but it only ever *encodes* them: a
-//! client library writes filters and reads events, and the relay does the
-//! opposite. Decoding is the relay's half of the wire format, and it is the
-//! half that touches untrusted input.
-//!
-//! One rule shapes the whole file: **a malformed field is a malformed filter,
-//! not a filter that matches nothing.** Quietly turning
-//! `{"authors":["NOT-HEX"]}` into an empty result set tells the client its
-//! query ran and found nothing, which is indistinguishable from the truth and
-//! is not the truth.
-
 const std = @import("std");
 const nostr = @import("nostr");
 
@@ -33,8 +18,6 @@ pub const Reason = enum {
     timestamp_out_of_range,
 };
 
-/// Carries the reason back to the caller, which turns it into the `CLOSED`
-/// message docs/protocol.md requires for a subscription it refuses.
 pub const Diagnostics = diag.Diagnostics(Reason);
 
 fn malformed(
@@ -47,9 +30,6 @@ fn malformed(
     return error.MalformedFilter;
 }
 
-/// Decodes one filter object. Everything the returned filter points at is
-/// allocated in `arena`, which is the per-request arena: a filter lives as
-/// long as the subscription that owns it, and is copied there by the caller.
 pub fn decode(
     arena: std.mem.Allocator,
     value: std.json.Value,
@@ -83,16 +63,12 @@ pub fn decode(
         } else if (key.len != 0 and key[0] == '#') {
             try tags.append(arena, try decodeTagFilter(arena, key, field_value, diagnostics));
         }
-        // Anything else is ignored. NIP-01 defines the fields above and later
-        // NIPs add their own; refusing a field this relay does not implement
-        // would break clients that send it to relays that do.
     }
 
     if (tags.items.len != 0) filter.tags = tags.items;
     return filter;
 }
 
-/// `ids` and `authors`: arrays of 64-character lowercase hex.
 fn decodeHexArray(
     arena: std.mem.Allocator,
     key: []const u8,
@@ -101,8 +77,7 @@ fn decodeHexArray(
 ) Error![]const [32]u8 {
     const array = try expectArray(key, value, diagnostics);
 
-    // An empty array stays an empty array: docs/protocol.md gives it a
-    // meaning, and it is "matches nothing" rather than "no constraint".
+    // An empty array means "matches nothing", not "no constraint".
     const out = try arena.alloc([32]u8, array.items.len);
     for (array.items, out) |item, *target| {
         const text = switch (item) {
@@ -142,8 +117,6 @@ fn decodeKinds(
                 .{},
             ),
         };
-        // Never truncated into range: a kind of 65537 silently becoming kind 1
-        // would subscribe the client to something it did not ask for.
         if (number < 0 or number > std.math.maxInt(u16)) {
             return malformed(
                 diagnostics,
@@ -164,8 +137,7 @@ fn decodeTimestamp(
 ) Error!i64 {
     return switch (value) {
         .integer => |number| number,
-        // A number too large for i64 arrives as its own case rather than as an
-        // integer, which is the only reason this is distinguishable at all.
+        // std.json yields integers beyond i64 as `.number_string`.
         .number_string => malformed(
             diagnostics,
             .timestamp_out_of_range,
@@ -208,17 +180,12 @@ fn decodeLimit(value: std.json.Value, diagnostics: *Diagnostics) Error!u32 {
     return @intCast(number);
 }
 
-/// `#<letter>`: a single-letter tag name and the values its first field may
-/// take.
 fn decodeTagFilter(
     arena: std.mem.Allocator,
     key: []const u8,
     value: std.json.Value,
     diagnostics: *Diagnostics,
 ) Error!TagFilter {
-    // `#` names exactly one tag letter. A longer name is refused rather than
-    // ignored: ignoring a constraint widens the result set, and answering a
-    // narrower question with more events is the failure mode that matters.
     if (key.len != 2 or !std.ascii.isAlphabetic(key[1])) {
         return malformed(
             diagnostics,
@@ -241,8 +208,6 @@ fn decodeTagFilter(
                 .{key},
             ),
         };
-        // `#e` and `#p` address events and pubkeys, so they carry the same hex
-        // rule as `ids` and `authors`. Every other letter takes arbitrary text.
         if ((letter == 'e' or letter == 'p') and decodeHex32(text) == null) {
             return malformed(
                 diagnostics,
@@ -272,10 +237,6 @@ fn expectArray(
     };
 }
 
-/// Exactly 64 lowercase hex characters, per docs/protocol.md. Uppercase is
-/// excluded on purpose: an id is the hex of a hash, the network writes it in
-/// lowercase, and accepting both spellings means two spellings of the same
-/// subscription reaching a store that indexes one of them.
 fn decodeHex32(text: []const u8) ?[32]u8 {
     if (text.len != 64) return null;
     var out: [32]u8 = undefined;
@@ -295,8 +256,6 @@ fn hexDigit(character: u8) ?u8 {
     };
 }
 
-/// Keeps a client-supplied string from filling the diagnostic message, which
-/// would push the part that explains the failure out of the buffer.
 fn truncate(text: []const u8) []const u8 {
     return text[0..@min(text.len, 24)];
 }
@@ -409,8 +368,6 @@ test "a kind outside the range a kind can hold is malformed" {
     var harness = Harness.init();
     defer harness.deinit();
 
-    // 65537 truncated into a u16 would be kind 1, subscribing the client to
-    // something it never asked for.
     try testing.expectError(error.MalformedFilter, harness.parse("{\"kinds\":[65537]}"));
     try testing.expectEqual(Reason.kind_out_of_range, harness.diagnostics.reason.?);
 
@@ -482,7 +439,6 @@ test "#e and #p carry the same hex rule as ids and authors" {
     try testing.expectError(error.MalformedFilter, not_hex.parse("{\"#p\":[\"someone\"]}"));
     try testing.expectEqual(Reason.value_not_lowercase_hex, not_hex.diagnostics.reason.?);
 
-    // Every other letter takes arbitrary text.
     var arbitrary = Harness.init();
     defer arbitrary.deinit();
     _ = try arbitrary.parse("{\"#t\":[\"not hex at all\"]}");
@@ -515,7 +471,6 @@ test "values within a field are OR-ed and fields are AND-ed" {
 
     try testing.expect(filter.matches(testEvent(0xaa, 1, 100, &.{})));
     try testing.expect(filter.matches(testEvent(0xaa, 7, 100, &.{})));
-    // Right author, wrong kind, and right kind, wrong author.
     try testing.expect(!filter.matches(testEvent(0xaa, 3, 100, &.{})));
     try testing.expect(!filter.matches(testEvent(0xbb, 1, 100, &.{})));
 }

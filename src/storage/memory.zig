@@ -1,20 +1,3 @@
-//! The in-memory `Store` backend.
-//!
-//! It exists for two reasons and neither of them is deployment. It is what
-//! Phase 1 runs on while the LMDB backend is still Phase 2 work, and it is
-//! kept permanently afterwards as the differential oracle the property tests
-//! compare the indexed store against: two implementations of one interface is
-//! what makes an abstraction leak visible immediately
-//! (docs/adr/0008-store-abstraction-boundary.md).
-//!
-//! It is a sorted array and a hash map, and it is not tuned. Insert is a
-//! binary search and a memmove; that is the wrong shape for a relay under
-//! load and the right shape for something whose answers have to be obviously
-//! correct, because it is what the real backend is checked against.
-//!
-//! Kind semantics — replaceable, ephemeral, addressable — are Phase 2. Every
-//! event stored here is stored as a regular event.
-
 const std = @import("std");
 const nostr = @import("nostr");
 
@@ -32,15 +15,8 @@ const Tag = nostr.event.Tag;
 pub const Memory = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// Held shared for the whole of a query, because emitted events borrow `order`.
     lock: std.Io.RwLock = .init,
-    /// Stored events, newest first, each one owned by this store.
-    ///
-    /// Kept in order on insert rather than sorted per query, because that is
-    /// what lets `query` stream: it walks from the front and stops at `limit`,
-    /// allocating nothing and holding nothing.
     order: std.ArrayList(Event),
-    /// The ids in `order`, for duplicate detection without a scan.
     ids: std.AutoHashMapUnmanaged([32]u8, void),
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Memory {
@@ -54,16 +30,10 @@ pub const Memory = struct {
         self.* = undefined;
     }
 
-    /// The `Store` interface over this backend, and the only way to reach its
-    /// events: `put`, `query` and `count` are deliberately private, so that a
-    /// caller holding a `*Memory` still goes through the boundary
-    /// (docs/adr/0008-store-abstraction-boundary.md). The returned value
-    /// borrows `self`, which must outlive it.
     pub fn store(self: *Memory) Store {
         return .{ .ptr = self, .vtable = &vtable };
     }
 
-    /// How many events are stored.
     fn count(self: *Memory) usize {
         self.lock.lockSharedUncancelable(self.io);
         defer self.lock.unlockShared(self.io);
@@ -88,8 +58,6 @@ pub const Memory = struct {
 
         if (self.ids.contains(event.id)) return .duplicate;
 
-        // Reserve both slots before copying, so a failure leaves the store
-        // exactly as it was rather than holding an event no index can find.
         try self.order.ensureUnusedCapacity(self.gpa, 1);
         try self.ids.ensureUnusedCapacity(self.gpa, 1);
 
@@ -126,7 +94,6 @@ pub const Memory = struct {
         }
     }
 
-    /// Where `event` belongs in `order`, by binary search.
     fn insertionIndex(self: Memory, event: *const Event) usize {
         var lo: usize = 0;
         var hi: usize = self.order.items.len;
@@ -138,16 +105,11 @@ pub const Memory = struct {
     }
 };
 
-/// The order docs/protocol.md requires of every backend: `created_at`
-/// descending, ties broken by the lexicographically smaller id first.
 fn isNewer(a: *const Event, b: *const Event) bool {
     if (a.created_at != b.created_at) return a.created_at > b.created_at;
     return std.mem.order(u8, &a.id, &b.id) == .lt;
 }
 
-/// Copies everything `event` borrows. The caller's per-request arena is reset
-/// as soon as the message is answered, so a stored event that pointed into it
-/// would be a use-after-free on the next query.
 fn dupeEvent(gpa: std.mem.Allocator, event: *const Event) Error!Event {
     const tags = try gpa.alloc(Tag, event.tags.len);
     var copied: usize = 0;
@@ -205,9 +167,6 @@ fn testEvent(id_byte: u8, created_at: i64, kind: u16) Event {
     };
 }
 
-/// Records what a query emitted, in order. The slices it keeps borrow the
-/// store, which outlives every assertion made against them here; a sink with
-/// a life of its own would have to copy (see `store.Sink`).
 const Collector = struct {
     ids: [8][32]u8 = undefined,
     contents: [8][]const u8 = undefined,
@@ -254,8 +213,6 @@ test "query streams newest first" {
     var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
-    // Inserted oldest, newest, middle, so that insertion order cannot be
-    // mistaken for the answer.
     for ([_]Event{
         testEvent(1, 1700000000, 1),
         testEvent(3, 1700000200, 1),
@@ -444,8 +401,6 @@ test "the store keeps its own copy of what the event borrows" {
     event.tags = tags;
     _ = try memory.store().put(&event);
 
-    // Everything the event pointed at is gone before the query runs, which is
-    // what a per-request arena reset looks like from the store's side.
     testing.allocator.free(tags);
     testing.allocator.free(fields);
     testing.allocator.free(value);

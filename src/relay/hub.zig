@@ -1,17 +1,3 @@
-//! Where an accepted event meets every subscription that wants it.
-//!
-//! A connection publishes on its own thread and the subscribers are on others,
-//! so this is the one place in the relay where two connections touch. Two locks
-//! make that safe, and they are always taken in this order: the hub's, then the
-//! subscriber's. Nothing takes them the other way round, which is what keeps
-//! the pair from deadlocking.
-//!
-//! Delivery is best-effort by design. A subscriber whose socket is dead is the
-//! transport's problem to notice, not the publisher's to wait on; the publisher
-//! has already been told its event was accepted, and blocking it on a slow
-//! reader would let one client stall another. Per-connection backpressure and
-//! the disconnect that goes with it are Phase 3.
-
 const std = @import("std");
 const nostr = @import("nostr");
 
@@ -21,9 +7,6 @@ const subscriptions = @import("subscriptions.zig");
 const Event = nostr.event.Event;
 const log = std.log.scoped(.relay);
 
-/// How a delivered message reaches a connection. `send` is called from another
-/// connection's thread, so the transport behind it must be safe to write to
-/// concurrently — `websocket.zig` documents that its `Conn.write` is.
 pub const Delivery = struct {
     ptr: *anyopaque,
     sendFn: *const fn (ptr: *anyopaque, message: []const u8) void,
@@ -33,16 +16,8 @@ pub const Delivery = struct {
     }
 };
 
-/// One connection as the rest of the relay sees it: what it is subscribed to,
-/// and how to hand it bytes.
 pub const Subscriber = struct {
-    /// Guards `registry`, which this connection's own thread mutates on `REQ`
-    /// and `CLOSE` while publishers read it.
-    ///
-    /// The connection also holds it across the whole of a `REQ` — opening the
-    /// subscription, streaming the stored events, and sending `EOSE` — so that
-    /// no live event can arrive in the middle of the stored phase.
-    /// docs/protocol.md requires every stored event to precede `EOSE`.
+    /// Lock order: hub, then subscriber.
     mutex: std.Io.Mutex = .init,
     registry: subscriptions.Registry,
     delivery: Delivery,
@@ -50,8 +25,6 @@ pub const Subscriber = struct {
 
 pub const Hub = struct {
     gpa: std.mem.Allocator,
-    /// Locking goes through `Io` in Zig 0.16, so the hub keeps the one the
-    /// relay was started with rather than taking it on every call.
     io: std.Io,
     mutex: std.Io.Mutex = .init,
     members: std.ArrayList(*Subscriber) = .empty,
@@ -71,8 +44,6 @@ pub const Hub = struct {
         try self.members.append(self.gpa, subscriber);
     }
 
-    /// Tolerates a subscriber that never joined, because a connection that
-    /// failed to start still runs its cleanup.
     pub fn leave(self: *Hub, subscriber: *Subscriber) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -90,20 +61,10 @@ pub const Hub = struct {
         return self.members.items.len;
     }
 
-    /// Sends `event` to every open subscription whose filters match it,
-    /// including the publisher's own: a client that subscribes and then
-    /// publishes expects to see what it published.
-    ///
-    /// `arena` is the publisher's per-message arena, used to compose each
-    /// message and released when its message is done.
     pub fn broadcast(self: *Hub, arena: std.mem.Allocator, event: *const Event) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        // Serialized once for the whole fan-out rather than once per
-        // subscription: they differ only in the id they carry, and this is the
-        // path every accepted event takes to every subscriber that wants it.
-        // Lazily, so that an event nothing matches costs nothing.
         var serialized: ?[]const u8 = null;
 
         for (self.members.items) |member| {
@@ -115,12 +76,6 @@ pub const Hub = struct {
 
                 const body = serialized orelse body: {
                     const rendered = render(arena, event) catch |err| {
-                        // Not silently: a delivery that did not happen is
-                        // invisible to everyone but the operator. The event
-                        // itself is stored and a later query will find it,
-                        // which is why this does not undo the acceptance the
-                        // publisher was already given. Phase 3 gives it a
-                        // metric next to the structured logging.
                         log.warn(
                             "dropping the fan-out of event {s}: {t}",
                             .{ std.fmt.bytesToHex(event.id, .lower), err },
@@ -167,7 +122,6 @@ fn deliver(
 
 const testing = std.testing;
 
-/// Stands in for a connection: keeps what it was handed.
 const Listener = struct {
     received: std.ArrayList([]u8) = .empty,
 
@@ -260,7 +214,6 @@ test "a subscriber that has left is not delivered to" {
 
     try connections.join(&member);
     connections.leave(&member);
-    // Leaving twice is what a connection that never finished starting does.
     connections.leave(&member);
     try testing.expectEqual(@as(usize, 0), connections.count());
 

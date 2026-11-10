@@ -1,24 +1,9 @@
-//! The subscriptions one connection has open.
-//!
-//! A subscription outlives the message that opened it, and the filters that
-//! `REQ` arrived with point into the per-message arena, which is reset as soon
-//! as the message is answered. So opening one copies everything it borrows.
-//!
-//! Each subscription owns an arena holding its id and its filters, which makes
-//! closing or replacing one a single `deinit` rather than a walk over a tree of
-//! slices. Replacing is a real operation and not a rarity — a client scrolling
-//! a feed reissues the same subscription id with a new `until` — so the memory
-//! it holds has to come back, which is why this is not one arena per
-//! connection.
-
 const std = @import("std");
 const nostr = @import("nostr");
 
 const Filter = nostr.filter.Filter;
 const TagFilter = nostr.filter.TagFilter;
 
-/// From the `limits` section of docs/configuration.md, spelled as it spells
-/// them.
 pub const Limits = struct {
     max_subscriptions: usize = 20,
     max_limit: usize = 5000,
@@ -28,12 +13,10 @@ pub const Limits = struct {
 pub const Subscription = struct {
     id: []const u8,
     filters: []const Filter,
-    /// Owns `id` and everything `filters` points at.
     arena: std.heap.ArenaAllocator,
 };
 
 pub const Error = error{
-    /// The connection already holds as many subscriptions as it may.
     TooMany,
     OutOfMemory,
 };
@@ -68,9 +51,6 @@ pub const Registry = struct {
         return null;
     }
 
-    /// Opens a subscription, replacing one with the same id. Replacing does not
-    /// count against the limit, because a `REQ` reusing an open id is a
-    /// replacement and not a second subscription (docs/protocol.md).
     pub fn open(self: *Registry, id: []const u8, filters: []const Filter) Error!void {
         const existing = self.indexOf(id);
         if (existing == null and self.entries.items.len >= self.limits.max_subscriptions) {
@@ -85,8 +65,6 @@ pub const Registry = struct {
             .arena = arena,
         };
 
-        // Only now that the copy exists does the incumbent go: a failed
-        // replacement must leave the old subscription serving.
         if (existing) |index| {
             self.entries.items[index].arena.deinit();
             self.entries.items[index] = owned;
@@ -95,7 +73,6 @@ pub const Registry = struct {
         try self.entries.append(self.gpa, owned);
     }
 
-    /// Returns whether there was one to close.
     pub fn close(self: *Registry, id: []const u8) bool {
         const index = self.indexOf(id) orelse return false;
         self.entries.items[index].arena.deinit();
@@ -136,7 +113,6 @@ fn copyFilter(arena: std.mem.Allocator, filter: Filter) Error!Filter {
     return copy;
 }
 
-/// Copies `filters` with each `limit` defaulted and capped, for the stored phase.
 pub fn resolveLimits(arena: std.mem.Allocator, filters: []const Filter, limits: Limits) error{OutOfMemory}![]const Filter {
     const cap = @min(limits.max_limit, std.math.maxInt(u32));
     const resolved = try arena.dupe(Filter, filters);
@@ -165,8 +141,6 @@ test "opening a subscription copies everything the filters borrow" {
     var registry = Registry.init(testing.allocator, .{});
     defer registry.deinit();
 
-    // The filters live in an arena that is thrown away straight after, the way
-    // a per-message arena is reset as soon as the message is answered.
     {
         var message_arena = std.heap.ArenaAllocator.init(testing.allocator);
         defer message_arena.deinit();
@@ -238,9 +212,6 @@ test "a replacement that cannot be built leaves the old subscription serving" {
     defer arena.deinit();
     try registry.open("sub-1", &[_]Filter{try testFilter(arena.allocator(), 1, "original")});
 
-    // The replacement's first allocation fails. The allocator goes back
-    // afterwards, so the entries this registry already owns are freed by the
-    // one that allocated them.
     var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
     registry.gpa = failing.allocator();
     const replacement = [_]Filter{try testFilter(arena.allocator(), 7, "replacement")};

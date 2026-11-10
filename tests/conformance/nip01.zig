@@ -1,11 +1,3 @@
-//! NIP-01 as docs/protocol.md states it, checked over a real WebSocket
-//! connection to a relay with an in-memory store.
-//!
-//! One test per rule, named after the rule. These are written from the
-//! document rather than from the implementation: a test derived from the code
-//! agrees with the code by construction, which is not the property worth
-//! having.
-
 const std = @import("std");
 const easyrelay = @import("easyrelay");
 const nostr = @import("nostr");
@@ -75,8 +67,6 @@ test "stored events are streamed newest first" {
     var client = try Client.connect(relay);
     defer client.close();
 
-    // Published oldest first, so that insertion order cannot pass for the
-    // answer.
     for ([_][]const u8{ "oldest", "middle", "newest" }, 0..) |content, offset| {
         const event = try author.event(
             client.allocator(),
@@ -181,7 +171,6 @@ test "an event with a valid id and an invalid signature is rejected as invalid" 
     try client.sendEvent(event);
     try expectOk(&client, false, "invalid:");
 
-    // And it was not stored: a rejected event must not come back.
     try client.send("[\"REQ\",\"s\",{}]");
     try expectEose(&client, "s");
 }
@@ -201,8 +190,6 @@ test "an event the relay already holds is accepted again with duplicate" {
     try expectOk(&client, true, "");
 
     try client.sendEvent(event);
-    // True, not false: the client's event is on the relay, which is what it
-    // asked for (docs/protocol.md).
     try expectOk(&client, true, "duplicate:");
 }
 
