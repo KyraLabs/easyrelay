@@ -12,6 +12,8 @@ pub const record = @import("storage/record.zig");
 
 pub const kind = @import("storage/kind.zig");
 
+pub const index = @import("storage/index.zig");
+
 pub const validation = @import("relay/validation.zig");
 
 pub const filter = @import("relay/filter.zig");

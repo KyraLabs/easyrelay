@@ -69,6 +69,11 @@ pub fn encode(buffer: []u8, event: *const Event) EncodeError!usize {
     return cursor;
 }
 
+pub fn createdAt(bytes: []const u8) error{Malformed}!i64 {
+    if (bytes.len < header_size) return error.Malformed;
+    return std.mem.readInt(i64, bytes[created_at_offset..][0..8], .little);
+}
+
 /// `content` and every tag field alias `bytes`.
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!Event {
     if (bytes.len < header_size) return error.Malformed;

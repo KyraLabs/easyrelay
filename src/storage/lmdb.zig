@@ -2,6 +2,7 @@ const std = @import("std");
 const lmdb = @import("lmdb");
 const nostr = @import("nostr");
 
+const index = @import("index.zig");
 const kinds = @import("kind.zig");
 const record = @import("record.zig");
 const store = @import("store.zig");
@@ -24,6 +25,7 @@ pub const Error = error{
 pub const Options = struct {
     map_size: usize = 10 * 1024 * 1024 * 1024,
     max_readers: u32 = 126,
+    max_scan: usize = 100_000,
 };
 
 pub const subdirectory = "events";
@@ -33,7 +35,6 @@ const max_databases = 16;
 const events_db = "events";
 const meta_db = "meta";
 const by_id_db = "by_id";
-const by_created_at_db = "by_created_at";
 const by_replaceable_db = "by_replaceable";
 const by_address_db = "by_address";
 const next_local_id_key = "next_local_id";
@@ -44,23 +45,6 @@ pub const first_local_id: u64 = 1;
 pub fn encodeLocalId(local_id: u64) [8]u8 {
     var key: [8]u8 = undefined;
     std.mem.writeInt(u64, &key, local_id, .big);
-    return key;
-}
-
-/// Sign-flipped and inverted so a forward walk yields newest first, ties by ascending id.
-fn descendingTime(created_at: i64) [8]u8 {
-    const biased: u64 = @as(u64, @bitCast(created_at)) ^ (@as(u64, 1) << 63);
-    var key: [8]u8 = undefined;
-    std.mem.writeInt(u64, &key, ~biased, .big);
-    return key;
-}
-
-const CreatedAtKey = [40]u8;
-
-fn createdAtKey(created_at: i64, id: *const [32]u8) CreatedAtKey {
-    var key: CreatedAtKey = undefined;
-    key[0..8].* = descendingTime(created_at);
-    key[8..40].* = id.*;
     return key;
 }
 
@@ -95,28 +79,151 @@ fn database(txn: lmdb.Transaction, name: [*:0]const u8) Error!lmdb.Database {
     return lmdb.Database.open(txn, name, .{ .create = true }) catch error.Backend;
 }
 
+const IndexWriter = struct {
+    txn: lmdb.Transaction,
+    local_key: *const [8]u8,
+    delete: bool,
+
+    pub fn entry(self: IndexWriter, which: index.Index, key: index.Key) Error!void {
+        const db = try database(self.txn, which.name());
+        if (self.delete) {
+            db.delete(key.slice()) catch return error.Backend;
+        } else {
+            db.set(key.slice(), self.local_key) catch return error.Backend;
+        }
+    }
+};
+
 fn writeIndexes(txn: lmdb.Transaction, event: *const Event, local_key: *const [8]u8) Error!void {
     (try database(txn, by_id_db)).set(&event.id, local_key) catch return error.Backend;
-    const created_at_key = createdAtKey(event.created_at, &event.id);
-    (try database(txn, by_created_at_db)).set(&created_at_key, local_key) catch return error.Backend;
+    try index.forEachEntry(event, IndexWriter{ .txn = txn, .local_key = local_key, .delete = false });
     if (Coordinate.of(event)) |coordinate| {
         (try database(txn, coordinate.db)).set(coordinate.key(), local_key) catch return error.Backend;
     }
 }
 
 fn deleteIndexes(txn: lmdb.Transaction, event: *const Event) Error!void {
+    const unused = [_]u8{0} ** 8;
     (try database(txn, by_id_db)).delete(&event.id) catch return error.Backend;
-    const created_at_key = createdAtKey(event.created_at, &event.id);
-    (try database(txn, by_created_at_db)).delete(&created_at_key) catch return error.Backend;
+    try index.forEachEntry(event, IndexWriter{ .txn = txn, .local_key = &unused, .delete = true });
     if (Coordinate.of(event)) |coordinate| {
         (try database(txn, coordinate.db)).delete(coordinate.key()) catch return error.Backend;
     }
 }
 
+const max_prefixes_per_filter = 64;
+
+fn idLessThan(_: void, a: [32]u8, b: [32]u8) bool {
+    return std.mem.order(u8, &a, &b) == .lt;
+}
+
+const Head = struct {
+    tail: index.Suffix,
+    local_id: u64,
+
+    fn lessThan(_: void, a: Head, b: Head) bool {
+        return std.mem.order(u8, &a.tail, &b.tail) == .lt;
+    }
+};
+
+const Source = struct {
+    filter: usize,
+    head: ?Head = null,
+    input: union(enum) {
+        cursor: struct {
+            cursor: lmdb.Cursor,
+            prefix: index.Prefix,
+            start: index.Key,
+            oldest: [8]u8,
+            started: bool = false,
+        },
+        list: struct { items: []const Head, next: usize = 0 },
+    },
+
+    fn advance(self: *Source) Error!void {
+        switch (self.input) {
+            .list => |*list| {
+                self.head = if (list.next < list.items.len) list.items[list.next] else null;
+                list.next += 1;
+            },
+            .cursor => |*walk| {
+                const found = if (walk.started)
+                    walk.cursor.goToNext() catch return error.Backend
+                else
+                    walk.cursor.seek(walk.start.slice()) catch return error.Backend;
+                walk.started = true;
+                self.head = null;
+                const key = found orelse return;
+                if (key.len != walk.prefix.len + index.suffix_len) return;
+                if (!std.mem.startsWith(u8, key, walk.prefix.slice())) return;
+                const tail = key[walk.prefix.len..][0..index.suffix_len];
+                if (std.mem.order(u8, tail[0..8], &walk.oldest) == .gt) return;
+                const value = walk.cursor.getCurrentValue() catch return error.Backend;
+                if (value.len != 8) return error.Corrupt;
+                self.head = .{ .tail = tail.*, .local_id = std.mem.readInt(u64, value[0..8], .big) };
+            },
+        }
+    }
+
+    fn deinit(self: *Source) void {
+        switch (self.input) {
+            .cursor => |walk| walk.cursor.deinit(),
+            .list => {},
+        }
+    }
+};
+
+fn addCursor(
+    txn: lmdb.Transaction,
+    arena: std.mem.Allocator,
+    sources: *std.ArrayList(Source),
+    position: usize,
+    which: index.Index,
+    prefix: index.Prefix,
+    newest: *const index.Suffix,
+    oldest: [8]u8,
+) Error!void {
+    const cursor = lmdb.Cursor.init(try database(txn, which.name())) catch return error.Backend;
+    errdefer cursor.deinit();
+    try sources.append(arena, .{ .filter = position, .input = .{ .cursor = .{
+        .cursor = cursor,
+        .prefix = prefix,
+        .start = .init(prefix, newest),
+        .oldest = oldest,
+    } } });
+}
+
+const Choice = union(enum) {
+    ids,
+    author_kind,
+    tag: usize,
+    author,
+    kind,
+    created_at,
+
+    fn of(filter: Filter) Choice {
+        if (filter.ids != null) return .ids;
+        if (filter.authors) |authors| if (filter.kinds) |kinds_list| {
+            if (authors.len * kinds_list.len <= max_prefixes_per_filter) return .author_kind;
+        };
+        if (filter.tags) |tag_filters| {
+            var best: ?usize = null;
+            for (tag_filters, 0..) |tag_filter, position| {
+                if (best == null or tag_filter.values.len < tag_filters[best.?].values.len) best = position;
+            }
+            if (best) |position| if (tag_filters[position].values.len <= max_prefixes_per_filter) return .{ .tag = position };
+        }
+        if (filter.authors) |authors| if (authors.len <= max_prefixes_per_filter) return .author;
+        if (filter.kinds) |kinds_list| if (kinds_list.len <= max_prefixes_per_filter) return .kind;
+        return .created_at;
+    }
+};
+
 pub const Lmdb = struct {
     gpa: std.mem.Allocator,
     env: lmdb.Environment,
     next_local_id: u64,
+    max_scan: usize,
 
     pub fn open(
         gpa: std.mem.Allocator,
@@ -137,7 +244,7 @@ pub const Lmdb = struct {
         errdefer env.deinit();
 
         const next_local_id = readNextLocalId(env) catch return error.Backend;
-        return .{ .gpa = gpa, .env = env, .next_local_id = next_local_id };
+        return .{ .gpa = gpa, .env = env, .next_local_id = next_local_id, .max_scan = options.max_scan };
     }
 
     pub fn store(self: *Lmdb) Store {
@@ -255,8 +362,11 @@ pub const Lmdb = struct {
     }
 
     fn query(self: *Lmdb, filters: []const Filter, sink: Sink) (Error || Sink.Abort)!void {
-        const remaining = try self.gpa.alloc(u64, filters.len);
-        defer self.gpa.free(remaining);
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const remaining = try arena.alloc(u64, filters.len);
         var pending: usize = 0;
         for (filters, remaining) |filter, *left| {
             left.* = filter.limit orelse std.math.maxInt(u64);
@@ -268,24 +378,35 @@ pub const Lmdb = struct {
             return error.Backend;
         defer txn.abort();
 
-        const by_created_at = lmdb.Database.open(txn, by_created_at_db, .{ .create = true }) catch
-            return error.Backend;
-        const cursor = lmdb.Cursor.init(by_created_at) catch return error.Backend;
-        defer cursor.deinit();
+        var sources: std.ArrayList(Source) = .empty;
+        defer for (sources.items) |*source| source.deinit();
+        for (filters, remaining, 0..) |filter, left, position| {
+            if (left == 0) continue;
+            try plan(txn, arena, filter, position, &sources);
+        }
+        for (sources.items) |*source| try source.advance();
 
-        var arena = std.heap.ArenaAllocator.init(self.gpa);
-        defer arena.deinit();
+        var event_arena = std.heap.ArenaAllocator.init(self.gpa);
+        defer event_arena.deinit();
+        var scanned: usize = 0;
+        while (pending != 0 and scanned < self.max_scan) {
+            var next: ?Head = null;
+            for (sources.items) |source| {
+                const head = source.head orelse continue;
+                if (remaining[source.filter] == 0) continue;
+                if (next == null or Head.lessThan({}, head, next.?)) next = head;
+            }
+            const chosen = next orelse break;
+            for (sources.items) |*source| {
+                const head = source.head orelse continue;
+                if (!std.mem.eql(u8, &head.tail, &chosen.tail)) continue;
+                try source.advance();
+                scanned += 1;
+            }
 
-        var key = cursor.goToFirst() catch return error.Backend;
-        while (key != null and pending != 0) : (key = cursor.goToNext() catch return error.Backend) {
-            const value = cursor.getCurrentValue() catch return error.Backend;
-            if (value.len != 8) return error.Corrupt;
-
-            _ = arena.reset(.retain_capacity);
-            const local_id = std.mem.readInt(u64, value[0..8], .big);
-            const event = (try self.read(txn, arena.allocator(), local_id)) orelse
+            _ = event_arena.reset(.retain_capacity);
+            const event = (try self.read(txn, event_arena.allocator(), chosen.local_id)) orelse
                 return error.Corrupt;
-
             var wanted = false;
             for (filters, remaining) |filter, *left| {
                 if (left.* == 0 or !filter.matches(event)) continue;
@@ -294,6 +415,52 @@ pub const Lmdb = struct {
                 wanted = true;
             }
             if (wanted) try sink.emit(&event);
+        }
+    }
+
+    fn plan(
+        txn: lmdb.Transaction,
+        arena: std.mem.Allocator,
+        filter: Filter,
+        position: usize,
+        sources: *std.ArrayList(Source),
+    ) Error!void {
+        const newest = index.suffix(filter.until orelse std.math.maxInt(i64), &([_]u8{0} ** 32));
+        const oldest = index.descendingTime(filter.since orelse std.math.minInt(i64));
+        switch (Choice.of(filter)) {
+            .ids => {
+                const ids = try arena.dupe([32]u8, filter.ids.?);
+                std.mem.sort([32]u8, ids, {}, idLessThan);
+                var heads: std.ArrayList(Head) = .empty;
+                const by_id = try database(txn, by_id_db);
+                const events = try database(txn, events_db);
+                for (ids, 0..) |*id, position_in_ids| {
+                    if (position_in_ids != 0 and std.mem.eql(u8, id, &ids[position_in_ids - 1])) continue;
+                    const value = (by_id.get(id) catch return error.Backend) orelse continue;
+                    if (value.len != 8) return error.Corrupt;
+                    const bytes = (events.get(value) catch return error.Backend) orelse return error.Corrupt;
+                    const created_at = record.createdAt(bytes) catch return error.Corrupt;
+                    try heads.append(arena, .{ .tail = index.suffix(created_at, id), .local_id = std.mem.readInt(u64, value[0..8], .big) });
+                }
+                std.mem.sort(Head, heads.items, {}, Head.lessThan);
+                try sources.append(arena, .{ .filter = position, .input = .{ .list = .{ .items = heads.items } } });
+            },
+            .author_kind => for (filter.authors.?) |*pubkey| for (filter.kinds.?) |value| {
+                try addCursor(txn, arena, sources, position, .by_author_kind, .authorKind(pubkey, value), &newest, oldest);
+            },
+            .tag => |which| {
+                const tag_filter = filter.tags.?[which];
+                for (tag_filter.values) |value| {
+                    try addCursor(txn, arena, sources, position, .by_tag, .tag(tag_filter.letter, value), &newest, oldest);
+                }
+            },
+            .author => for (filter.authors.?) |*pubkey| {
+                try addCursor(txn, arena, sources, position, .by_author, .author(pubkey), &newest, oldest);
+            },
+            .kind => for (filter.kinds.?) |value| {
+                try addCursor(txn, arena, sources, position, .by_kind, .kind(value), &newest, oldest);
+            },
+            .created_at => try addCursor(txn, arena, sources, position, .by_created_at, .none(), &newest, oldest),
         }
     }
 };
@@ -530,8 +697,8 @@ const Collector = struct {
         self.len += 1;
     }
 
-    fn idAt(self: Collector, index: usize) u8 {
-        return self.ids[index][0];
+    fn idAt(self: Collector, position: usize) u8 {
+        return self.ids[position][0];
     }
 };
 
@@ -756,7 +923,15 @@ test "a superseded replaceable event is removed from every table" {
     try testing.expectEqual(PutResult.stored, try fixture.backend.store().put(&new));
     try testing.expectEqual(PutResult.outdated, try fixture.backend.store().put(&old));
 
-    for ([_][*:0]const u8{ events_db, by_id_db, by_created_at_db, by_replaceable_db }) |name| {
+    for ([_][*:0]const u8{
+        events_db,
+        by_id_db,
+        by_replaceable_db,
+        index.Index.by_created_at.name(),
+        index.Index.by_author.name(),
+        index.Index.by_kind.name(),
+        index.Index.by_author_kind.name(),
+    }) |name| {
         try testing.expectEqual(@as(usize, 1), try entryCount(&fixture.backend, name));
     }
 
@@ -830,4 +1005,158 @@ test "replacement holds across a restart" {
     defer backend.close();
     const old = kindEvent(1, 1700000000, 10002);
     try testing.expectEqual(PutResult.outdated, try backend.store().put(&old));
+}
+
+const memory = @import("memory.zig");
+
+const IdCollector = struct {
+    gpa: std.mem.Allocator,
+    ids: std.ArrayList([32]u8) = .empty,
+
+    fn sink(self: *IdCollector) Sink {
+        return .{ .ptr = self, .emitFn = emit };
+    }
+
+    fn emit(ptr: *anyopaque, event: *const Event) Sink.Abort!void {
+        const self: *IdCollector = @ptrCast(@alignCast(ptr));
+        self.ids.append(self.gpa, event.id) catch return error.Abort;
+    }
+};
+
+fn randomEvent(random: std.Random, arena: std.mem.Allocator, authors: []const [32]u8) !Event {
+    const kind_choices = [_]u16{ 1, 1, 1, 7, 0, 3, 10002, 30023, 30000, 40000 };
+    const letters = [_][]const u8{ "e", "p", "t", "d" };
+    const values = [_][]const u8{ "", "a", "b", "c" };
+
+    const tags = try arena.alloc(nostr.event.Tag, random.uintLessThan(usize, 4));
+    for (tags) |*tag| {
+        const fields = try arena.alloc([]const u8, 1 + random.uintLessThan(usize, 2));
+        fields[0] = letters[random.uintLessThan(usize, letters.len)];
+        if (fields.len > 1) fields[1] = values[random.uintLessThan(usize, values.len)];
+        tag.* = fields;
+    }
+    var event: Event = .{
+        .id = undefined,
+        .pubkey = authors[random.uintLessThan(usize, authors.len)],
+        .created_at = random.intRangeAtMost(i64, -3, 40),
+        .kind = kind_choices[random.uintLessThan(usize, kind_choices.len)],
+        .tags = tags,
+        .content = "",
+        .sig = [_]u8{0} ** 64,
+    };
+    random.bytes(&event.id);
+    event.id[0] &= 0x0f;
+    return event;
+}
+
+fn randomFilter(random: std.Random, arena: std.mem.Allocator, authors: []const [32]u8, stored: []const Event) !Filter {
+    var filter: Filter = .{};
+    if (random.uintLessThan(u8, 6) == 0 and stored.len != 0) {
+        const ids = try arena.alloc([32]u8, 1 + random.uintLessThan(usize, 4));
+        for (ids) |*id| id.* = stored[random.uintLessThan(usize, stored.len)].id;
+        filter.ids = ids;
+    }
+    if (random.boolean()) {
+        const picked = try arena.alloc([32]u8, random.uintLessThan(usize, 3));
+        for (picked) |*author| author.* = authors[random.uintLessThan(usize, authors.len)];
+        filter.authors = picked;
+    }
+    if (random.boolean()) {
+        const picked = try arena.alloc(u16, 1 + random.uintLessThan(usize, 3));
+        for (picked) |*value| value.* = ([_]u16{ 1, 7, 0, 30023, 40000 })[random.uintLessThan(usize, 5)];
+        filter.kinds = picked;
+    }
+    if (random.uintLessThan(u8, 3) == 0) {
+        const values = try arena.alloc([]const u8, 1 + random.uintLessThan(usize, 2));
+        for (values) |*value| value.* = ([_][]const u8{ "", "a", "b", "c" })[random.uintLessThan(usize, 4)];
+        const tag_filters = try arena.alloc(nostr.filter.TagFilter, 1);
+        tag_filters[0] = .{ .letter = ("ept")[random.uintLessThan(usize, 3)], .values = values };
+        filter.tags = tag_filters;
+    }
+    if (random.boolean()) filter.since = random.intRangeAtMost(i64, -3, 40);
+    if (random.boolean()) filter.until = random.intRangeAtMost(i64, -3, 40);
+    if (random.uintLessThan(u8, 4) != 0) filter.limit = random.uintLessThan(u32, 12);
+    return filter;
+}
+
+test "the LMDB planner agrees with brute force over the memory store" {
+    for (0..12) |seed| {
+        var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const random = prng.random();
+
+        var fixture: Fixture = undefined;
+        try fixture.init();
+        defer fixture.deinit();
+        var oracle = memory.Memory.init(testing.allocator, testing.io);
+        defer oracle.deinit();
+
+        var authors: [3][32]u8 = undefined;
+        for (&authors, 0..) |*author, position| author.* = [_]u8{@intCast(position + 1)} ** 32;
+
+        var published: std.ArrayList(Event) = .empty;
+        for (0..250) |_| {
+            const event = try randomEvent(random, arena, &authors);
+            const expected = try oracle.store().put(&event);
+            try testing.expectEqual(expected, try fixture.backend.store().put(&event));
+            try published.append(arena, event);
+        }
+
+        for (0..150) |_| {
+            const filters = try arena.alloc(Filter, 1 + random.uintLessThan(usize, 3));
+            for (filters) |*filter| filter.* = try randomFilter(random, arena, &authors, published.items);
+
+            var want: IdCollector = .{ .gpa = arena };
+            try oracle.store().query(filters, want.sink());
+            var got: IdCollector = .{ .gpa = arena };
+            try fixture.backend.store().query(filters, got.sink());
+            try testing.expectEqualSlices([32]u8, want.ids.items, got.ids.items);
+        }
+    }
+}
+
+test "the scan budget ends a query early" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{ .max_scan = 3 });
+    defer backend.close();
+
+    for (0..10) |position| {
+        const event = kindEvent(@intCast(position + 1), 1700000000 + @as(i64, @intCast(position)), 1);
+        _ = try backend.store().put(&event);
+    }
+    var collector: Collector = .{};
+    try backend.store().query(&.{.{ .kinds = &.{7} }}, collector.sink());
+    try testing.expectEqual(@as(usize, 0), collector.len);
+    try backend.store().query(&.{.{}}, collector.sink());
+    try testing.expectEqual(@as(usize, 3), collector.len);
+}
+
+test "an ids query reads each event once, however often its id repeats" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+    defer backend.close();
+
+    var tags: [2000]nostr.event.Tag = undefined;
+    for (&tags) |*tag| tag.* = &.{ "t", "x" };
+    var note = kindEvent(1, 1700000000, 1);
+    note.tags = &tags;
+    _ = try backend.store().put(&note);
+
+    var ids: [1000][32]u8 = undefined;
+    for (&ids) |*id| id.* = note.id;
+    var measured = testing.FailingAllocator.init(testing.allocator, .{});
+    backend.gpa = measured.allocator();
+    defer backend.gpa = testing.allocator;
+    var collector: Collector = .{};
+    try backend.store().query(&.{.{ .ids = &ids, .limit = 1 }}, collector.sink());
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    try testing.expect(measured.allocated_bytes < 1024 * 1024);
 }

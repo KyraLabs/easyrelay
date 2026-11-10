@@ -80,7 +80,7 @@ available, because nothing bounds how many events may share one `created_at`.
 | `by_author` | `pubkey`, `created_at`, `event_id` | `authors` |
 | `by_kind` | `kind`, `created_at`, `event_id` | `kinds` |
 | `by_author_kind` | `pubkey`, `kind`, `created_at`, `event_id` | `authors` + `kinds` |
-| `by_tag` | `tag_name` (1 B), `tag_value`, `created_at`, `event_id` | `#<letter>` |
+| `by_tag` | `tag_name` (1 B), `sha256(tag_value)`, `created_at`, `event_id` | `#<letter>` |
 | `by_address` | `pubkey`, `kind`, `sha256(d_value)` | addressable replacement |
 | `by_replaceable` | `pubkey`, `kind` | replaceable replacement |
 | `by_expiration` | `expires_at`, `event_id` | NIP-40 reaper |
@@ -90,8 +90,9 @@ The `event_id` in the key costs 32 bytes an entry where the `local_id` would hav
 is the price of the tie-break being a property of the key order rather than of a sort, and it is
 worth paying: it is what keeps a query streaming.
 
-`by_address` hashes the `d` value because LMDB caps a key at 511 bytes and a `d` value is
-bounded only by the event size. A collision would need a SHA-256 preimage.
+`by_address` and `by_tag` hash the value because LMDB caps a key at 511 bytes and a tag value
+is bounded only by the event size. A collision would need a SHA-256 preimage. Only tags with a
+single-letter name and a value are indexed, once per distinct value.
 
 `by_author_kind` is a deliberate denormalisation: the `authors` + `kinds` combination is the
 single most common shape in real client traffic, and serving it from one cursor rather than
@@ -100,8 +101,14 @@ intersecting two is the difference between a scan and a seek.
 ### Query planning
 
 For each filter the planner picks one index — the most selective one whose key prefix the filter
-constrains — then walks it backwards from `until` (or from the end), applying the remaining
-filter conditions to each candidate as a post-filter, and stops at `limit`.
+constrains — and opens one cursor per prefix it names: one per author and kind pair, one per
+value of the tag with the fewest values, and so on. Each cursor walks forwards from `until` and
+stops at `since`. An index that would need more than 64 prefixes for one filter is skipped for
+the next one in the order below.
+
+The cursors of every filter in the `REQ` are merged on the shared key suffix, so an event found
+through several of them is read and post-filtered once. Each filter counts its own matches and
+drops out at its `limit`; the query ends when every filter has, or when the cursors run dry.
 
 Selectivity order, most selective first: `ids` → `by_author_kind` → `by_tag` → `by_author` →
 `by_kind` → `by_created_at`.
@@ -115,8 +122,8 @@ Two properties matter more than raw speed:
 
 The cost of this design is that a filter with a very low `limit` but a very selective post-filter
 can walk many index entries before finding enough matches. A scan budget caps that: after
-`max_scan` entries the subscription is answered with what was found and `EOSE`, and the event is
-counted in metrics.
+`max_scan` entries the subscription is answered with what was found and `EOSE`. Counting those
+early endings is a Phase 3 metric.
 
 ## Kind semantics
 
