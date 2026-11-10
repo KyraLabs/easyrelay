@@ -28,6 +28,7 @@ versions may contain breaking changes; they will always be listed under `Changed
 - The runtime dependencies, pinned and compiled from source: `zig-nostr/nostr` for the event
   model, canonical serialization and Schnorr verification, and `zig-lmdb` for LMDB.
 - A first-party RFC 6455 WebSocket transport, which also answers plain HTTP on the same port.
+- NIP-11: the relay information document, served on `Accept: application/nostr+json`.
 - A conformance suite that drives the relay over a real WebSocket connection, and an interop
   check in CI that publishes an event with [`nak`](https://github.com/fiatjaf/nak) and reads it
   back.

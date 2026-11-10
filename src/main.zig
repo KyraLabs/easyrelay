@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
                 },
                 else => return err,
             };
-            try serve(gpa, io, loaded, stdout, stderr);
+            try serve(gpa, arena, io, loaded, stdout, stderr);
         },
     }
     try stdout.flush();
@@ -191,7 +191,7 @@ fn isLoopback(address: []const u8) bool {
     return std.mem.startsWith(u8, address, "127.") or std.mem.eql(u8, address, "::1") or std.mem.eql(u8, address, "localhost");
 }
 
-fn serve(gpa: std.mem.Allocator, io: Io, loaded: Loaded, stdout: *Io.Writer, stderr: *Io.Writer) !void {
+fn serve(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, loaded: Loaded, stdout: *Io.Writer, stderr: *Io.Writer) !void {
     const settings = loaded.settings;
     var events = easyrelay.lmdb.Lmdb.open(gpa, io, settings.storage.path, storeOptions(settings)) catch |err| {
         if (err == error.InUse) {
@@ -223,7 +223,8 @@ fn serve(gpa: std.mem.Allocator, io: Io, loaded: Loaded, stdout: *Io.Writer, std
         .writer = &writer,
         .limits = sessionLimits(settings),
     };
-    var app: easyrelay.server.App = .{ .gpa = gpa, .shared = &shared };
+    const information = try easyrelay.nip11.Responses.render(arena, settings);
+    var app: easyrelay.server.App = .{ .gpa = gpa, .shared = &shared, .information = &information };
 
     const options = serverOptions(settings);
     var relay = easyrelay.server.init(gpa, &app, options) catch |err| {

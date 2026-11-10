@@ -5,8 +5,8 @@ A [Nostr](https://github.com/nostr-protocol/nips) relay written in [Zig](https:/
 **Status: pre-alpha.** The relay works and is not ready to run for anyone else yet. It speaks
 NIP-01 over WebSocket — publishing, subscriptions, live delivery, full event validation, kind
 semantics — and NIP-09 deletion, and it keeps its events in LMDB under `./data`, so they survive a
-restart. Phase 2, persistence, is in progress; the rate limits, authentication and distribution a
-public relay needs are Phase 3. See the
+restart. It answers NIP-11 on the same port. The rate limits, authentication and distribution a public
+relay needs are Phase 3. See the
 [roadmap](docs/roadmap.md) for what is being built and in which order.
 
 ## What it is

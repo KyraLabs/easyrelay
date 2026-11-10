@@ -70,6 +70,12 @@ $received"
 echo "$received" | grep -q "$content" || fail "the event came back with different content:
 $received"
 
+information=$(nak relay "ws://localhost:$port" </dev/null 2>&1) ||
+    fail "nak could not read the NIP-11 document:
+$information"
+echo "$information" | grep -q '"supported_nips"' || fail "the NIP-11 document has no supported_nips:
+$information"
+
 [ -d "$workdir/data/events" ] || fail "the relay did not create ./data/events in its working directory"
 
 stop_relay

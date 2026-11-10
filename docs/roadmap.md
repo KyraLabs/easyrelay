@@ -133,6 +133,9 @@ implemented them. The suite grows with each phase. The fuzz targets
 
 ## Phase 2 — Persistence and indexes
 
+> **Complete.** Every exit criterion below was verified, and what it verified with is recorded
+> in [what Phase 2 delivered](#what-phase-2-delivered).
+
 ### Deliverables
 
 - The `lmdb` backend behind the `Store` interface, with the data model in
@@ -201,10 +204,10 @@ implemented them. The suite grows with each phase. The fuzz targets
 
 ---
 
-### Phase 2 progress
+### What Phase 2 delivered
 
-> **Open.** Every exit criterion below except NIP-11 holds. NIP-11 needs a plain HTTP answer on
-> the WebSocket listener, which the transport does not offer.
+> **Complete.** Every exit criterion below holds. Serving NIP-11 on the WebSocket listener
+> replaced the transport ([ADR-0011](adr/0011-first-party-websocket-transport.md)).
 
 | Exit criterion | Verified by |
 | --- | --- |
@@ -213,7 +216,7 @@ implemented them. The suite grows with each phase. The fuzz targets
 | A superseded event is gone, not hidden | An LMDB test counting the entries of every table after replacement |
 | Ephemeral events are fanned out and never persisted | `tests/conformance/kinds.zig` |
 | `limit: 500` latency flat from 10k to 100k events | Measured 2026-11-10, below |
-| NIP-11 `supported_nips` matches nips.md | Not yet: NIP-11 is not served |
+| NIP-11 `supported_nips` matches nips.md | `src/relay/nip11.zig` reads the table at compile time and a test compares; `scripts/interop-nak.sh` reads the document with `nak relay` |
 | NIP-09, including another author's target and a re-submission | `tests/conformance/nip09.zig` |
 | A multi-filter `REQ` returns the union with each filter's `limit` | `tests/conformance/nip01.zig`, and the memory-versus-LMDB property test |
 | Sustained durable write throughput, measured | Measured 2026-11-10, below |
