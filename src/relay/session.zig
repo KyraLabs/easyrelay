@@ -5,6 +5,8 @@ const codec = @import("codec.zig");
 const hub = @import("hub.zig");
 const subscriptions = @import("subscriptions.zig");
 const validation = @import("validation.zig");
+const write_queue = @import("writer.zig");
+const kinds = @import("../storage/kind.zig");
 const store = @import("../storage/store.zig");
 
 const Event = nostr.event.Event;
@@ -41,6 +43,8 @@ pub const Shared = struct {
     io: std.Io,
     store: store.Store,
     hub: *hub.Hub,
+    /// When set, events are committed on the writer thread, which sends their `OK`.
+    writer: ?*write_queue.Writer = null,
     limits: Limits = .{},
 };
 
@@ -118,33 +122,34 @@ pub const Session = struct {
             }),
         };
 
-        const result = self.shared.store.put(&event) catch |err| switch (err) {
-            error.OutOfMemory => return self.sendOk(.{
-                .event_id = event.id,
-                .accepted = false,
-                .prefix = .internal,
-                .reason = "the relay ran out of memory storing this event",
-            }),
-            error.Backend => return self.sendOk(.{
-                .event_id = event.id,
-                .accepted = false,
-                .prefix = .internal,
-                .reason = "the store could not accept this event",
-            }),
-        };
+        if (kinds.classify(event.kind) == .ephemeral) {
+            self.shared.hub.broadcast(context.arena, &event, null);
+            return self.sendOk(.{ .event_id = event.id, .accepted = true });
+        }
 
-        return switch (result) {
-            .stored => {
-                self.shared.hub.broadcast(context.arena, &event);
-                return self.sendOk(.{ .event_id = event.id, .accepted = true });
-            },
-            .duplicate => self.sendOk(.{
+        if (self.shared.writer) |queue| {
+            const reply: write_queue.Reply = .{ .subscriber = self.subscriber, .generation = self.subscriber.generation };
+            queue.submit(&event, reply) catch |err| return self.sendOk(.{
                 .event_id = event.id,
-                .accepted = true,
-                .prefix = .duplicate,
-                .reason = "already stored",
-            }),
-        };
+                .accepted = false,
+                .prefix = switch (err) {
+                    error.QueueFull => .rate_limited,
+                    error.OutOfMemory => .internal,
+                },
+                .reason = switch (err) {
+                    error.QueueFull => "the write queue is full",
+                    error.OutOfMemory => "the relay ran out of memory queueing this event",
+                },
+            });
+            return;
+        }
+
+        var result: store.PutResult = undefined;
+        var local_id: u64 = 0;
+        self.shared.store.putBatch((&event)[0..1], (&result)[0..1], (&local_id)[0..1]) catch |err|
+            return self.sendOk(write_queue.failure(event.id, err));
+        if (result == .stored) self.shared.hub.broadcast(context.arena, &event, local_id);
+        return self.sendOk(write_queue.ok(event.id, result));
     }
 
     fn subscribe(self: *Session, context: Context, req: codec.ClientMessage.Req) Error!void {
@@ -180,7 +185,10 @@ pub const Session = struct {
             );
         };
 
-        self.shared.store.query(bounded, sink.sink()) catch |err| switch (err) {
+        var watermark: u64 = 0;
+        var store_sink = sink.sink();
+        store_sink.watermark = &watermark;
+        self.shared.store.query(bounded, store_sink) catch |err| switch (err) {
             error.Abort => return sink.failure orelse error.WriteFailed,
             error.OutOfMemory, error.Backend => {
                 _ = self.subscriber.registry.close(req.subscription_id);
@@ -192,6 +200,7 @@ pub const Session = struct {
             },
         };
 
+        self.subscriber.registry.setWatermark(req.subscription_id, watermark);
         try self.sendEose(req.subscription_id);
     }
 
@@ -671,7 +680,7 @@ const FailingStore = struct {
     put_error: ?store.Error = null,
     query_error: ?store.Error = null,
 
-    const vtable: store.Store.VTable = .{ .put = put, .query = query };
+    const vtable: store.Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query };
 
     fn interface(self: *FailingStore) store.Store {
         return .{ .ptr = self, .vtable = &vtable };
@@ -682,6 +691,11 @@ const FailingStore = struct {
         _ = event;
         if (self.put_error) |failure| return failure;
         return .stored;
+    }
+
+    fn putBatch(ptr: *anyopaque, events: []const Event, results: []store.PutResult, local_ids: ?[]u64) store.Error!void {
+        _ = local_ids;
+        for (events, results) |*event, *result| result.* = try put(ptr, event);
     }
 
     fn query(ptr: *anyopaque, filters: []const nostr.filter.Filter, sink: store.Sink) store.QueryError!void {
@@ -721,4 +735,45 @@ test "a subscription the store cannot answer is closed, not left open" {
         try testing.expect(std.mem.startsWith(u8, answer, "[\"CLOSED\",\"sub-1\",\"error:"));
         try testing.expectEqual(@as(usize, 0), harness.subscriber.registry.count());
     }
+}
+
+test "an event the write queue cannot take is refused with rate-limited" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+
+    var queue = try write_queue.Writer.init(testing.allocator, harness.shared.io, harness.shared.store, &harness.connections, 1);
+    defer {
+        queue.start() catch {};
+        queue.stop();
+        queue.deinit();
+    }
+    harness.shared.writer = &queue;
+
+    try harness.handle(try harness.eventMessage(try harness.signedEvent("queued")));
+    try testing.expectEqual(@as(usize, 0), harness.recorder.messages.items.len);
+
+    try harness.handle(try harness.eventMessage(try harness.signedEvent("refused")));
+    try testing.expect(std.mem.indexOf(u8, harness.recorder.only(), ",false,\"rate-limited: the write queue is full\"]") != null);
+}
+
+test "an event the stored phase already sent is not delivered live as well" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"before\",{}]");
+    const event = try harness.signedEvent("raced");
+    var result: store.PutResult = undefined;
+    var local_id: u64 = 0;
+    try harness.shared.store.putBatch((&event)[0..1], (&result)[0..1], (&local_id)[0..1]);
+    try testing.expectEqual(store.PutResult.stored, result);
+
+    harness.recorder.clear();
+    try harness.handle("[\"REQ\",\"after\",{}]");
+    try testing.expectEqual(@as(usize, 2), harness.recorder.messages.items.len);
+
+    harness.shared.hub.broadcast(harness.arena(), &event, local_id);
+    try testing.expectEqual(@as(usize, 1), harness.delivered.items.len);
+    try testing.expect(std.mem.startsWith(u8, harness.delivered.items[0], "[\"EVENT\",\"before\","));
 }

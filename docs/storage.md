@@ -6,11 +6,14 @@ LMDB, embedded. No external database process, no SQL engine, no query planner be
 NIP-01 filter language needs. The reasoning is in [ADR-0003](adr/0003-storage-engine-lmdb.md);
 the concurrency consequences are in [architecture.md](architecture.md#concurrency-model).
 
-The backend is `zig-nostr/nostr`'s zero-copy store, reached through easyrelay's own `Store`
-interface ([ADR-0008](adr/0008-store-abstraction-boundary.md)). This document describes the
-data model that backend must satisfy. It is written independently of that dependency so that it
-also serves as the specification for a replacement, should Phase 0's validation spike return a
-no-go.
+The backend is easyrelay's own, in `src/storage/lmdb.zig`, built on
+[`zig-lmdb`](https://github.com/nDimensional/zig-lmdb) and reached through the `Store` interface
+([ADR-0008](adr/0008-store-abstraction-boundary.md)). It was `zig-nostr/nostr`'s store until
+Phase 2 read that store against this document; [ADR-0010](adr/0010-first-party-lmdb-store.md)
+records what the comparison found and why the store is now first-party.
+
+This document is therefore a specification that is implemented, not a model a third-party backend
+is expected to approximate. Where the code and this file disagree, one of them is a bug.
 
 ## Data model
 
@@ -25,24 +28,76 @@ events:  local_id (u64 BE)  ->  serialized event bytes
 Local ids are dense and increase with insertion order, which makes them a natural tie-break and
 keeps index entries small. They are internal and never leave the process.
 
+They start at 1, leaving zero to mean "before every event" — which is what a subscription's
+watermark holds until its stored phase has read anything. The next id to hand out lives in a
+`meta` database beside the indexes rather than being re-derived at startup from the newest
+surviving key, because deleting the newest event must not put its id back into circulation.
+
+The counter is read and advanced inside each write transaction, never cached in the process, so
+it commits or rolls back with the events it numbered. An id allocated by a transaction that then
+aborts is therefore handed out again by the next one. That is safe because nothing outside the
+transaction ever saw it: a watermark is read from a committed snapshot, and an event is
+broadcast only after its batch commits. What must never happen is a committed id being reissued,
+which would let a live event arrive at or below a watermark that had already passed it, and the
+subscription would drop the event it was waiting for.
+
+### The event record
+
+The value in `events` is a fixed header, then the tags, then the content. Little-endian
+throughout: these bytes are a value and never a key, so nothing sorts on them.
+
+| offset | size | field |
+| --- | --- | --- |
+| 0 | 32 | `id` |
+| 32 | 32 | `pubkey` |
+| 64 | 64 | `sig` |
+| 128 | 8 | `created_at`, signed |
+| 136 | 2 | `kind` |
+| 138 | 2 | tag count |
+| 140 | 4 | `content` length |
+
+The header is 144 bytes. After it comes one block per tag — a 2-byte field count, then each
+field as a 4-byte length followed by its bytes — and then the content.
+
+The scalars sit at constant offsets so that reading one costs no parsing, and `content` and
+every tag field come back as slices into the memory map. A decode allocates only the slice
+structure describing the tags, which `limits.max_event_tags` bounds and which belongs to the
+per-request arena. The event bytes are never copied on the read path.
+
 ### Indexes
 
-Every index key ends with `created_at` descending and then `local_id`, so that a cursor
-positioned at `until` and walked backwards yields exactly the newest-first order that
-[protocol.md](protocol.md#filters) requires, and can stop the moment `limit` is reached.
+Every index key ends with `created_at` in a **descending encoding** and then the `event_id`, and
+every index value is the `local_id`. A cursor walked *forwards* from `until` then yields exactly
+the order [protocol.md](protocol.md#filters) requires — newest `created_at` first, ties broken by
+ascending id — and can stop the moment `limit` is reached.
+
+The descending encoding flips `created_at`'s sign bit, so the two's-complement range sorts, and
+inverts the result. The inversion is what puts the tie-break the right way round. An ascending
+time key walked backwards gives descending time, but it gives *descending* ids inside a tie,
+which is the opposite of what protocol.md asks for; and sorting each tie group afterwards is not
+available, because nothing bounds how many events may share one `created_at`.
 
 | Index | Key | Serves |
 | --- | --- | --- |
 | `by_id` | `event_id` (32 B) | `ids` filters, duplicate detection |
-| `by_created_at` | `created_at`, `local_id` | filters with only `since`/`until` |
-| `by_author` | `pubkey`, `created_at`, `local_id` | `authors` |
-| `by_kind` | `kind`, `created_at`, `local_id` | `kinds` |
-| `by_author_kind` | `pubkey`, `kind`, `created_at`, `local_id` | `authors` + `kinds` |
-| `by_tag` | `tag_name` (1 B), `tag_value`, `created_at`, `local_id` | `#<letter>` |
-| `by_address` | `pubkey`, `kind`, `d_value` | addressable replacement |
+| `by_created_at` | `created_at`, `event_id` | filters with only `since`/`until` |
+| `by_author` | `pubkey`, `created_at`, `event_id` | `authors` |
+| `by_kind` | `kind`, `created_at`, `event_id` | `kinds` |
+| `by_author_kind` | `pubkey`, `kind`, `created_at`, `event_id` | `authors` + `kinds` |
+| `by_tag` | `tag_name` (1 B), `sha256(tag_value)`, `created_at`, `event_id` | `#<letter>` |
+| `by_address` | `pubkey`, `kind`, `sha256(d_value)` | addressable replacement |
 | `by_replaceable` | `pubkey`, `kind` | replaceable replacement |
-| `by_expiration` | `expires_at`, `local_id` | NIP-40 reaper |
+| `by_expiration` | `expires_at`, `event_id` | NIP-40 reaper |
 | `deleted` | `event_id` (32 B) | NIP-09 tombstones |
+| `deleted_address` | `pubkey`, `kind`, [`sha256(d_value)`] → `created_at` | NIP-09 address tombstones |
+
+The `event_id` in the key costs 32 bytes an entry where the `local_id` would have cost 8. That
+is the price of the tie-break being a property of the key order rather than of a sort, and it is
+worth paying: it is what keeps a query streaming.
+
+`by_address` and `by_tag` hash the value because LMDB caps a key at 511 bytes and a tag value
+is bounded only by the event size. A collision would need a SHA-256 preimage. Only tags with a
+single-letter name and a value are indexed, once per distinct value.
 
 `by_author_kind` is a deliberate denormalisation: the `authors` + `kinds` combination is the
 single most common shape in real client traffic, and serving it from one cursor rather than
@@ -51,8 +106,14 @@ intersecting two is the difference between a scan and a seek.
 ### Query planning
 
 For each filter the planner picks one index — the most selective one whose key prefix the filter
-constrains — then walks it backwards from `until` (or from the end), applying the remaining
-filter conditions to each candidate as a post-filter, and stops at `limit`.
+constrains — and opens one cursor per prefix it names: one per author and kind pair, one per
+value of the tag with the fewest values, and so on. Each cursor walks forwards from `until` and
+stops at `since`. An index that would need more than 64 prefixes for one filter is skipped for
+the next one in the order below.
+
+The cursors of every filter in the `REQ` are merged on the shared key suffix, so an event found
+through several of them is read and post-filtered once. Each filter counts its own matches and
+drops out at its `limit`; the query ends when every filter has, or when the cursors run dry.
 
 Selectivity order, most selective first: `ids` → `by_author_kind` → `by_tag` → `by_author` →
 `by_kind` → `by_created_at`.
@@ -66,8 +127,8 @@ Two properties matter more than raw speed:
 
 The cost of this design is that a filter with a very low `limit` but a very selective post-filter
 can walk many index entries before finding enough matches. A scan budget caps that: after
-`max_scan` entries the subscription is answered with what was found and `EOSE`, and the event is
-counted in metrics.
+`max_scan` entries the subscription is answered with what was found and `EOSE`. Counting those
+early endings is a Phase 3 metric.
 
 ## Kind semantics
 
@@ -93,7 +154,9 @@ A kind-5 event lists `e` and `a` tags identifying what its author wants removed.
    different author are ignored silently — a deletion request is not authorisation.
 2. Removes the target event and its index entries.
 3. Records the target id in `deleted`, so a later re-submission of the same event is rejected
-   with `blocked:` rather than silently reinstated.
+   with `blocked:` rather than silently reinstated. An `a` target records its coordinate in
+   `deleted_address` with the request's `created_at`, keyed like `by_replaceable` or
+   `by_address`, and refuses any event at that coordinate up to that time.
 4. Stores the kind-5 event itself as a regular event, so that other relays syncing from this one
    learn about the deletion.
 
@@ -138,10 +201,18 @@ requirements for the storage engine, not query-performance tuning.
 modes exist and may be exposed as configuration, but they are never the default and never the
 basis of a published benchmark. See [testing.md](testing.md#benchmarks).
 
-**The store is a single file, not a directory.** The environment is opened with
-`MDB_NOSUBDIR`, so the store is one `.mdb` file plus its lock file. easyrelay still takes a
-data *directory* in configuration and places the file inside it, which keeps room for the
-search index and any future sibling data.
+**The store is a subdirectory of the data directory.** The environment lives at
+`<storage.path>/events`, holding LMDB's `data.mdb` and its lock file, and `easyrelay.lock`. The
+relay holds an exclusive lock on `easyrelay.lock` while the store is open, and a second relay on
+the same directory refuses to start: the two would share the events but not their subscriptions,
+and each would miss live events the other accepted. The data directory itself
+stays free for the search index and any future sibling data, which is the property this rule
+exists to protect.
+
+It was specified as a single `.mdb` file opened with `MDB_NOSUBDIR`. `zig-lmdb` exposes no flag
+for that ([ADR-0010](adr/0010-first-party-lmdb-store.md)), and the difference is one directory
+level rather than anything an operator or a backup depends on, so the specification follows the
+code here. Adding the flag upstream is two lines if a reason to prefer the flat layout appears.
 
 **Backup.** The store can be copied while the relay runs, using LMDB's consistent snapshot,
 without stopping writes. Procedure in [operations.md](operations.md).

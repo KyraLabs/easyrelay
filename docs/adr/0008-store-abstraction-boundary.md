@@ -122,6 +122,35 @@ through a first-party interface — is untouched. What changed is a supporting r
 overreached past the risk it was written to contain, which is the correction of a factual error
 the [records README](README.md) allows.
 
+## Amendment (2026-09-07): the backend behind the boundary changed
+
+Phase 2's reading of `zig-nostr/nostr` v0.12.0 led to
+[ADR-0010](0010-first-party-lmdb-store.md): easyrelay implements its own LMDB store. This record
+is untouched in substance — its Consequences anticipated the move precisely, down to naming
+`zig-lmdb` — but the file behind the boundary is now `src/storage/lmdb.zig` and it is ours, which
+changes what several statements above mean.
+
+**Rule 1 has become trivial to keep.** It forbids the dependency's store types above the
+boundary. There are none left anywhere: the dependency is the protocol layer only. The rule
+stands as written, and the discipline cost the Consequences warned about goes with it.
+
+**The batch entry point existed; what was missing was a semantics-aware one.** The outcome above
+calls that shape one "the dependency does not currently offer". `putEventBatch` did offer it, in
+a single transaction, documenting itself as applying neither replaceable nor deletion semantics,
+while `ingest` applied them one transaction per event through helpers accepting no external
+transaction. The gap was the absence of both at once, which is what
+[ADR-0002](0002-build-on-zig-nostr.md) recorded accurately.
+
+**Zero-copy reads move from assumed to owed.** This record requires the interface to stream
+through a sink "so that zero-copy reads stay zero-copy". The dependency's `query` returned an
+arena-owned copy of the matched events — bounded by `limit`, so the bounded-scan property held,
+but not zero-copy. Behind a first-party store it becomes a property we implement, and this record
+is what holds us to it.
+
+**The memory backend now carries more weight than when this was written.** It was retained as the
+differential oracle for the property tests. With both implementations first-party, that test is
+the main thing standing between a hand-written index and a confidently wrong answer.
+
 ## Amendment (2026-11-10): `limit` is per filter
 
 The outcome above, [protocol.md](../protocol.md) and the Phase 1 code applied the largest

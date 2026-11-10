@@ -13,13 +13,22 @@ versions may contain breaking changes; they will always be listed under `Changed
 
 - A working relay: `easyrelay` with no arguments and no configuration file serves NIP-01 over
   WebSocket on `ws://127.0.0.1:7777`. It accepts and validates events, answers subscriptions
-  from stored events, and fans accepted events out live to every matching subscription. Events
-  are held in memory; persistence arrives with the LMDB backend.
+  from stored events, and fans accepted events out live to every matching subscription.
+- Persistence: events are stored in LMDB under `./data` and survive a restart. Writes go through
+  a single writer thread that commits them in batches; a full queue is answered with
+  `rate-limited:`.
+- Kind semantics: replaceable, addressable and ephemeral events, with the NIP-01 tie-break.
+- NIP-09 deletion, author-scoped, with tombstones that refuse a deleted event sent again.
+- Indexed queries: each filter is planned onto the most selective index, bounded by its own
+  `limit` and by `storage.max_scan`.
+- Configuration: an optional `easyrelay.zon` file, `EASYRELAY_*` environment overrides,
+  validation that names the offending setting, and `easyrelay init` to print every default.
 - Project scaffold: `build.zig`, pinned Zig toolchain, and a command-line entry point that
   reports its version and refuses unknown arguments.
-- The two runtime dependencies, pinned and compiled from source: `zig-nostr/nostr` for the
-  event model, canonical serialization and Schnorr verification, and `websocket.zig` for the
-  transport.
+- The runtime dependencies, pinned and compiled from source: `zig-nostr/nostr` for the event
+  model, canonical serialization and Schnorr verification, and `zig-lmdb` for LMDB.
+- A first-party RFC 6455 WebSocket transport, which also answers plain HTTP on the same port.
+- NIP-11: the relay information document, served on `Accept: application/nostr+json`.
 - A conformance suite that drives the relay over a real WebSocket connection, and an interop
   check in CI that publishes an event with [`nak`](https://github.com/fiatjaf/nak) and reads it
   back.

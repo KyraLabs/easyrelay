@@ -133,6 +133,9 @@ implemented them. The suite grows with each phase. The fuzz targets
 
 ## Phase 2 — Persistence and indexes
 
+> **Complete.** Every exit criterion below was verified, and what it verified with is recorded
+> in [what Phase 2 delivered](#what-phase-2-delivered).
+
 ### Deliverables
 
 - The `lmdb` backend behind the `Store` interface, with the data model in
@@ -145,22 +148,26 @@ implemented them. The suite grows with each phase. The fuzz targets
   [nips.md](nips.md), served on `Accept: application/nostr+json`.
 - Configuration file loading, which closes [ADR-0007](adr/0007-configuration-format.md).
 - **Batched writes from the first commit, not as a later optimisation.** The writer thread
-  drains its queue into one transaction per batch. Phase 0 measured 92 events/s for one durable
-  transaction per event against 169,491 events/s batched; building on the per-event path and
-  optimising later would mean building on something that cannot carry traffic. If the upstream
-  dependency has not gained a protocol-aware batch ingest by then, easyrelay vendors the patch —
-  see the [spike's conditions](research/2026-08-phase-0-validation.md#verdict-and-conditions).
-- **Multi-filter `REQ` handling.** The storage dependency queries one filter at a time; a `REQ`
-  carries several, OR-ed. Each filter is bounded by its own `limit`, and the results are merged
-  newest first and deduplicated by id. The in-memory backend already does this and the
-  conformance suite checks it; the `lmdb` backend has to match.
-- **NIP-09 deletion**, which the storage dependency already implements and Phase 0 verified.
-  It arrives here with persistence rather than in Phase 3.
+  drains its queue into one transaction per batch, applying kind semantics inside that same
+  transaction. Phase 0 measured 92 events/s for one durable transaction per event against 169,491
+  events/s batched; building on the per-event path and optimising later would mean building on
+  something that cannot carry traffic. Being unable to have batching and kind semantics at once
+  is one of the findings behind [ADR-0010](adr/0010-first-party-lmdb-store.md).
+- **Multi-filter `REQ` handling.** A `REQ` carries several filters, OR-ed. Each filter is bounded
+  by its own `limit`, and the results are merged newest first and deduplicated by id. The
+  in-memory backend already does this and the conformance suite checks it; the `lmdb` backend
+  has to match.
+- **NIP-09 deletion.** Written here rather than inherited: the dependency implemented it and
+  Phase 0 verified it, but [ADR-0010](adr/0010-first-party-lmdb-store.md) moved the store
+  in-house, so the tombstone table, the author check and the refusal of a re-submitted deleted
+  event are all ours. Conformance tests come from the NIP text before the code.
 - **A watermark that closes Phase 1's duplicate window.** An event stored while a subscription's
   stored phase runs can be delivered twice. The store's monotonic local id is the watermark that
   fixes it: a subscription records the newest id its stored phase saw, and live delivery skips
-  anything at or below it. This is why the gap was left open rather than worked around in
-  memory.
+  anything at or below it. This is why the gap was left open rather than worked around in memory.
+  Assigning that local id is easyrelay's own job as of
+  [ADR-0010](adr/0010-first-party-lmdb-store.md); the store it was originally specified against
+  had no such counter.
 - **A complete default set.** Every setting in [configuration.md](configuration.md) has a
   default correct for a real deployment, not merely one that avoids a crash. Defaults are a
   correctness surface from this point on and are reviewed as such.
@@ -197,6 +204,33 @@ implemented them. The suite grows with each phase. The fuzz targets
 
 ---
 
+### What Phase 2 delivered
+
+> **Complete.** Every exit criterion below holds. Serving NIP-11 on the WebSocket listener
+> replaced the transport ([ADR-0011](adr/0011-first-party-websocket-transport.md)).
+
+| Exit criterion | Verified by |
+| --- | --- |
+| Events published before a restart are queryable after it | `scripts/interop-nak.sh` restarts the built binary between publishing and reading; LMDB restart tests |
+| Replaceable and addressable semantics, both tie-break paths, the three empty `d` forms | `tests/conformance/kinds.zig`; LMDB unit tests |
+| A superseded event is gone, not hidden | An LMDB test counting the entries of every table after replacement |
+| Ephemeral events are fanned out and never persisted | `tests/conformance/kinds.zig` |
+| `limit: 500` latency flat from 10k to 100k events | Measured 2026-11-10, below |
+| NIP-11 `supported_nips` matches nips.md | `src/relay/nip11.zig` reads the table at compile time and a test compares; `scripts/interop-nak.sh` reads the document with `nak relay` |
+| NIP-09, including another author's target and a re-submission | `tests/conformance/nip09.zig` |
+| A multi-filter `REQ` returns the union with each filter's `limit` | `tests/conformance/nip01.zig`, and the memory-versus-LMDB property test |
+| Sustained durable write throughput, measured | Measured 2026-11-10, below |
+| The relay starts and persists with no configuration file | `scripts/interop-nak.sh`, run from an empty directory |
+| `easyrelay init` fed back in equals no file | `src/config.zig`, and a test that the defaults equal each component's |
+| Every configuration error names its key | `src/config.zig` |
+
+Measurements: Intel i5-10400F, btrfs on a SATA SSD, LMDB durable (sync on commit), ReleaseSafe.
+
+- **Writes**, four producers into the writer thread: one transaction per event sustained 42 to
+  137 events/s; batched through the writer, 21,388 to 41,635 events/s over 50,000 events.
+- **Reads**, median of 41 `limit: 500` queries: `{}` 135 µs at 10k events and 145 µs at 100k;
+  `kinds` 150 and 160 µs. Author-scoped shapes cost the same per event at both sizes.
+
 ## Phase 3 — Operational hardening
 
 The phase that makes the relay safe to expose to the open internet.
@@ -204,8 +238,10 @@ The phase that makes the relay safe to expose to the open internet.
 ### Deliverables
 
 - Rate limiting per connection and per pubkey, with the write queue as the final backstop.
-- An I/O pool bounded below LMDB's 126-reader ceiling, which the storage dependency does not
-  expose a way to raise. Exceeding it fails roughly a third of reads — measured in
+- An I/O pool bounded below LMDB's 126-reader ceiling. Raising it is now easyrelay's own call
+  through `max_readers` ([ADR-0010](adr/0010-first-party-lmdb-store.md)); the pool is still
+  bounded, because a ceiling that is merely higher is still a ceiling. Exceeding it fails roughly
+  a third of reads — measured in
   [Phase 0](research/2026-08-phase-0-validation.md#q1--concurrent-readers-with-a-single-writer-yes-with-a-hard-ceiling).
 - One `Signer` per I/O thread. The dependency's signer is not thread-safe for concurrent use of
   a single instance.

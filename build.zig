@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
     ) orelse &.{};
 
     const nostr = b.dependency("nostr", .{ .target = target, .optimize = optimize });
-    const websocket = b.dependency("websocket", .{ .target = target, .optimize = optimize });
+    const lmdb = lmdbModule(b, target, optimize);
 
     const mod = b.addModule("easyrelay", .{
         .root_source_file = b.path("src/root.zig"),
@@ -19,9 +19,12 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "nostr", .module = nostr.module("nostr") },
-            .{ .name = "websocket", .module = websocket.module("websocket") },
+            .{ .name = "lmdb", .module = lmdb.wrapper },
+            .{ .name = "lmdb_c", .module = lmdb.header },
         },
     });
+
+    mod.addAnonymousImport("nips.md", .{ .root_source_file = b.path("docs/nips.md") });
 
     const exe = b.addExecutable(.{
         .name = "easyrelay",
@@ -67,7 +70,6 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "easyrelay", .module = mod },
                 .{ .name = "nostr", .module = nostr.module("nostr") },
-                .{ .name = "websocket", .module = websocket.module("websocket") },
             },
         }),
         .filters = test_filters,
@@ -85,4 +87,25 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&exe_tests.step);
     check_step.dependOn(&vector_tests.step);
     check_step.dependOn(&conformance_tests.step);
+}
+
+/// zig-lmdb's wrapper without its own liblmdb: the copy zig-nostr links, built without UBSan, is the only one.
+fn lmdbModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) struct { wrapper: *std.Build.Module, header: *std.Build.Module } {
+    const wrapper = b.dependency("lmdb", .{ .target = target, .optimize = optimize });
+    const liblmdb = wrapper.builder.dependency("lmdb", .{});
+    const header = b.addTranslateC(.{
+        .root_source_file = liblmdb.path("libraries/liblmdb/lmdb.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const module = b.createModule(.{
+        .root_source_file = wrapper.path("src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const header_module = header.createModule();
+    module.addImport("c", header_module);
+    return .{ .wrapper = module, .header = header_module };
 }

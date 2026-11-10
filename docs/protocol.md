@@ -177,6 +177,21 @@ absent `d` all address the same slot.
 
 Superseded events are removed from the store, not merely hidden.
 
+## Deletion (NIP-09)
+
+A kind-5 event is stored as a regular event and acts on its `e` and `a` tags:
+
+- An `e` tag removes the named event if the same `pubkey` authored it. A target by another
+  author is ignored, and so is a target that is itself a deletion request.
+- An `a` tag (`<kind>:<pubkey>:<d>`) whose `pubkey` matches the request's removes the event at
+  that address if its `created_at` is at or before the request's.
+- An event removed this way, or any event at a deleted address with a `created_at` at or before
+  the request's, is refused afterwards with `OK` `false` and `blocked:`. A later version of an
+  address is accepted.
+
+A target that is not stored when the request arrives is not remembered: without the event the
+relay cannot tell whether the request's author wrote it.
+
 ## Structural limits
 
 Enforced before signature verification and advertised in NIP-11 `limitation`:

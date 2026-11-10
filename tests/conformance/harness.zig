@@ -1,20 +1,17 @@
 const std = @import("std");
 const easyrelay = @import("easyrelay");
 const nostr = @import("nostr");
-const ws = @import("websocket");
-
-var next_port: std.atomic.Value(u16) = .init(47_800);
 
 pub const Relay = struct {
     gpa: std.mem.Allocator,
     threaded: std.Io.Threaded,
     events: easyrelay.memory.Memory,
     connections: easyrelay.hub.Hub,
+    writer: easyrelay.writer.Writer,
     shared: easyrelay.session.Shared,
     app: easyrelay.server.App,
     server: easyrelay.server.Server,
     listener: std.Thread,
-    port: u16,
 
     pub fn start(gpa: std.mem.Allocator, limits: easyrelay.session.Limits) !*Relay {
         const self = try gpa.create(Relay);
@@ -24,8 +21,8 @@ pub const Relay = struct {
             .gpa = gpa,
             .threaded = .init(gpa, .{}),
             .events = undefined,
-            .port = next_port.fetchAdd(1, .monotonic),
             .connections = undefined,
+            .writer = undefined,
             .shared = undefined,
             .app = undefined,
             .server = undefined,
@@ -33,20 +30,26 @@ pub const Relay = struct {
         };
 
         const relay_io = self.threaded.io();
+        errdefer self.threaded.deinit();
         self.events = easyrelay.memory.Memory.init(gpa, relay_io);
+        errdefer self.events.deinit();
         self.connections = easyrelay.hub.Hub.init(gpa, relay_io);
+        errdefer self.connections.deinit();
+        self.writer = try easyrelay.writer.Writer.init(gpa, relay_io, self.events.store(), &self.connections, 64);
+        errdefer self.writer.deinit();
+        try self.writer.start();
+        errdefer self.writer.stop();
         self.shared = .{
             .io = relay_io,
             .store = self.events.store(),
             .hub = &self.connections,
+            .writer = &self.writer,
             .limits = limits,
         };
         self.app = .{ .gpa = gpa, .shared = &self.shared };
-        self.server = try easyrelay.server.init(gpa, &self.app, .{
-            .port = self.port,
-            .message_threads = 2,
-        });
-        self.listener = try self.server.listenInNewThread(&self.app);
+        self.server = try easyrelay.server.init(gpa, &self.app, .{ .port = 0 });
+        errdefer self.server.deinit();
+        self.listener = try self.server.listenInNewThread();
         return self;
     }
 
@@ -54,46 +57,35 @@ pub const Relay = struct {
         return self.threaded.io();
     }
 
-    /// Stopping before every connection closes hits a transport shutdown race.
+    pub fn port(self: *Relay) u16 {
+        return self.server.address.getPort();
+    }
+
     pub fn stop(self: *Relay) void {
-        self.drain() catch {};
         self.server.stop();
         self.listener.join();
         self.server.deinit();
+        self.writer.stop();
+        self.writer.deinit();
         self.connections.deinit();
         self.events.deinit();
         self.threaded.deinit();
         const gpa = self.gpa;
         gpa.destroy(self);
     }
-
-    fn drain(self: *Relay) !void {
-        for (0..200) |_| {
-            if (self.app.live.load(.acquire) == 0) return;
-            try self.io().sleep(.fromMilliseconds(10), .awake);
-        }
-        return error.ConnectionsDidNotClose;
-    }
 };
 
 pub const Client = struct {
     arena: std.heap.ArenaAllocator,
-    socket: ws.Client,
+    socket: *easyrelay.client.Client,
 
     pub fn connect(relay: *Relay) !Client {
-        var socket = try ws.Client.init(relay.io(), relay.gpa, .{
-            .port = relay.port,
-            .host = "127.0.0.1",
-        });
-        errdefer socket.deinit();
-        try socket.handshake("/", .{ .timeout_ms = 2000, .headers = "Host: 127.0.0.1" });
-        try socket.readTimeout(2000);
+        const socket = try easyrelay.client.Client.connect(relay.gpa, relay.io(), relay.port(), 2000);
         return .{ .arena = std.heap.ArenaAllocator.init(relay.gpa), .socket = socket };
     }
 
     pub fn close(self: *Client) void {
-        self.socket.close(.{}) catch {};
-        self.socket.deinit();
+        self.socket.close();
         self.arena.deinit();
     }
 
@@ -101,9 +93,8 @@ pub const Client = struct {
         return self.arena.allocator();
     }
 
-    /// `Client.write` masks the payload in place.
     pub fn send(self: *Client, message: []const u8) !void {
-        try self.socket.write(try self.allocator().dupe(u8, message));
+        try self.socket.send(message);
     }
 
     pub fn sendEvent(self: *Client, event: nostr.event.Event) !void {
@@ -111,23 +102,23 @@ pub const Client = struct {
     }
 
     pub fn receive(self: *Client) ![]const u8 {
-        const message = (try self.socket.read()) orelse return error.RelayDidNotAnswer;
-        defer self.socket.done(message);
-        return self.allocator().dupe(u8, message.data);
+        return self.allocator().dupe(u8, try self.socket.receive());
     }
 
     pub fn receiveJson(self: *Client) !std.json.Value {
         return std.json.parseFromSliceLeaky(std.json.Value, self.allocator(), try self.receive(), .{});
     }
 
+    /// Fails if anything arrives within `window_ms`.
     pub fn expectSilence(self: *Client, window_ms: u32) !void {
-        try self.socket.readTimeout(window_ms);
-        defer self.socket.readTimeout(2000) catch {};
-        if (try self.socket.read()) |unexpected| {
-            defer self.socket.done(unexpected);
-            std.debug.print("expected silence, received: {s}\n", .{unexpected.data});
-            return error.RelayAnsweredWhenItShouldNot;
-        }
+        try self.socket.setTimeout(window_ms);
+        defer self.socket.setTimeout(2000) catch {};
+        const unexpected = self.socket.receive() catch |err| switch (err) {
+            error.Timeout => return,
+            else => return err,
+        };
+        std.debug.print("expected silence, received: {s}\n", .{unexpected});
+        return error.UnexpectedMessage;
     }
 };
 

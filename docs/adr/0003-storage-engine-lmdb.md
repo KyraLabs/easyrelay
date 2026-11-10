@@ -58,6 +58,19 @@ goal in [overview.md](../overview.md). `mattn/zig-nostr-relay` demonstrates the 
 **A first-party storage engine.** Rejected without serious consideration. Writing a durable,
 crash-safe storage engine is a larger project than the relay.
 
+## Amendment (2026-09-07): the access clause is superseded
+
+The Decision above offers two ways to reach LMDB: through `zig-nostr/nostr`'s store, or through
+`zig-lmdb` "if Phase 0 returns a no-go and a first-party schema is needed". Phase 2 took the
+second path without the trigger the sentence names — the spike returned go, and the reasons are
+Phase 2's own findings about the dependency's data model and write path, recorded in
+[ADR-0010](0010-first-party-lmdb-store.md).
+
+The engine decision is untouched. LMDB with hand-built indexes, no SQL, and the index set in
+[storage.md](../storage.md) all stand; only who writes the code against LMDB changed. The
+Consequences above therefore apply in full, and the one warning that "every index is hand
+maintained... this is the real cost of the decision" now lands in Phase 2 rather than in Phase 4.
+
 ## Revisit when
 
 NIP-50 search proves impractical to index by hand, or a workload appears whose queries the fixed

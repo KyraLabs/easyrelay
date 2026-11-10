@@ -14,12 +14,18 @@ pub const QueryError = Error || Sink.Abort;
 pub const PutResult = enum {
     stored,
     duplicate,
+    /// A replaceable or addressable event lost the tie-break to the one already stored.
+    outdated,
+    /// Its author deleted it, or deleted its address at or after its `created_at` (NIP-09).
+    deleted,
 };
 
 /// The emitted event borrows the store's memory and is valid only until `emit` returns.
 pub const Sink = struct {
     ptr: *anyopaque,
     emitFn: *const fn (ptr: *anyopaque, event: *const Event) Abort!void,
+    /// Receives the newest local id the query's snapshot could see; a live event at or below it was already visible.
+    watermark: ?*u64 = null,
 
     pub const Abort = error{Abort};
 
@@ -34,11 +40,21 @@ pub const Store = struct {
 
     pub const VTable = struct {
         put: *const fn (ptr: *anyopaque, event: *const Event) Error!PutResult,
+        putBatch: *const fn (ptr: *anyopaque, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void,
         query: *const fn (ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void,
     };
 
+    /// Ephemeral events must not be passed; they are never stored.
     pub fn put(self: Store, event: *const Event) Error!PutResult {
         return self.vtable.put(self.ptr, event);
+    }
+
+    /// Stores `events` in one transaction; on error none of them is stored.
+    /// `local_ids`, when given, receives the local id of each stored event.
+    pub fn putBatch(self: Store, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void {
+        std.debug.assert(events.len == results.len);
+        if (local_ids) |ids| std.debug.assert(ids.len == events.len);
+        return self.vtable.putBatch(self.ptr, events, results, local_ids);
     }
 
     /// Union of each filter's `limit` newest matches, newest first; a null `limit` is unbounded.
@@ -55,7 +71,7 @@ const StubStore = struct {
     events: []const Event = &.{},
     last_filters: []const Filter = &.{},
 
-    const vtable: Store.VTable = .{ .put = put, .query = query };
+    const vtable: Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query };
 
     fn store(self: *StubStore) Store {
         return .{ .ptr = self, .vtable = &vtable };
@@ -65,6 +81,11 @@ const StubStore = struct {
         const self: *StubStore = @ptrCast(@alignCast(ptr));
         self.last_put = event;
         return self.put_result;
+    }
+
+    fn putBatch(ptr: *anyopaque, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void {
+        _ = local_ids;
+        for (events, results) |*event, *result| result.* = try put(ptr, event);
     }
 
     fn query(ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void {

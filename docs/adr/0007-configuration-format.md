@@ -1,7 +1,7 @@
 # 0007. Configuration file format
 
-- **Status:** Proposed — decided in Phase 2
-- **Date:** 2026-08-23
+- **Status:** Accepted
+- **Date:** 2026-08-23, accepted 2026-11-10
 
 ## Context
 
@@ -15,9 +15,16 @@ Phase 2 experience of what the file actually looks like once every setting is re
 
 ## Decision
 
-**Proposed:** ZON, with environment-variable overrides for containerised deployments.
+**ZON**, parsed with `std.zon`, with environment-variable overrides for containerised
+deployments.
 
-Not accepted. Phase 2 closes this record.
+Phase 2 settled it: the file needs nothing ZON lacks, and the unfamiliar syntax is answered by
+`easyrelay init`, which prints a commented file holding every default, so an operator edits a
+working file rather than writing one. A ZON parse error already names the line, column and key.
+
+An override is `EASYRELAY_<SECTION>_<KEY>`. A list is comma-separated and `null` clears an
+optional value. An override that cannot be read as its setting's type stops the relay and names
+the variable.
 
 ## Consequences
 
