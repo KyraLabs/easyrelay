@@ -36,6 +36,8 @@ pub const config = @import("config.zig");
 
 pub const nip11 = @import("relay/nip11.zig");
 
+pub const frame = @import("transport/frame.zig");
+
 test {
     _ = store;
     _ = memory;
@@ -54,6 +56,7 @@ test {
     _ = writer;
     _ = config;
     _ = nip11;
+    _ = frame;
 }
 
 test "version is a non-empty semantic version" {
