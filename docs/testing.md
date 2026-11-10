@@ -72,7 +72,9 @@ against what clients actually do.
 ### Fuzzing
 
 Zig's built-in fuzzer, driven through the test runner with `zig build test --fuzz`, over every
-parser that touches untrusted bytes:
+parser that touches untrusted bytes. On Zig 0.16.0 that command does not compile (see
+[development.md](development.md#commands)), so each target also runs as a deterministic
+randomized test in the ordinary suite:
 
 - JSON message decoding.
 - Event decoding and canonical re-serialization.

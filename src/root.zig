@@ -42,6 +42,8 @@ pub const handshake = @import("transport/handshake.zig");
 
 pub const socket = @import("transport/socket.zig");
 
+pub const listener = @import("transport/listener.zig");
+
 pub const client = @import("transport/client.zig");
 
 test {
@@ -65,6 +67,7 @@ test {
     _ = frame;
     _ = handshake;
     _ = socket;
+    _ = listener;
     _ = client;
 }
 
@@ -114,13 +117,6 @@ test "libsecp256k1 verifies a signed event and rejects a tampered id" {
     var tampered = event;
     tampered.id[0] ^= 0xff;
     try std.testing.expect(!try nostr.event.verify(std.testing.allocator, signer, tampered));
-}
-
-test "websocket.zig frames a text message" {
-    const websocket = @import("websocket");
-
-    const framed = websocket.frameText("hi");
-    try std.testing.expectEqualSlices(u8, &.{ 0x81, 2, 'h', 'i' }, &framed);
 }
 
 test "liblmdb commits durably and reads back after reopening" {

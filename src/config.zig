@@ -61,7 +61,7 @@ const descriptions = .{
         .address = "Bind address. Loopback by default: put a TLS reverse proxy in front before exposing it.",
         .port = "Bind port.",
         .max_connections = "Connections accepted before new ones are refused.",
-        .handshake_timeout_ms = "Time allowed to complete the WebSocket handshake.",
+        .handshake_timeout_ms = "Time allowed to complete the WebSocket handshake, from accept to the end of the request.",
     },
     .storage = .{
         .path = "Data directory. The LMDB environment lives in its `events` subdirectory.",

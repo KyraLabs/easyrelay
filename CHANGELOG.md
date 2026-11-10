@@ -25,9 +25,9 @@ versions may contain breaking changes; they will always be listed under `Changed
   validation that names the offending setting, and `easyrelay init` to print every default.
 - Project scaffold: `build.zig`, pinned Zig toolchain, and a command-line entry point that
   reports its version and refuses unknown arguments.
-- The two runtime dependencies, pinned and compiled from source: `zig-nostr/nostr` for the
-  event model, canonical serialization and Schnorr verification, and `websocket.zig` for the
-  transport.
+- The runtime dependencies, pinned and compiled from source: `zig-nostr/nostr` for the event
+  model, canonical serialization and Schnorr verification, and `zig-lmdb` for LMDB.
+- A first-party RFC 6455 WebSocket transport, which also answers plain HTTP on the same port.
 - A conformance suite that drives the relay over a real WebSocket connection, and an interop
   check in CI that publishes an event with [`nak`](https://github.com/fiatjaf/nak) and reads it
   back.

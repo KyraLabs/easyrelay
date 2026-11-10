@@ -60,8 +60,7 @@ zig fmt --check --exclude zig-pkg .   # formatting gate, identical to CI
 
 The interop script needs [`nak`](https://github.com/fiatjaf/nak) on `PATH` and a relay binary in
 `zig-out/bin/`. It starts the relay on its default port, so nothing else may be listening on
-7777 while it runs — the transport sets `SO_REUSEPORT`, so the script checks rather than
-discovering it as a confusing failure.
+7777 while it runs; the script checks before starting rather than reporting a failed start.
 
 Run a subset of tests while iterating:
 
@@ -69,12 +68,15 @@ Run a subset of tests while iterating:
 zig build test -Dtest-filter="replaceable"
 ```
 
-Fuzz a target once the fuzz tests exist (Phase 1 onward). Zig's fuzzer is driven through the
-test runner rather than a separate step:
+Zig's fuzzer is driven through the test runner rather than a separate step:
 
 ```bash
 zig build test --fuzz
 ```
+
+On Zig 0.16.0 this fails to compile inside the standard library's own test runner
+(`writeStackTrace` is passed a `builtin.StackTrace`). Until the pinned toolchain fixes it, each
+fuzz target also has a deterministic randomized test that runs with `zig build test`.
 
 Added by later phases: `zig build bench` (the harness in `bench/`, Phase 6).
 
@@ -86,14 +88,10 @@ release tag where upstream publishes one. No branch references, no `main`.
 | Dependency | Purpose | Record |
 | --- | --- | --- |
 | [`zig-nostr/nostr`](https://github.com/zig-nostr/nostr) | Event model, canonical serialization, Schnorr, filters | [ADR-0002](adr/0002-build-on-zig-nostr.md) |
-| [`websocket.zig`](https://github.com/karlseguin/websocket.zig) | WebSocket server | [ADR-0004](adr/0004-websocket-transport.md) |
 | [`zig-lmdb`](https://github.com/nDimensional/zig-lmdb) | LMDB, under easyrelay's own store schema | [ADR-0010](adr/0010-first-party-lmdb-store.md) |
 
-`websocket.zig` is pinned to a **commit** rather than a tag: its Zig 0.16 support lives on
-`master`, and its only release tag predates it. The pin is immutable and hashed, which is what
-the rule is there for, but an upgrade is a deliberate choice of a newer commit rather than a
-version bump, and there are no release notes to read before taking it.
-[ADR-0004](adr/0004-websocket-transport.md) already tracks when to revisit that.
+The WebSocket transport is first-party ([ADR-0011](adr/0011-first-party-websocket-transport.md)),
+so it has no row here.
 
 Adding a dependency requires an ADR. The cost of a dependency in a pre-1.0 language ecosystem is
 paid on every compiler upgrade, and that cost belongs in a written decision.
@@ -102,7 +100,6 @@ Upgrading one:
 
 ```bash
 zig fetch --save=nostr https://github.com/zig-nostr/nostr/archive/refs/tags/vX.Y.Z.tar.gz
-zig fetch --save=websocket https://github.com/karlseguin/websocket.zig/archive/<commit>.tar.gz
 zig build test
 ```
 

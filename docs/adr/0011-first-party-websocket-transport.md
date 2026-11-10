@@ -34,9 +34,9 @@ The specifics:
 
 - **One thread per connection**, blocking reads, bounded by `network.max_connections`. ADR-0005
   already accepts this ceiling until Phase 6.
-- **Every resource bounded**: the handshake request size, the handshake time (a receive
-  timeout on the socket), the frame payload and the assembled message size
-  (`limits.max_message_size`).
+- **Every resource bounded**: the handshake request size, the handshake time (an absolute
+  deadline, which a client sending one byte at a time cannot extend), the frame payload and the
+  assembled message size (`limits.max_message_size`).
 - **Only what a relay needs**: text and binary messages, fragmentation, ping, pong and close.
   No extensions; `permessage-deflate` is not negotiated.
 - **A request that is not an upgrade** is offered to the application before it is refused, which
@@ -55,9 +55,10 @@ data, close handshakes, UTF-8 validation of text frames. ADR-0004 named this as 
 take a library. It is now the work Phase 3's adversarial transport testing exercises against our
 code instead of a dependency's.
 
-The listener sets `SO_REUSEADDR` so a restart is not refused by connections in TIME_WAIT, and
-`std.Io.net` sets `SO_REUSEPORT` with it; a second relay started on the same port is therefore
-not refused either, and shares the traffic.
+The listener sets `SO_REUSEADDR` so a restart is not refused by connections in TIME_WAIT. It
+opens its own socket rather than using `std.Io.net`'s `listen`, which sets `SO_REUSEPORT` along
+with `SO_REUSEADDR` and would let a second relay bind the same port and take a share of the
+connections into a hub of its own. A second relay on the same port is refused instead.
 
 One thread per connection costs a stack per connection. It is the ceiling ADR-0005 already
 records, and the reason Phase 6 exists.

@@ -44,7 +44,7 @@ ignored line.
 | `address` | string | `127.0.0.1` | Bind address. Default is loopback because easyrelay expects a reverse proxy in front of it. |
 | `port` | u16 | `7777` | Bind port. |
 | `max_connections` | usize | `1024` | Connections accepted before new ones are refused. |
-| `handshake_timeout_ms` | u32 | `5000` | Time allowed to complete the WebSocket handshake. |
+| `handshake_timeout_ms` | u32 | `5000` | Time allowed to complete the WebSocket handshake, from accept to the end of the request. |
 | `ping_interval_s` | u32 | `30` | Interval between pings on idle connections. `0` disables. Phase 3. |
 | `idle_timeout_s` | u32 | `300` | Close a connection after this long with no traffic. `0` disables. Phase 3. |
 | `write_buffer_limit` | usize | `1048576` | Per-connection pending write bytes before the connection is dropped. Backpressure, not buffering. Phase 3. |

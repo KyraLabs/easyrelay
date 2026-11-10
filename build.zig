@@ -11,7 +11,6 @@ pub fn build(b: *std.Build) void {
     ) orelse &.{};
 
     const nostr = b.dependency("nostr", .{ .target = target, .optimize = optimize });
-    const websocket = b.dependency("websocket", .{ .target = target, .optimize = optimize });
     const lmdb = lmdbModule(b, target, optimize);
 
     const mod = b.addModule("easyrelay", .{
@@ -20,7 +19,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "nostr", .module = nostr.module("nostr") },
-            .{ .name = "websocket", .module = websocket.module("websocket") },
             .{ .name = "lmdb", .module = lmdb.wrapper },
             .{ .name = "lmdb_c", .module = lmdb.header },
         },
@@ -72,7 +70,6 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "easyrelay", .module = mod },
                 .{ .name = "nostr", .module = nostr.module("nostr") },
-                .{ .name = "websocket", .module = websocket.module("websocket") },
             },
         }),
         .filters = test_filters,

@@ -10,8 +10,8 @@ the layer below it and never the layer above.
 
 ```mermaid
 flowchart TB
-    subgraph T["Transport — src/server/"]
-        WS["websocket.zig server<br/>connection lifecycle, frames, ping/pong"]
+    subgraph T["Transport — src/transport/ + src/server/"]
+        WS["RFC 6455 server<br/>handshake, frames, ping/pong, close"]
         HTTP["HTTP endpoints<br/>NIP-11 document, /metrics, /health"]
     end
     subgraph P["Protocol — src/relay/"]
@@ -35,15 +35,15 @@ flowchart TB
 
 ### Transport
 
-Owns sockets and nothing else. Built on
-[`websocket.zig`](https://github.com/karlseguin/websocket.zig), whose Zig 0.16 support is
-upstream-flagged as experimental — see [ADR-0004](adr/0004-websocket-transport.md).
+Owns sockets and nothing else. A first-party RFC 6455 implementation over `std.Io.net` — see
+[ADR-0011](adr/0011-first-party-websocket-transport.md), which replaced `websocket.zig`.
 
-One connection maps to one handler instance. `websocket.zig` guarantees that a single
-connection's messages are processed one at a time, which removes the need for per-connection
-locking in the layers above. This layer enforces the frame-level limits (maximum message size,
-maximum in-flight write buffer), answers ping with pong, and closes connections that exceed
-their write backlog rather than buffering without bound.
+One connection maps to one thread, which reads its frames and handles its messages one at a
+time, so the layers above need no per-connection locking for what a connection receives. Writes
+to a connection come from its own thread and from the hub's fan-out, and are serialised by a
+per-connection lock. This layer bounds the handshake request and its duration, the frame payload
+and the assembled message size, answers ping with pong, and refuses a protocol violation with a
+close frame naming it. Closing a connection whose write backlog grows without bound is Phase 3.
 
 The same listener serves the plain HTTP surface: the NIP-11 relay information document when the
 request carries `Accept: application/nostr+json`, `GET /metrics`, and `GET /health`.
@@ -135,7 +135,7 @@ to be removed later — it is what the storage engine asks for. strfry makes the
 
 ```mermaid
 flowchart LR
-    C1["connection"] --> IO["I/O thread pool<br/>(websocket.zig)"]
+    C1["connection"] --> IO["one thread per connection<br/>(src/server/)"]
     C2["connection"] --> IO
     C3["connection"] --> IO
     IO -->|"REQ / COUNT"| RO["read-only txn<br/>(concurrent)"]
@@ -183,7 +183,8 @@ build.zig.zon
 src/
   main.zig            entry point, startup, signal handling
   config.zig          configuration loading and validation
-  server/             transport: websocket handlers, HTTP endpoints
+  transport/          RFC 6455 frames and handshake, socket reads, a test client
+  server/             listener and connections: WebSocket sessions, plain HTTP answers
   relay/              protocol codec, validation, session, subscription registry
   policy/             rate limiting, PoW, auth, allow/deny lists
   storage/
@@ -207,7 +208,8 @@ Every architectural claim above traces to a record:
 | Zig 0.16.0, pinned toolchain | [ADR-0001](adr/0001-language-and-toolchain.md) |
 | Building on `zig-nostr/nostr` | [ADR-0002](adr/0002-build-on-zig-nostr.md) |
 | LMDB rather than SQL | [ADR-0003](adr/0003-storage-engine-lmdb.md) |
-| `websocket.zig` transport | [ADR-0004](adr/0004-websocket-transport.md) |
+| `websocket.zig` transport, superseded | [ADR-0004](adr/0004-websocket-transport.md) |
+| First-party WebSocket transport | [ADR-0011](adr/0011-first-party-websocket-transport.md) |
 | Thread pool now, evented later | [ADR-0005](adr/0005-concurrency-model.md) |
 | Schnorr via vendored `libsecp256k1` | [ADR-0006](adr/0006-cryptography.md) |
 | Configuration format | [ADR-0007](adr/0007-configuration-format.md) |

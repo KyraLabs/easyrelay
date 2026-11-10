@@ -226,7 +226,11 @@ fn serve(gpa: std.mem.Allocator, io: Io, loaded: Loaded, stdout: *Io.Writer, std
     var app: easyrelay.server.App = .{ .gpa = gpa, .shared = &shared };
 
     const options = serverOptions(settings);
-    var relay = try easyrelay.server.init(gpa, &app, options);
+    var relay = easyrelay.server.init(gpa, &app, options) catch |err| {
+        try stderr.print("error: cannot listen on {s}:{d}: {t}. Check network.address and network.port\n", .{ options.address, options.port, err });
+        try stderr.flush();
+        std.process.exit(1);
+    };
     defer relay.deinit();
 
     const data_dir = Io.Dir.cwd().realPathFileAlloc(io, settings.storage.path, gpa) catch null;
@@ -245,7 +249,7 @@ fn serve(gpa: std.mem.Allocator, io: Io, loaded: Loaded, stdout: *Io.Writer, std
     }
     try stdout.flush();
 
-    try relay.listen(&app);
+    try relay.listen();
 }
 
 const testing = std.testing;

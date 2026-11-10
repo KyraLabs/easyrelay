@@ -1,6 +1,6 @@
 # 0004. `websocket.zig` as the transport
 
-- **Status:** Accepted
+- **Status:** Superseded by [0011](0011-first-party-websocket-transport.md)
 - **Date:** 2026-08-23
 
 ## Context
