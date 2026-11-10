@@ -31,12 +31,7 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const args = try init.minimal.args.toSlice(arena);
 
-    // Streaming, not positional. `Io.File.Writer.init` defaults to positional
-    // writes, which carry their own offset and ignore the one the operating
-    // system shares between everything writing to the same file. Under
-    // `easyrelay > relay.log 2>&1` — systemd, Docker, nohup, every ordinary
-    // deployment — that made the startup message and the transport's log
-    // overwrite each other's bytes.
+    // Streaming, not positional: positional writes clobber other writers under `> log 2>&1`.
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file: Io.File.Writer = .initStreaming(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_file.interface;
@@ -56,9 +51,6 @@ pub fn main(init: std.process.Init) !void {
             try stdout.flush();
             return;
         },
-        // Name the offending argument instead of dumping usage alone. An error
-        // the operator cannot act on is a bug: see
-        // docs/adr/0009-deployment-experience.md.
         .unknown => {
             try stderr.print("error: unknown argument '{s}'\n\n{s}", .{ arg, usage });
             try stderr.flush();
@@ -69,14 +61,8 @@ pub fn main(init: std.process.Init) !void {
     try serve(gpa, io, stdout);
 }
 
-/// Starts the relay on the defaults and blocks.
-///
-/// Zero configuration is a commitment with its own exit criteria
-/// (docs/adr/0009-deployment-experience.md), and it is cheap to hold to here
-/// while the surface is small. Every setting below is a default in
-/// docs/configuration.md, not a value invented for this function.
 fn serve(gpa: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
-    var events = easyrelay.memory.Memory.init(gpa);
+    var events = easyrelay.memory.Memory.init(gpa, io);
     defer events.deinit();
 
     var connections = easyrelay.hub.Hub.init(gpa, io);
@@ -97,10 +83,6 @@ fn serve(gpa: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
         "easyrelay {s} is serving ws://{s}:{d}\n",
         .{ easyrelay.version, options.address, options.port },
     );
-    // Said plainly, because the alternative is an operator discovering it
-    // after a restart. The full startup message — data directory, whether the
-    // relay is reachable from outside loopback, what to change — arrives with
-    // the configuration file in Phase 2.
     try stdout.writeAll("events are held in memory only: a restart loses them\n");
     try stdout.flush();
 

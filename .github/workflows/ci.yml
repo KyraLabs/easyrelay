@@ -31,8 +31,6 @@ jobs:
           version: ${{ steps.zig.outputs.version }}
           cache-key: lint
 
-      # zig-pkg/ is where the build system unpacks the dependencies. Excluding it
-      # keeps this command identical to the one contributors run after a build.
       - name: Check formatting
         run: zig fmt --check --exclude zig-pkg .
 
@@ -63,8 +61,6 @@ jobs:
   interop:
     name: Interop (nak)
     runs-on: ubuntu-latest
-    # The version is pinned: an interop test that follows a moving client tells
-    # you something changed, not which side changed it.
     env:
       NAK_VERSION: v0.20.6
     steps:
@@ -88,8 +84,6 @@ jobs:
       - name: Build
         run: zig build
 
-      # docs/testing.md: conformance checks the relay against this project's
-      # reading of NIP-01, interop checks it against what a client actually does.
       - name: Publish and read back with nak
         run: ./scripts/interop-nak.sh
 
@@ -115,8 +109,6 @@ jobs:
           version: ${{ steps.zig.outputs.version }}
           cache-key: cross-${{ matrix.target }}
 
-      # Guards the exact targets release.yml publishes. Without this a broken
-      # cross-compile is only discovered when a tag is pushed, which is the worst
-      # possible moment to discover it.
+      # Keep in sync with the targets release.yml publishes.
       - name: Build
         run: zig build -Dtarget=${{ matrix.target }} -Doptimize=ReleaseSafe

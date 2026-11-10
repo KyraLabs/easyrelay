@@ -1,18 +1,8 @@
-//! What the conformance tests run against: a real relay on a real socket, and
-//! a real client to drive it.
-//!
-//! docs/testing.md asks for exactly this. A conformance test that called into
-//! the relay's own functions would check easyrelay against easyrelay; these
-//! check it against a client that knows only the wire.
-
 const std = @import("std");
 const easyrelay = @import("easyrelay");
 const nostr = @import("nostr");
 const ws = @import("websocket");
 
-/// Each relay takes the next port. The transport binds inside `listen` and
-/// never reports which port it got, so this cannot be zero — and every relay
-/// getting its own keeps a stopping one out of a starting one's way.
 var next_port: std.atomic.Value(u16) = .init(47_800);
 
 pub const Relay = struct {
@@ -26,7 +16,6 @@ pub const Relay = struct {
     listener: std.Thread,
     port: u16,
 
-    /// Heap-allocated because the relay points at its own fields.
     pub fn start(gpa: std.mem.Allocator, limits: easyrelay.session.Limits) !*Relay {
         const self = try gpa.create(Relay);
         errdefer gpa.destroy(self);
@@ -34,7 +23,7 @@ pub const Relay = struct {
         self.* = .{
             .gpa = gpa,
             .threaded = .init(gpa, .{}),
-            .events = easyrelay.memory.Memory.init(gpa),
+            .events = undefined,
             .port = next_port.fetchAdd(1, .monotonic),
             .connections = undefined,
             .shared = undefined,
@@ -44,6 +33,7 @@ pub const Relay = struct {
         };
 
         const relay_io = self.threaded.io();
+        self.events = easyrelay.memory.Memory.init(gpa, relay_io);
         self.connections = easyrelay.hub.Hub.init(gpa, relay_io);
         self.shared = .{
             .io = relay_io,
@@ -64,9 +54,7 @@ pub const Relay = struct {
         return self.threaded.io();
     }
 
-    /// Stops once every connection has finished closing. Stopping earlier
-    /// walks into the shutdown race recorded in
-    /// docs/adr/0004-websocket-transport.md.
+    /// Stopping before every connection closes hits a transport shutdown race.
     pub fn stop(self: *Relay) void {
         self.drain() catch {};
         self.server.stop();
@@ -113,8 +101,7 @@ pub const Client = struct {
         return self.arena.allocator();
     }
 
-    /// `Client.write` masks the payload in the caller's buffer, so everything
-    /// sent gets its own copy. Phase 0 found this the hard way.
+    /// `Client.write` masks the payload in place.
     pub fn send(self: *Client, message: []const u8) !void {
         try self.socket.write(try self.allocator().dupe(u8, message));
     }
@@ -123,26 +110,16 @@ pub const Client = struct {
         try self.send(try nostr.message.encodeEvent(self.allocator(), event));
     }
 
-    /// The next message, copied out of the library's buffer so it stays valid
-    /// for the rest of the test.
     pub fn receive(self: *Client) ![]const u8 {
         const message = (try self.socket.read()) orelse return error.RelayDidNotAnswer;
         defer self.socket.done(message);
         return self.allocator().dupe(u8, message.data);
     }
 
-    /// The next message as its JSON array, for asserting on a field rather
-    /// than on a spelling.
     pub fn receiveJson(self: *Client) !std.json.Value {
         return std.json.parseFromSliceLeaky(std.json.Value, self.allocator(), try self.receive(), .{});
     }
 
-    /// Fails if anything arrives within `window_ms`.
-    ///
-    /// The window is the whole assertion: without one, a test cannot tell
-    /// "nothing" from "not yet". It is deliberately short, because this is
-    /// waiting for something that must not happen and every test that calls it
-    /// pays the full wait.
     pub fn expectSilence(self: *Client, window_ms: u32) !void {
         try self.socket.readTimeout(window_ms);
         defer self.socket.readTimeout(2000) catch {};
@@ -154,8 +131,6 @@ pub const Client = struct {
     }
 };
 
-/// Signs events, so that a test can put a real event on the wire without
-/// keeping a fixture of one.
 pub const Author = struct {
     signer: nostr.keys.Signer,
     keypair: nostr.keys.KeyPair,
@@ -185,8 +160,4 @@ pub const Author = struct {
     }
 };
 
-/// Unix seconds the conformance tests date their events with. Fixed, so that
-/// no assertion depends on when the suite runs, and in the past, because the
-/// relay refuses an event claiming to be from the future while accepting any
-/// age by default (docs/protocol.md#structural-limits).
 pub const event_time: i64 = 1_700_000_000;

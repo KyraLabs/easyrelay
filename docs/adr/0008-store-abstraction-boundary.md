@@ -79,7 +79,7 @@ Two of the spike's findings land squarely on it. The dependency commits one tran
 event, so the interface needs a batch entry point that easyrelay's writer thread drives — a
 shape the dependency does not currently offer, and which the adapter has to provide. And the
 dependency queries a single filter while a `REQ` carries several, so merging, deduplicating and
-applying `limit` across the merge is adapter work too.
+applying `limit` across the merge is adapter work too. (Corrected below: `limit` is per filter.)
 
 Both are exactly what rule 2 of this record anticipated: the interface is defined by what the
 relay needs, and `lmdb.zig` absorbs the difference. If the upstream conditions in
@@ -121,6 +121,15 @@ Amended in place rather than superseded by a new record because the decision —
 through a first-party interface — is untouched. What changed is a supporting rule that
 overreached past the risk it was written to contain, which is the correction of a factual error
 the [records README](README.md) allows.
+
+## Amendment (2026-11-10): `limit` is per filter
+
+The outcome above, [protocol.md](../protocol.md) and the Phase 1 code applied the largest
+`limit` in a `REQ` across the merged result. NIP-01 defines `limit` per filter, so that rule
+returned stored events for a filter that asked for none. `query` now takes filters whose
+`limit` the relay has already defaulted and capped, and returns the union of each filter's
+newest matches without duplicates. Merging and deduplicating remain adapter work for
+`lmdb.zig`; only the bound changed.
 
 ## Revisit when
 

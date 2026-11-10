@@ -1,20 +1,3 @@
-//! The relay's half of the NIP-01 wire format: decoding what a client sends
-//! and encoding what the relay answers.
-//!
-//! It is first-party rather than adapted. `zig-nostr`'s `message.zig` speaks
-//! the client's half — it encodes `EVENT`, `REQ` and `CLOSE` and parses `OK`,
-//! `EOSE`, `CLOSED` and `NOTICE` — and the two halves do not overlap anywhere.
-//! That is not a gap in the dependency; a client reads exactly what this module
-//! writes. It does make the dependency an oracle worth having, and the tests
-//! below use it as one: everything encoded here is parsed back with its
-//! `parseRelayMessage`, and everything decoded here was built with its
-//! encoders. A codec tested only against itself agrees with itself.
-//!
-//! Decoding allocates in the per-request arena and borrows from the message
-//! bytes: a subscription id and a tag value point into the buffer the frame
-//! arrived in, which the caller must keep alive until it is done with the
-//! message.
-
 const std = @import("std");
 const nostr = @import("nostr");
 
@@ -25,19 +8,11 @@ const Event = nostr.event.Event;
 const Filter = nostr.filter.Filter;
 
 pub const Error = error{
-    /// The bytes are not a message this relay can act on: not JSON, not an
-    /// array, or the wrong shape for the type it claims to be.
     MalformedMessage,
-    /// A message type the protocol defines and this relay does not implement
-    /// yet. Distinct from an unknown type because "not yet" and "never" are
-    /// different answers for the client.
     UnsupportedMessage,
     OutOfMemory,
 };
 
-/// From docs/protocol.md#structural-limits, spelled as docs/configuration.md
-/// spells them so that Phase 2's file maps onto this without a translation
-/// table.
 pub const Limits = struct {
     max_subid_length: usize = 64,
     max_filters: usize = 10,
@@ -78,8 +53,6 @@ fn unsupported(
     return error.UnsupportedMessage;
 }
 
-// -- Client to relay --------------------------------------------------------
-
 pub const ClientMessage = union(enum) {
     event: Event,
     req: Req,
@@ -87,8 +60,6 @@ pub const ClientMessage = union(enum) {
 
     pub const Req = struct {
         subscription_id: []const u8,
-        /// Possibly empty: `["REQ","sub"]` asks for nothing, and the relay
-        /// answers it with `EOSE` rather than with an error.
         filters: []const Filter,
     };
 
@@ -103,9 +74,6 @@ pub fn decode(
     limits: Limits,
     diagnostics: *Diagnostics,
 ) Error!ClientMessage {
-    // `std.json`'s value parser is iterative — it keeps its nesting on the
-    // heap rather than on the call stack — so a deeply nested message costs
-    // memory bounded by the transport's message limit rather than a crash.
     const value = std.json.parseFromSliceLeaky(std.json.Value, arena, text, .{}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         else => return malformed(diagnostics, .not_json, "message is not valid JSON", .{}),
@@ -170,8 +138,6 @@ fn decodeReq(
         return malformed(diagnostics, .wrong_shape, "REQ carries a subscription id and its filters", .{});
     }
     const subscription_id = try decodeSubscriptionId(array[1], limits, diagnostics);
-    // From here on the failure has a subscription id to name, which is what
-    // lets the caller answer `CLOSED` rather than `NOTICE`.
     diagnostics.subject = subscription_id;
 
     const count = array.len - 2;
@@ -236,16 +202,10 @@ fn decodeSubscriptionId(
     return subscription_id;
 }
 
-/// Keeps client-supplied text from filling a diagnostic and pushing out the
-/// part that explains the failure.
 fn shorten(text: []const u8, limit: usize) []const u8 {
     return text[0..@min(text.len, limit)];
 }
 
-// -- Relay to client --------------------------------------------------------
-
-/// The machine-readable prefixes from
-/// docs/protocol.md#machine-readable-result-prefixes.
 pub const Prefix = enum {
     duplicate,
     pow,
@@ -254,10 +214,8 @@ pub const Prefix = enum {
     invalid,
     restricted,
     auth_required,
-    /// Spelled `error:` on the wire; `error` is a keyword here.
     internal,
 
-    /// The token including its colon, exactly as the document publishes it.
     pub fn text(self: Prefix) []const u8 {
         return switch (self) {
             .duplicate => "duplicate:",
@@ -275,15 +233,11 @@ pub const Prefix = enum {
 pub const Ok = struct {
     event_id: [32]u8,
     accepted: bool,
-    /// Required when `accepted` is false. `duplicate:` travels with `true`,
-    /// because the client's event is on the relay, which is what it asked for.
     prefix: ?Prefix = null,
     reason: []const u8 = "",
 };
 
 pub fn writeOk(writer: *std.Io.Writer, ok: Ok) std.Io.Writer.Error!void {
-    // docs/protocol.md: every `OK` carrying false begins with a prefix. A
-    // rejection a client cannot classify is one it will retry forever.
     std.debug.assert(ok.accepted or ok.prefix != null);
 
     const id = std.fmt.bytesToHex(ok.event_id, .lower);
@@ -296,24 +250,39 @@ pub fn writeOk(writer: *std.Io.Writer, ok: Ok) std.Io.Writer.Error!void {
 
 pub fn writeEvent(
     writer: *std.Io.Writer,
-    gpa: std.mem.Allocator,
     subscription_id: []const u8,
     event: Event,
-) (std.Io.Writer.Error || error{OutOfMemory})!void {
-    // The dependency serializes an event into an owned slice and offers no
-    // append-into-writer variant, so this costs one allocation. It comes from
-    // the per-request arena.
-    const body = try nostr.event.toJson(gpa, event);
-    defer gpa.free(body);
-    try writeEventEnvelope(writer, subscription_id, body);
+) std.Io.Writer.Error!void {
+    try writer.writeAll("[\"EVENT\",");
+    try std.json.Stringify.encodeJsonString(subscription_id, .{}, writer);
+    try writer.writeByte(',');
+    try writeEventJson(writer, event);
+    try writer.writeByte(']');
 }
 
-/// The same message from an event that is already serialized.
-///
-/// Fan-out sends one event to many subscriptions, which differ only in the id
-/// they carry, so it serializes once and calls this for each. That path is the
-/// relay's hot one: every accepted event is written to every subscriber that
-/// wants it.
+/// Not `nostr.event.toJson`: its canonical escaping leaves control bytes raw.
+pub fn writeEventJson(writer: *std.Io.Writer, event: Event) std.Io.Writer.Error!void {
+    try writer.writeAll("{\"id\":\"");
+    try writer.writeAll(&std.fmt.bytesToHex(event.id, .lower));
+    try writer.writeAll("\",\"pubkey\":\"");
+    try writer.writeAll(&std.fmt.bytesToHex(event.pubkey, .lower));
+    try writer.print("\",\"created_at\":{d},\"kind\":{d},\"tags\":[", .{ event.created_at, event.kind });
+    for (event.tags, 0..) |tag, tag_index| {
+        if (tag_index != 0) try writer.writeByte(',');
+        try writer.writeByte('[');
+        for (tag, 0..) |field, field_index| {
+            if (field_index != 0) try writer.writeByte(',');
+            try std.json.Stringify.encodeJsonString(field, .{}, writer);
+        }
+        try writer.writeByte(']');
+    }
+    try writer.writeAll("],\"content\":");
+    try std.json.Stringify.encodeJsonString(event.content, .{}, writer);
+    try writer.writeAll(",\"sig\":\"");
+    try writer.writeAll(&std.fmt.bytesToHex(event.sig, .lower));
+    try writer.writeAll("\"}");
+}
+
 pub fn writeEventEnvelope(
     writer: *std.Io.Writer,
     subscription_id: []const u8,
@@ -351,9 +320,6 @@ pub fn writeNotice(writer: *std.Io.Writer, message: []const u8) std.Io.Writer.Er
     try writer.writeByte(']');
 }
 
-/// `"<prefix>: <reason>"`, escaped for the wire. This is ordinary JSON string
-/// escaping and deliberately not NIP-01's canonical escaping: the canonical
-/// form exists to make an id reproducible, and nothing here is hashed.
 fn writeReason(
     writer: *std.Io.Writer,
     prefix: ?Prefix,
@@ -521,8 +487,6 @@ test "a message type the protocol defines and this relay lacks is refused as uns
     }
 }
 
-// -- Encoding, checked by parsing the result with the dependency's client ----
-
 test "an accepted OK parses back as accepted" {
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
@@ -595,7 +559,7 @@ test "an EVENT parses back as the event that was sent" {
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try writeEvent(&out.writer, arena, "sub-1", event);
+    try writeEvent(&out.writer, "sub-1", event);
 
     var parsed = try nostr.message.parseRelayMessage(testing.allocator, out.written());
     defer parsed.deinit();
@@ -603,6 +567,33 @@ test "an EVENT parses back as the event that was sent" {
     try testing.expectEqualStrings("sub-1", parsed.value.event.subscription_id);
     try testing.expectEqualSlices(u8, &event.id, &parsed.value.event.event.id);
     try testing.expect(try nostr.event.verify(arena, signer, parsed.value.event.event));
+}
+
+test "an EVENT with control bytes is valid JSON and keeps its id" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const keypair = try signer.keyPairFromSecretKey([_]u8{9} ** 32);
+
+    var control: [32]u8 = undefined;
+    for (&control, 0..) |*byte, value| byte.* = @intCast(value);
+    const content = try std.mem.concat(arena, u8, &.{ &control, "\"\\\x7f ✓" });
+    const tag: []const []const u8 = &.{ "t", "a\x01b" };
+    const event = try nostr.event.create(arena, signer, keypair, 1700000000, 1, &.{tag}, content, null);
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try writeEvent(&out.writer, "sub-1", event);
+    _ = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.written(), .{});
+
+    var parsed = try nostr.message.parseRelayMessage(testing.allocator, out.written());
+    defer parsed.deinit();
+    const received = parsed.value.event.event;
+    try testing.expectEqualStrings(content, received.content);
+    try testing.expectEqualStrings("a\x01b", received.tags[0][1]);
+    try testing.expect(try nostr.event.verify(arena, signer, received));
 }
 
 test "EOSE, CLOSED and NOTICE parse back" {

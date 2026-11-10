@@ -151,9 +151,9 @@ implemented them. The suite grows with each phase. The fuzz targets
   dependency has not gained a protocol-aware batch ingest by then, easyrelay vendors the patch —
   see the [spike's conditions](research/2026-08-phase-0-validation.md#verdict-and-conditions).
 - **Multi-filter `REQ` handling.** The storage dependency queries one filter at a time; a `REQ`
-  carries several, OR-ed. Results are merged, deduplicated by id, and the subscription's `limit`
-  is applied **across** the merge. Applying it per filter returns the wrong events, so this gets
-  a conformance test rather than a comment.
+  carries several, OR-ed. Each filter is bounded by its own `limit`, and the results are merged
+  newest first and deduplicated by id. The in-memory backend already does this and the
+  conformance suite checks it; the `lmdb` backend has to match.
 - **NIP-09 deletion**, which the storage dependency already implements and Phase 0 verified.
   It arrives here with persistence rather than in Phase 3.
 - **A watermark that closes Phase 1's duplicate window.** An event stored while a subscription's
@@ -185,8 +185,8 @@ implemented them. The suite grows with each phase. The fuzz targets
 - The NIP-11 `supported_nips` array matches [nips.md](nips.md) exactly, checked by a test.
 - NIP-09 conformance tests pass, including a deletion request targeting another author's event,
   which must be ignored, and a re-submission of a deleted event, which must be refused.
-- A `REQ` carrying several filters returns the union, without duplicates, with the
-  subscription's `limit` applied across the merge and selecting the globally newest events.
+- A `REQ` carrying several filters returns the union of each filter's `limit` newest matches,
+  without duplicates, newest first.
 - Sustained durable write throughput is measured and recorded. Phase 0 puts the unbatched
   ceiling at 92 events/s and the batched figure at 169,491; anything close to the former means
   the batching is not actually in the write path.

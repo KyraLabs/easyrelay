@@ -1,39 +1,20 @@
-//! Test vectors: fixed inputs with known-correct outputs, taken from outside
-//! this project rather than produced by it (docs/testing.md).
-//!
-//! They do two jobs. They check easyrelay against the network's definition of
-//! a correct event id and a correct signature, which is the only definition
-//! that matters. And they are the tripwire on `zig-nostr`: an upgrade that
-//! changes canonical serialization or signature behaviour fails here, at
-//! upgrade time, rather than in production — where it would surface as clients
-//! silently discarding everything the relay serves, with the relay looking
-//! healthy throughout.
-
 const std = @import("std");
 const nostr = @import("nostr");
 const easyrelay = @import("easyrelay");
 
 const testing = std.testing;
 
-/// The official BIP-340 suite, verbatim. Provenance in README.md.
 const bip340_csv = @embedFile("bip340.csv");
-/// Real events from public relays, with their published ids.
 const events_json = @embedFile("events.json");
-
-// -- BIP-340 ----------------------------------------------------------------
 
 const Bip340 = struct {
     index: usize,
-    /// Absent for the vectors that only exercise verification.
     secret_key: ?[32]u8,
     public_key: [32]u8,
     aux_rand: ?[32]u8,
-    /// The suite's messages run from 0 to 100 bytes.
     message_buf: [100]u8,
     message_len: usize,
     signature: [64]u8,
-    /// What the suite says verification must return. Ten of the vectors are
-    /// here to be *rejected*, and they are the valuable half.
     valid: bool,
     comment: []const u8,
 
@@ -44,16 +25,12 @@ const Bip340 = struct {
 
 const VectorError = error{MalformedVector} || std.fmt.ParseIntError || error{ InvalidCharacter, InvalidLength, NoSpaceLeft };
 
-/// Walks the CSV. The file is fixed and in the repository, so a malformed row
-/// is a broken checkout and not untrusted input: this gives up rather than
-/// skipping, because a silently skipped vector is a test that passes for the
-/// wrong reason.
 const Bip340Iterator = struct {
     lines: std.mem.SplitIterator(u8, .scalar),
 
     fn init() Bip340Iterator {
         var lines = std.mem.splitScalar(u8, bip340_csv, '\n');
-        _ = lines.next(); // header
+        _ = lines.next();
         return .{ .lines = lines };
     }
 
@@ -114,7 +91,6 @@ test "BIP-340: every official vector verifies exactly as the suite says" {
         };
         checked += 1;
     }
-    // Pins the file: a truncated CSV would otherwise pass by checking nothing.
     try testing.expectEqual(@as(usize, 19), checked);
 }
 
@@ -136,8 +112,6 @@ test "BIP-340: signing reproduces the published signature" {
     }
     try testing.expectEqual(@as(usize, 8), signed);
 }
-
-// -- Canonical serialization and event ids ----------------------------------
 
 fn parseEvents(arena: std.mem.Allocator) ![]nostr.event.Event {
     var parsed = try std.json.parseFromSlice(std.json.Value, arena, events_json, .{});
@@ -203,8 +177,6 @@ test "the collected events still cover the cases a JSON encoder gets wrong" {
         if (event.tags.len >= 20) many_tags = true;
     }
 
-    // Refreshing the corpus is fine; refreshing it into one that no longer
-    // exercises these is how the suite quietly stops being worth running.
     try testing.expect(non_ascii);
     try testing.expect(newline);
     try testing.expect(quote);
@@ -224,8 +196,6 @@ test "every collected event passes easyrelay's own validation" {
     defer signer.deinit();
     const validator = easyrelay.validation.Validator{ .signer = signer };
 
-    // A fixed clock, later than every collected event and earlier than none:
-    // the corpus is historical, and no lower bound is configured by default.
     const now: i64 = 2_000_000_000;
 
     for (try parseEvents(arena)) |*event| {
@@ -242,16 +212,7 @@ test "every collected event passes easyrelay's own validation" {
 }
 
 test "canonical serialization escapes exactly the seven characters NIP-01 names" {
-    // Transcribed from docs/protocol.md: line break, quote, backslash,
-    // carriage return, tab, backspace and form feed are escaped, and every
-    // other byte is emitted verbatim — no \uXXXX, no escaped forward slash,
-    // no escaped non-ASCII, and no escape for any other control character.
-    // A general-purpose JSON encoder disagrees on the last three, and
-    // disagreeing produces a different id.
-    //
-    // This is written from the specification rather than collected, because
-    // tab and the raw control byte do not occur in a corpus of a few thousand
-    // real events: see README.md.
+    // A general-purpose JSON encoder escapes differently, and any difference changes the id.
     const content = "\n\"\\\r\t\x08\x0c/\u{00e9}\x01";
     const expected = "[0,\"" ++ "00" ** 32 ++ "\",1700000000,1,[],\"\\n\\\"\\\\\\r\\t\\b\\f/\u{00e9}\x01\"]";
 

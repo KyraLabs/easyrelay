@@ -1,15 +1,4 @@
 #!/usr/bin/env bash
-#
-# The pinned Zig version lives in three files that must agree:
-#
-#   .zigversion          read by editors, ZLS and CI
-#   mise.toml            what `mise install` gives a contributor
-#   build.zig.zon        minimum_zig_version, enforced by the compiler
-#
-# Drift between them is the classic "works on my machine" bug, and it surfaces as an
-# unrelated CI failure days later. This script is the guard. CI runs it; run it yourself
-# after changing the pin. See docs/adr/0001-language-and-toolchain.md.
-
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -19,7 +8,6 @@ fail() {
 }
 
 extract_quoted() {
-    # First double-quoted value on the first line matching the given pattern.
     grep -E "$1" "$2" | head -1 | sed -E 's/.*"([^"]+)".*/\1/'
 }
 

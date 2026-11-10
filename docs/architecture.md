@@ -111,9 +111,8 @@ measured one durable transaction per event at 92 events/s against 169,491 events
 batched transaction — a factor of 1,842, entirely `fsync` per commit. The writer thread drains
 its queue in batches for that reason, and the interface has to admit it.
 
-`query` takes a *list* of filters because a NIP-01 `REQ` carries several, OR-ed, and the
-subscription's `limit` applies across the merged result rather than per filter. Getting that
-wrong returns plausible but incorrect events.
+`query` takes a *list* of filters because a NIP-01 `REQ` carries several, OR-ed. Each filter's
+`limit` bounds that filter's matches, and the answer is their union without duplicates.
 
 ### Storage
 

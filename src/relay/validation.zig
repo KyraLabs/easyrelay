@@ -1,18 +1,3 @@
-//! Validation of an inbound event, in the order docs/architecture.md fixes:
-//! structural limits, then the `created_at` window, then the canonical id,
-//! then the signature.
-//!
-//! The order is the design, not a detail. Signature verification is the
-//! expensive step — roughly 46 µs an event, measured in Phase 0 — and an
-//! unauthenticated client must not be able to reach it with input that a byte
-//! comparison would have rejected. Every check before it is a length or an
-//! integer comparison.
-//!
-//! Failure is one error, `error.Invalid`, with the reason in a `Diagnostics`
-//! the caller passes in. Zig errors carry no payload and docs/protocol.md
-//! requires `["OK", <id>, false, "invalid: <reason>"]` to carry a real reason,
-//! so the reason travels beside the error rather than inside it.
-
 const std = @import("std");
 const nostr = @import("nostr");
 
@@ -21,27 +6,15 @@ const diag = @import("diagnostics.zig");
 const Event = nostr.event.Event;
 
 pub const Error = error{
-    /// The event is malformed, its id does not match its content, or its
-    /// signature does not verify. The client is answered `OK false` with the
-    /// `invalid:` prefix and the diagnostics' message.
     Invalid,
     OutOfMemory,
 };
 
-/// The structural bounds from docs/protocol.md#structural-limits. The defaults
-/// are that document's defaults; Phase 2's configuration file fills this in
-/// from docs/configuration.md, whose key names these mirror deliberately.
 pub const Limits = struct {
-    /// Bytes the event occupied on the wire. Nothing else bounds the length of
-    /// an individual tag element, which is deliberate: this bounds it
-    /// transitively and one limit is easier to reason about than two.
     max_event_size: usize = 65536,
     max_event_tags: usize = 2000,
     max_content_length: usize = 65536,
-    /// Seconds into the future an event may claim to have been created.
     created_at_upper_limit_s: i64 = 900,
-    /// Seconds into the past. Null accepts any age, which is the default: a
-    /// relay that refuses old events cannot be backfilled.
     created_at_lower_limit_s: ?i64 = null,
 };
 
@@ -55,13 +28,8 @@ pub const Reason = enum {
     bad_signature,
 };
 
-/// Carries the reason a validation failed back to the caller, which turns it
-/// into the `OK` message.
 pub const Diagnostics = diag.Diagnostics(Reason);
 
-/// Records the reason and returns the module's error in one expression, so
-/// that a check reads as a single statement and cannot record a failure
-/// without returning one.
 fn invalid(
     into: *Diagnostics,
     reason: Reason,
@@ -74,20 +42,8 @@ fn invalid(
 
 pub const Validator = struct {
     limits: Limits = .{},
-    /// Borrowed, and not owned: `keys.Signer` is not thread-safe for
-    /// concurrent use of one instance, so each I/O thread holds its own and
-    /// deinitialises it. Phase 0 found this before it could become a race.
     signer: nostr.keys.Signer,
 
-    /// Checks `event`, which arrived as `serialized_length` bytes on the wire,
-    /// against the relay's rules as of `now` (unix seconds).
-    ///
-    /// `now` is a parameter rather than a clock read: it makes every bound
-    /// testable without waiting, and the caller reads the clock once per
-    /// message instead of twice per event.
-    ///
-    /// `arena` is the per-request arena. Nothing allocated here outlives the
-    /// call.
     pub fn validate(
         self: Validator,
         arena: std.mem.Allocator,
@@ -121,8 +77,6 @@ pub const Validator = struct {
             );
         }
 
-        // Saturating, because both bounds are configured and `now` is not: an
-        // overflow here would be a rejection turning into an acceptance.
         if (event.created_at > now +| self.limits.created_at_upper_limit_s) {
             return invalid(
                 diagnostics,
@@ -172,8 +126,6 @@ pub const Validator = struct {
 
 const testing = std.testing;
 
-/// Unix seconds every test validates against. Fixed, so that no bound depends
-/// on when the suite runs.
 const test_now: i64 = 1_700_000_000;
 
 const Harness = struct {
@@ -317,10 +269,6 @@ test "an event with a valid id and an invalid signature is rejected" {
 }
 
 test "the cheap checks run before the expensive one" {
-    // Both events below would also fail signature verification. Reporting the
-    // cheaper failure is the evidence that verification was never reached,
-    // which is what keeps an unauthenticated client from spending the relay's
-    // CPU on malformed input.
     var by_size = Harness.init(.{});
     defer by_size.deinit();
     var oversized = try by_size.sign(test_now, &.{}, "hello");
