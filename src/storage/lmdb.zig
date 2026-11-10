@@ -532,12 +532,16 @@ pub const Lmdb = struct {
     }
 };
 
+/// Creates every table, because a read-only transaction cannot.
 fn readNextLocalId(env: lmdb.Environment) !u64 {
     const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
     errdefer txn.abort();
 
     const meta = try lmdb.Database.open(txn, meta_db, .{ .create = true });
-    _ = try lmdb.Database.open(txn, events_db, .{ .create = true });
+    for ([_][*:0]const u8{ events_db, by_id_db, by_replaceable_db, by_address_db, deleted_db, deleted_address_db }) |name| {
+        _ = try lmdb.Database.open(txn, name, .{ .create = true });
+    }
+    for (std.enums.values(index.Index)) |which| _ = try lmdb.Database.open(txn, which.name(), .{ .create = true });
 
     const stored = try meta.get(next_local_id_key);
     const next = if (stored) |bytes| blk: {
@@ -1255,4 +1259,14 @@ test "a deletion holds across a restart" {
     var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
     defer backend.close();
     try testing.expectEqual(PutResult.deleted, try backend.store().put(&note));
+}
+
+test "a query on a store that has never been written answers nothing" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    var collector: Collector = .{};
+    try fixture.backend.store().query(&.{ .{}, .{ .kinds = &.{1} }, .{ .authors = &.{[_]u8{1} ** 32} } }, collector.sink());
+    try testing.expectEqual(@as(usize, 0), collector.len);
 }
