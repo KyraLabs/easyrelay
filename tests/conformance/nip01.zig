@@ -7,6 +7,7 @@
 //! having.
 
 const std = @import("std");
+const easyrelay = @import("easyrelay");
 const nostr = @import("nostr");
 
 const harness = @import("harness.zig");
@@ -239,4 +240,38 @@ test "a closed subscription receives nothing further" {
     try expectOk(&publisher, true, "");
 
     try subscriber.expectSilence(300);
+}
+
+test "an event with control bytes in its content reaches clients as valid JSON" {
+    const relay = try Relay.start(testing.allocator, .{});
+    defer relay.stop();
+
+    var author = try harness.Author.init(11);
+    defer author.deinit();
+
+    var publisher = try Client.connect(relay);
+    defer publisher.close();
+    var subscriber = try Client.connect(relay);
+    defer subscriber.close();
+
+    const content = "control\x01byte\x1f";
+    try sendEscaped(&publisher, try author.event(publisher.allocator(), harness.event_time, 1, &.{}, content));
+    try expectOk(&publisher, true, "");
+
+    try subscriber.send("[\"REQ\",\"s\",{}]");
+    try testing.expectEqualStrings(content, (try expectEventFor(&subscriber, "s")).content);
+    try expectEose(&subscriber, "s");
+
+    try sendEscaped(&publisher, try author.event(publisher.allocator(), harness.event_time + 1, 1, &.{}, content));
+    try expectOk(&publisher, true, "");
+    try testing.expectEqualStrings(content, (try expectEventFor(&subscriber, "s")).content);
+}
+
+/// `nostr.message.encodeEvent` leaves control bytes raw, which is not JSON.
+fn sendEscaped(client: *Client, event: nostr.event.Event) !void {
+    var out: std.Io.Writer.Allocating = .init(client.allocator());
+    try out.writer.writeAll("[\"EVENT\",");
+    try easyrelay.codec.writeEventJson(&out.writer, event);
+    try out.writer.writeByte(']');
+    try client.send(out.written());
 }

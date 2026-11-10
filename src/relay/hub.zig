@@ -114,7 +114,7 @@ pub const Hub = struct {
                 if (!matchesAny(subscription.filters, event)) continue;
 
                 const body = serialized orelse body: {
-                    const rendered = nostr.event.toJson(arena, event.*) catch |err| {
+                    const rendered = render(arena, event) catch |err| {
                         // Not silently: a delivery that did not happen is
                         // invisible to everyone but the operator. The event
                         // itself is stored and a later query will find it,
@@ -135,6 +135,12 @@ pub const Hub = struct {
         }
     }
 };
+
+fn render(arena: std.mem.Allocator, event: *const Event) error{OutOfMemory}![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(arena);
+    codec.writeEventJson(&out.writer, event.*) catch return error.OutOfMemory;
+    return out.written();
+}
 
 fn matchesAny(filters: []const nostr.filter.Filter, event: *const Event) bool {
     for (filters) |filter| {
@@ -261,4 +267,30 @@ test "a subscriber that has left is not delivered to" {
     const event = testEvent(1);
     connections.broadcast(arena_state.allocator(), &event);
     try testing.expectEqual(@as(usize, 0), listener.received.items.len);
+}
+
+test "a delivered event with control bytes is valid JSON" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+
+    var connections = Hub.init(testing.allocator, testing.io);
+    defer connections.deinit();
+
+    var listener = Listener{};
+    defer listener.deinit();
+    var member: Subscriber = .{
+        .registry = subscriptions.Registry.init(testing.allocator, .{}),
+        .delivery = listener.delivery(),
+    };
+    defer member.registry.deinit();
+    try member.registry.open("everything", &[_]nostr.filter.Filter{.{}});
+    try connections.join(&member);
+
+    var event = testEvent(1);
+    event.content = "control\x01byte";
+    connections.broadcast(arena_state.allocator(), &event);
+
+    try testing.expectEqual(@as(usize, 1), listener.received.items.len);
+    const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), listener.received.items[0], .{});
+    try testing.expectEqualStrings("control\x01byte", parsed.array.items[2].object.get("content").?.string);
 }

@@ -296,16 +296,38 @@ pub fn writeOk(writer: *std.Io.Writer, ok: Ok) std.Io.Writer.Error!void {
 
 pub fn writeEvent(
     writer: *std.Io.Writer,
-    gpa: std.mem.Allocator,
     subscription_id: []const u8,
     event: Event,
-) (std.Io.Writer.Error || error{OutOfMemory})!void {
-    // The dependency serializes an event into an owned slice and offers no
-    // append-into-writer variant, so this costs one allocation. It comes from
-    // the per-request arena.
-    const body = try nostr.event.toJson(gpa, event);
-    defer gpa.free(body);
-    try writeEventEnvelope(writer, subscription_id, body);
+) std.Io.Writer.Error!void {
+    try writer.writeAll("[\"EVENT\",");
+    try std.json.Stringify.encodeJsonString(subscription_id, .{}, writer);
+    try writer.writeByte(',');
+    try writeEventJson(writer, event);
+    try writer.writeByte(']');
+}
+
+/// Ordinary JSON escaping, not the canonical form that `nostr.event.toJson`
+/// shares with the id hash: that form leaves most control bytes raw.
+pub fn writeEventJson(writer: *std.Io.Writer, event: Event) std.Io.Writer.Error!void {
+    try writer.writeAll("{\"id\":\"");
+    try writer.writeAll(&std.fmt.bytesToHex(event.id, .lower));
+    try writer.writeAll("\",\"pubkey\":\"");
+    try writer.writeAll(&std.fmt.bytesToHex(event.pubkey, .lower));
+    try writer.print("\",\"created_at\":{d},\"kind\":{d},\"tags\":[", .{ event.created_at, event.kind });
+    for (event.tags, 0..) |tag, tag_index| {
+        if (tag_index != 0) try writer.writeByte(',');
+        try writer.writeByte('[');
+        for (tag, 0..) |field, field_index| {
+            if (field_index != 0) try writer.writeByte(',');
+            try std.json.Stringify.encodeJsonString(field, .{}, writer);
+        }
+        try writer.writeByte(']');
+    }
+    try writer.writeAll("],\"content\":");
+    try std.json.Stringify.encodeJsonString(event.content, .{}, writer);
+    try writer.writeAll(",\"sig\":\"");
+    try writer.writeAll(&std.fmt.bytesToHex(event.sig, .lower));
+    try writer.writeAll("\"}");
 }
 
 /// The same message from an event that is already serialized.
@@ -595,7 +617,7 @@ test "an EVENT parses back as the event that was sent" {
 
     var out: std.Io.Writer.Allocating = .init(testing.allocator);
     defer out.deinit();
-    try writeEvent(&out.writer, arena, "sub-1", event);
+    try writeEvent(&out.writer, "sub-1", event);
 
     var parsed = try nostr.message.parseRelayMessage(testing.allocator, out.written());
     defer parsed.deinit();
@@ -603,6 +625,33 @@ test "an EVENT parses back as the event that was sent" {
     try testing.expectEqualStrings("sub-1", parsed.value.event.subscription_id);
     try testing.expectEqualSlices(u8, &event.id, &parsed.value.event.event.id);
     try testing.expect(try nostr.event.verify(arena, signer, parsed.value.event.event));
+}
+
+test "an EVENT with control bytes is valid JSON and keeps its id" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const keypair = try signer.keyPairFromSecretKey([_]u8{9} ** 32);
+
+    var control: [32]u8 = undefined;
+    for (&control, 0..) |*byte, value| byte.* = @intCast(value);
+    const content = try std.mem.concat(arena, u8, &.{ &control, "\"\\\x7f ✓" });
+    const tag: []const []const u8 = &.{ "t", "a\x01b" };
+    const event = try nostr.event.create(arena, signer, keypair, 1700000000, 1, &.{tag}, content, null);
+
+    var out: std.Io.Writer.Allocating = .init(arena);
+    try writeEvent(&out.writer, "sub-1", event);
+    _ = try std.json.parseFromSliceLeaky(std.json.Value, arena, out.written(), .{});
+
+    var parsed = try nostr.message.parseRelayMessage(testing.allocator, out.written());
+    defer parsed.deinit();
+    const received = parsed.value.event.event;
+    try testing.expectEqualStrings(content, received.content);
+    try testing.expectEqualStrings("a\x01b", received.tags[0][1]);
+    try testing.expect(try nostr.event.verify(arena, signer, received));
 }
 
 test "EOSE, CLOSED and NOTICE parse back" {

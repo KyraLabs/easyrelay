@@ -117,7 +117,7 @@ pub const Session = struct {
             // parsing the event a second time to measure it exactly would cost
             // more than the shade is worth.
             .event => |event| try self.publish(context, event, data.len),
-            .req => |req| try self.subscribe(context, req),
+            .req => |req| try self.subscribe(req),
             // Closing a subscription that is not open is not an error, and
             // NIP-01 gives the relay nothing to say about it.
             .close => |close| {
@@ -198,7 +198,7 @@ pub const Session = struct {
 
     /// Opens or replaces a subscription, answers it from the store, and closes
     /// the stored phase with `EOSE`.
-    fn subscribe(self: *Session, context: Context, req: codec.ClientMessage.Req) Error!void {
+    fn subscribe(self: *Session, req: codec.ClientMessage.Req) Error!void {
         // Held across the whole stored phase. A live event delivered in the
         // middle of it would reach the client before `EOSE`, and
         // docs/protocol.md promises that every stored event precedes it.
@@ -220,7 +220,6 @@ pub const Session = struct {
 
         var sink: EventSink = .{
             .session = self,
-            .arena = context.arena,
             .subscription_id = req.subscription_id,
         };
         const limit = subscriptions.resolveLimit(req.filters, self.shared.limits.subscription);
@@ -246,14 +245,9 @@ pub const Session = struct {
         try self.sendEose(req.subscription_id);
     }
 
-    fn sendEvent(
-        self: *Session,
-        arena: std.mem.Allocator,
-        subscription_id: []const u8,
-        event: Event,
-    ) Error!void {
+    fn sendEvent(self: *Session, subscription_id: []const u8, event: Event) Error!void {
         const writer = try self.responder.begin();
-        try codec.writeEvent(writer, arena, subscription_id, event);
+        try codec.writeEvent(writer, subscription_id, event);
         try self.responder.send();
     }
 
@@ -293,7 +287,6 @@ pub const Session = struct {
 /// here and re-raised by the caller once the query has unwound.
 const EventSink = struct {
     session: *Session,
-    arena: std.mem.Allocator,
     subscription_id: []const u8,
     failure: ?Error = null,
 
@@ -303,7 +296,7 @@ const EventSink = struct {
 
     fn emit(ptr: *anyopaque, event: *const Event) store.Sink.Abort!void {
         const self: *EventSink = @ptrCast(@alignCast(ptr));
-        self.session.sendEvent(self.arena, self.subscription_id, event.*) catch |err| {
+        self.session.sendEvent(self.subscription_id, event.*) catch |err| {
             self.failure = err;
             return error.Abort;
         };
