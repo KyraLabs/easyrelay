@@ -1,15 +1,3 @@
-//! The LMDB backend: easyrelay's own schema, not a third party's.
-//!
-//! The data model this implements is docs/storage.md, and the reasoning behind
-//! writing it here rather than taking one is
-//! docs/adr/0010-first-party-lmdb-store.md. Nothing from `lmdb` appears above
-//! this file (docs/adr/0008-store-abstraction-boundary.md).
-//!
-//! This file currently owns the environment, the `events` table, the `by_id`
-//! and `by_created_at` indexes, and the `Store` implementation over them. The
-//! remaining indexes, kind semantics and the query planner arrive with the
-//! commits that need them.
-
 const std = @import("std");
 const lmdb = @import("lmdb");
 const nostr = @import("nostr");
@@ -27,34 +15,18 @@ const StoreQueryError = store.QueryError;
 
 pub const Error = error{
     OutOfMemory,
-    /// The data directory could not be created.
     DataDirectory,
-    /// LMDB refused the operation. The commonest cause at open by far is a
-    /// `map_size` the address space cannot satisfy.
     Backend,
-    /// A stored record could not be read back. It means corruption, because
-    /// every record in the store was written by `encode`.
     Corrupt,
 };
 
 pub const Options = struct {
-    /// Address space, not a disk reservation, but a ceiling fixed until the
-    /// next restart. The default matches `storage.map_size` in
-    /// docs/configuration.md.
     map_size: usize = 10 * 1024 * 1024 * 1024,
-    /// LMDB's own default. Phase 3 bounds the I/O pool below it and makes it
-    /// configurable; until then, raising it would be a number with no reader.
     max_readers: u32 = 126,
 };
 
-/// The environment sits in a subdirectory rather than directly in the data
-/// directory, which keeps the latter free for the search index and whatever
-/// else grows beside it.
 pub const subdirectory = "events";
 
-/// Fixed when the environment opens and raisable only by reopening, so it
-/// covers docs/storage.md's index table with room for what Phase 4 adds rather
-/// than the two databases that exist today.
 const max_databases = 16;
 
 const events_db = "events";
@@ -63,9 +35,7 @@ const by_id_db = "by_id";
 const by_created_at_db = "by_created_at";
 const next_local_id_key = "next_local_id";
 
-/// Local ids start at 1 so that zero is available as "before every event",
-/// which is what a subscription's watermark holds until its stored phase has
-/// seen anything.
+/// Zero is reserved as the watermark before any event.
 pub const first_local_id: u64 = 1;
 
 pub fn encodeLocalId(local_id: u64) [8]u8 {
@@ -74,15 +44,7 @@ pub fn encodeLocalId(local_id: u64) [8]u8 {
     return key;
 }
 
-/// `created_at` encoded so that ascending byte order is *descending* time: the
-/// sign bit is flipped to make the two's-complement range sort correctly, then
-/// the whole thing is inverted.
-///
-/// The inversion is what lets one forward cursor walk produce the order
-/// docs/protocol.md requires — newest `created_at` first, ties by ascending
-/// event id — with the event id appended unchanged and nothing buffered. A key
-/// of ascending time walked backwards cannot do it, because the tie-break would
-/// come out descending too.
+/// Sign-flipped and inverted so a forward walk yields newest first, ties by ascending id.
 fn descendingTime(created_at: i64) [8]u8 {
     const biased: u64 = @as(u64, @bitCast(created_at)) ^ (@as(u64, 1) << 63);
     var key: [8]u8 = undefined;
@@ -102,9 +64,6 @@ fn createdAtKey(created_at: i64, id: *const [32]u8) CreatedAtKey {
 pub const Lmdb = struct {
     gpa: std.mem.Allocator,
     env: lmdb.Environment,
-    /// Read from `meta` at open and advanced by `append`. Only the writer
-    /// thread touches it (docs/adr/0005-concurrency-model.md), so it needs no
-    /// lock.
     next_local_id: u64,
 
     pub fn open(
@@ -129,9 +88,6 @@ pub const Lmdb = struct {
         return .{ .gpa = gpa, .env = env, .next_local_id = next_local_id };
     }
 
-    /// The `Store` interface over this backend, and the only way above
-    /// `src/storage/` to reach its events
-    /// (docs/adr/0008-store-abstraction-boundary.md).
     pub fn store(self: *Lmdb) Store {
         return .{ .ptr = self, .vtable = &vtable };
     }
@@ -141,9 +97,6 @@ pub const Lmdb = struct {
         self.* = undefined;
     }
 
-    /// Stores `event` at a freshly allocated local id, encoding it through
-    /// `buffer`, and returns that id. The transaction is the caller's so that
-    /// a whole batch commits once (docs/roadmap.md).
     pub fn append(
         self: *Lmdb,
         txn: lmdb.Transaction,
@@ -177,8 +130,6 @@ pub const Lmdb = struct {
         return local_id;
     }
 
-    /// Whether `id` is already stored, which is what tells `put` a `duplicate:`
-    /// from a `stored`.
     pub fn contains(self: *Lmdb, txn: lmdb.Transaction, id: *const [32]u8) Error!bool {
         _ = self;
         const by_id = lmdb.Database.open(txn, by_id_db, .{ .create = true }) catch
@@ -187,8 +138,7 @@ pub const Lmdb = struct {
         return found != null;
     }
 
-    /// Reads the event at `local_id`. Everything but the tag structure aliases
-    /// the memory map, so the result is valid only while `txn` is open.
+    /// The result aliases the memory map and is valid only while `txn` is open.
     pub fn read(
         self: *Lmdb,
         txn: lmdb.Transaction,
@@ -243,7 +193,6 @@ pub const Lmdb = struct {
         return .stored;
     }
 
-    /// The scan is bounded by matches, not yet by candidates examined; `storage.max_scan` arrives with the planner.
     fn query(self: *Lmdb, filters: []const Filter, sink: Sink) (Error || Sink.Abort)!void {
         const remaining = try self.gpa.alloc(u64, filters.len);
         defer self.gpa.free(remaining);
@@ -496,17 +445,12 @@ test "an aborted transaction assigns no id that a later append reuses" {
         txn.abort();
     }
 
-    // The in-memory counter advanced with the append that was rolled back, so
-    // the id it handed out is skipped rather than handed out twice. Skipping is
-    // free; reuse would make the watermark in docs/roadmap.md wrong.
     var backend_after = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
     defer backend_after.close();
 
     try testing.expectEqual(first_local_id, try appendOne(&backend_after, &buffer, &event));
 }
 
-/// Collects what a query emitted, in order. Its slices borrow the store, which
-/// outlives every assertion made against them here.
 const Collector = struct {
     ids: [8][32]u8 = undefined,
     contents: [8][]const u8 = undefined,
@@ -589,9 +533,6 @@ test "events sharing a created_at are ordered by ascending id" {
     try fixture.init();
     defer fixture.deinit();
 
-    // Inserted in an order that is neither the answer nor its reverse, so that
-    // neither insertion order nor local id can be mistaken for the tie-break
-    // docs/protocol.md requires.
     for ([_]Event{
         kindEvent(0xcc, 1700000000, 1),
         kindEvent(0xaa, 1700000000, 1),

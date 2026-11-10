@@ -1,13 +1,3 @@
-//! The on-disk event record.
-//!
-//! Events are stored as a compact binary record rather than as JSON, so that a
-//! read serves an event straight from the page cache: the fixed-size fields sit
-//! at constant offsets, and `content` and every tag field are slices into the
-//! memory map rather than copies. The layout is specified in docs/storage.md.
-//!
-//! Nothing here touches LMDB. The format is the store's, but it is bytes in and
-//! bytes out, which is what makes it testable without an environment.
-
 const std = @import("std");
 const nostr = @import("nostr");
 
@@ -16,15 +6,11 @@ const Tag = nostr.event.Tag;
 
 pub const EncodeError = error{
     BufferTooSmall,
-    /// More tags, or a longer tag field, than the format can address. Inbound
-    /// events are bounded well below this by `limits` in docs/configuration.md;
-    /// reaching it means validation did not run.
     TooLarge,
 };
 
 pub const DecodeError = error{
     OutOfMemory,
-    /// The record is truncated or its lengths do not agree with its size.
     Malformed,
 };
 
@@ -53,7 +39,6 @@ pub fn encodedSize(event: *const Event) EncodeError!usize {
     return size;
 }
 
-/// Writes `event` into `buffer` and returns how many bytes it used.
 pub fn encode(buffer: []u8, event: *const Event) EncodeError!usize {
     const size = try encodedSize(event);
     if (buffer.len < size) return error.BufferTooSmall;
@@ -84,9 +69,7 @@ pub fn encode(buffer: []u8, event: *const Event) EncodeError!usize {
     return cursor;
 }
 
-/// Reads a record back. `content` and every tag field alias `bytes`; only the
-/// slice structure holding the tags is allocated, so the caller's arena bounds
-/// what a query costs while the event bytes stay in the map.
+/// `content` and every tag field alias `bytes`.
 pub fn decode(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!Event {
     if (bytes.len < header_size) return error.Malformed;
 
@@ -273,8 +256,6 @@ test "a record claiming a longer field than it holds is rejected" {
     const buffer = try arena.allocator().alloc(u8, size);
     const written = try encode(buffer, &event);
 
-    // The first tag's first field length sits after the header and the tag's
-    // own field count.
     std.mem.writeInt(u32, buffer[header_size + 2 ..][0..4], 0xffff, .little);
     try testing.expectError(error.Malformed, decode(arena.allocator(), buffer[0..written]));
 }

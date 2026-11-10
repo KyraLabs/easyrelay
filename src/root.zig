@@ -119,8 +119,6 @@ test "liblmdb commits durably and reads back after reopening" {
         try txn.commit();
     }
 
-    // Reopening is the half that matters: it is what Phase 2's first exit
-    // criterion asks of the store.
     const env = try liblmdb.Environment.init(path, .{});
     defer env.deinit();
 
