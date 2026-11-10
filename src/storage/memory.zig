@@ -41,11 +41,18 @@ pub const Memory = struct {
         return self.order.items.len;
     }
 
-    const vtable: Store.VTable = .{ .put = putErased, .query = queryErased };
+    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased };
 
     fn putErased(ptr: *anyopaque, event: *const Event) Error!PutResult {
         const self: *Memory = @ptrCast(@alignCast(ptr));
         return self.put(event);
+    }
+
+    fn putBatchErased(ptr: *anyopaque, events: []const Event, results: []PutResult) Error!void {
+        const self: *Memory = @ptrCast(@alignCast(ptr));
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        for (events, results) |*event, *result| result.* = try self.insert(event);
     }
 
     fn queryErased(ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void {
@@ -56,7 +63,10 @@ pub const Memory = struct {
     fn put(self: *Memory, event: *const Event) Error!PutResult {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
+        return self.insert(event);
+    }
 
+    fn insert(self: *Memory, event: *const Event) Error!PutResult {
         std.debug.assert(kinds.classify(event.kind) != .ephemeral);
         if (self.ids.contains(event.id)) return .duplicate;
 

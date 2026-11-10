@@ -304,11 +304,19 @@ pub const Lmdb = struct {
         };
     }
 
-    const vtable: Store.VTable = .{ .put = putErased, .query = queryErased };
+    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased };
 
     fn putErased(ptr: *anyopaque, event: *const Event) StoreError!PutResult {
         const self: *Lmdb = @ptrCast(@alignCast(ptr));
         return self.put(event) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Backend,
+        };
+    }
+
+    fn putBatchErased(ptr: *anyopaque, events: []const Event, results: []PutResult) StoreError!void {
+        const self: *Lmdb = @ptrCast(@alignCast(ptr));
+        return self.putBatch(events, results) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Backend,
         };
@@ -324,40 +332,45 @@ pub const Lmdb = struct {
     }
 
     fn put(self: *Lmdb, event: *const Event) Error!PutResult {
-        const size = record.encodedSize(event) catch return error.Backend;
-        const buffer = try self.gpa.alloc(u8, size);
-        defer self.gpa.free(buffer);
+        var result: PutResult = undefined;
+        try self.putBatch(event[0..1], (&result)[0..1]);
+        return result;
+    }
+
+    fn putBatch(self: *Lmdb, events: []const Event, results: []PutResult) Error!void {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
 
         const txn = lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite }) catch
             return error.Backend;
         errdefer txn.abort();
-
-        std.debug.assert(kinds.classify(event.kind) != .ephemeral);
-        if (try self.contains(txn, &event.id)) {
-            txn.abort();
-            return .duplicate;
+        for (events, results) |*event, *result| {
+            _ = arena_state.reset(.retain_capacity);
+            result.* = try self.insert(txn, arena_state.allocator(), event);
         }
+        txn.commit() catch return error.Backend;
+    }
+
+    fn insert(self: *Lmdb, txn: lmdb.Transaction, arena: std.mem.Allocator, event: *const Event) Error!PutResult {
+        std.debug.assert(kinds.classify(event.kind) != .ephemeral);
+        if (try self.contains(txn, &event.id)) return .duplicate;
 
         if (Coordinate.of(event)) |coordinate| {
-            var arena = std.heap.ArenaAllocator.init(self.gpa);
-            defer arena.deinit();
             const found = (try database(txn, coordinate.db)).get(coordinate.key()) catch return error.Backend;
             if (found) |value| {
                 if (value.len != 8) return error.Corrupt;
                 const incumbent_id = std.mem.readInt(u64, value[0..8], .big);
-                const incumbent = (try self.read(txn, arena.allocator(), incumbent_id)) orelse return error.Corrupt;
-                if (!kinds.supersedes(event, &incumbent)) {
-                    txn.abort();
-                    return .outdated;
-                }
+                const incumbent = (try self.read(txn, arena, incumbent_id)) orelse return error.Corrupt;
+                if (!kinds.supersedes(event, &incumbent)) return .outdated;
                 try deleteIndexes(txn, &incumbent);
                 const incumbent_key = encodeLocalId(incumbent_id);
                 (try database(txn, events_db)).delete(&incumbent_key) catch return error.Backend;
             }
         }
 
+        const size = record.encodedSize(event) catch return error.Backend;
+        const buffer = try arena.alloc(u8, size);
         _ = try self.append(txn, buffer, event);
-        txn.commit() catch return error.Backend;
         return .stored;
     }
 
@@ -1097,11 +1110,20 @@ test "the LMDB planner agrees with brute force over the memory store" {
         for (&authors, 0..) |*author, position| author.* = [_]u8{@intCast(position + 1)} ** 32;
 
         var published: std.ArrayList(Event) = .empty;
-        for (0..250) |_| {
-            const event = try randomEvent(random, arena, &authors);
-            const expected = try oracle.store().put(&event);
-            try testing.expectEqual(expected, try fixture.backend.store().put(&event));
-            try published.append(arena, event);
+        while (published.items.len < 250) {
+            const batch = try arena.alloc(Event, 1 + random.uintLessThan(usize, 16));
+            for (batch) |*event| {
+                event.* = if (published.items.len != 0 and random.uintLessThan(u8, 10) == 0)
+                    published.items[random.uintLessThan(usize, published.items.len)]
+                else
+                    try randomEvent(random, arena, &authors);
+            }
+            const want = try arena.alloc(PutResult, batch.len);
+            const got = try arena.alloc(PutResult, batch.len);
+            try oracle.store().putBatch(batch, want);
+            try fixture.backend.store().putBatch(batch, got);
+            try testing.expectEqualSlices(PutResult, want, got);
+            try published.appendSlice(arena, batch);
         }
 
         for (0..150) |_| {

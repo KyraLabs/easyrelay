@@ -36,12 +36,19 @@ pub const Store = struct {
 
     pub const VTable = struct {
         put: *const fn (ptr: *anyopaque, event: *const Event) Error!PutResult,
+        putBatch: *const fn (ptr: *anyopaque, events: []const Event, results: []PutResult) Error!void,
         query: *const fn (ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void,
     };
 
     /// Ephemeral events must not be passed; they are never stored.
     pub fn put(self: Store, event: *const Event) Error!PutResult {
         return self.vtable.put(self.ptr, event);
+    }
+
+    /// Stores `events` in one transaction; on error none of them is stored.
+    pub fn putBatch(self: Store, events: []const Event, results: []PutResult) Error!void {
+        std.debug.assert(events.len == results.len);
+        return self.vtable.putBatch(self.ptr, events, results);
     }
 
     /// Union of each filter's `limit` newest matches, newest first; a null `limit` is unbounded.
@@ -58,7 +65,7 @@ const StubStore = struct {
     events: []const Event = &.{},
     last_filters: []const Filter = &.{},
 
-    const vtable: Store.VTable = .{ .put = put, .query = query };
+    const vtable: Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query };
 
     fn store(self: *StubStore) Store {
         return .{ .ptr = self, .vtable = &vtable };
@@ -68,6 +75,10 @@ const StubStore = struct {
         const self: *StubStore = @ptrCast(@alignCast(ptr));
         self.last_put = event;
         return self.put_result;
+    }
+
+    fn putBatch(ptr: *anyopaque, events: []const Event, results: []PutResult) Error!void {
+        for (events, results) |*event, *result| result.* = try put(ptr, event);
     }
 
     fn query(ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void {

@@ -683,7 +683,7 @@ const FailingStore = struct {
     put_error: ?store.Error = null,
     query_error: ?store.Error = null,
 
-    const vtable: store.Store.VTable = .{ .put = put, .query = query };
+    const vtable: store.Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query };
 
     fn interface(self: *FailingStore) store.Store {
         return .{ .ptr = self, .vtable = &vtable };
@@ -694,6 +694,10 @@ const FailingStore = struct {
         _ = event;
         if (self.put_error) |failure| return failure;
         return .stored;
+    }
+
+    fn putBatch(ptr: *anyopaque, events: []const Event, results: []store.PutResult) store.Error!void {
+        for (events, results) |*event, *result| result.* = try put(ptr, event);
     }
 
     fn query(ptr: *anyopaque, filters: []const nostr.filter.Filter, sink: store.Sink) store.QueryError!void {
