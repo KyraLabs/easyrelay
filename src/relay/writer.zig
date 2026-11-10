@@ -59,8 +59,10 @@ pub const Writer = struct {
     len: usize = 0,
     stopping: bool = false,
     thread: ?std.Thread = null,
+    batch_jobs: []*Job,
     batch_events: []Event,
     batch_results: []PutResult,
+    batch_local_ids: []u64,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, backend: store.Store, connections: *hub.Hub, depth: usize) !Writer {
         std.debug.assert(depth > 0);
@@ -69,19 +71,27 @@ pub const Writer = struct {
         const batch_events = try gpa.alloc(Event, max_batch);
         errdefer gpa.free(batch_events);
         const batch_results = try gpa.alloc(PutResult, max_batch);
+        errdefer gpa.free(batch_results);
+        const batch_local_ids = try gpa.alloc(u64, max_batch);
+        errdefer gpa.free(batch_local_ids);
+        const batch_jobs = try gpa.alloc(*Job, max_batch);
         return .{
             .gpa = gpa,
             .io = io,
             .store = backend,
             .hub = connections,
             .queue = queue,
+            .batch_jobs = batch_jobs,
             .batch_events = batch_events,
             .batch_results = batch_results,
+            .batch_local_ids = batch_local_ids,
         };
     }
 
     pub fn deinit(self: *Writer) void {
         std.debug.assert(self.thread == null and self.len == 0);
+        self.gpa.free(self.batch_jobs);
+        self.gpa.free(self.batch_local_ids);
         self.gpa.free(self.batch_results);
         self.gpa.free(self.batch_events);
         self.gpa.free(self.queue);
@@ -123,12 +133,10 @@ pub const Writer = struct {
     }
 
     fn run(self: *Writer) void {
-        const jobs = self.gpa.alloc(*Job, max_batch) catch @panic("writer could not allocate its batch");
-        defer self.gpa.free(jobs);
         while (true) {
-            const taken = self.take(jobs);
+            const taken = self.take(self.batch_jobs);
             if (taken == 0) return;
-            self.commit(jobs[0..taken]);
+            self.commit(self.batch_jobs[0..taken]);
         }
     }
 
@@ -148,21 +156,22 @@ pub const Writer = struct {
     fn commit(self: *Writer, jobs: []*Job) void {
         const events = self.batch_events[0..jobs.len];
         const results = self.batch_results[0..jobs.len];
+        const local_ids = self.batch_local_ids[0..jobs.len];
         for (jobs, events) |job, *event| event.* = job.event;
 
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
 
-        const outcome = self.store.putBatch(events, results);
-        for (jobs, results) |job, result| {
+        const outcome = self.store.putBatch(events, results, local_ids);
+        for (jobs, results, local_ids) |job, result, local_id| {
             defer {
                 job.arena.deinit();
                 self.gpa.destroy(job);
             }
             _ = arena_state.reset(.retain_capacity);
             const answer = if (outcome) |_| answer: {
-                if (result == .stored) self.hub.broadcast(arena, &job.event);
+                if (result == .stored) self.hub.broadcast(arena, &job.event, local_id);
                 break :answer ok(job.event.id, result);
             } else |err| failure(job.event.id, err);
             self.send(arena, job.reply, answer);

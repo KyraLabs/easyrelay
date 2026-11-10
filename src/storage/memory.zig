@@ -19,6 +19,9 @@ pub const Memory = struct {
     lock: std.Io.RwLock = .init,
     order: std.ArrayList(Event),
     ids: std.AutoHashMapUnmanaged([32]u8, void),
+    /// Parallel to `order`.
+    locals: std.ArrayList(u64) = .empty,
+    next_local_id: u64 = 1,
     deleted_ids: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
     deleted_addresses: std.ArrayList(DeletedAddress) = .empty,
 
@@ -32,6 +35,7 @@ pub const Memory = struct {
         for (self.order.items) |event| freeEvent(self.gpa, event);
         self.order.deinit(self.gpa);
         self.ids.deinit(self.gpa);
+        self.locals.deinit(self.gpa);
         self.deleted_ids.deinit(self.gpa);
         for (self.deleted_addresses.items) |deleted| self.gpa.free(deleted.address.d);
         self.deleted_addresses.deinit(self.gpa);
@@ -55,12 +59,79 @@ pub const Memory = struct {
         return self.put(event);
     }
 
-    fn putBatchErased(ptr: *anyopaque, events: []const Event, results: []PutResult) Error!void {
+    fn putBatchErased(ptr: *anyopaque, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void {
         const self: *Memory = @ptrCast(@alignCast(ptr));
+        return self.putBatch(events, results, local_ids);
+    }
+
+    /// Everything a batch can allocate is allocated before the first change, so an error leaves
+    /// the store as it was.
+    fn putBatch(self: *Memory, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
-        for (events, results) |*event, *result| result.* = try self.insert(event);
+
+        var reserved: Reserved = .{};
+        defer reserved.deinit(self.gpa);
+        try reserved.reserve(self, events);
+        for (events, results, 0..) |*event, *result, position| {
+            const allocated = self.next_local_id;
+            result.* = self.insert(event, &reserved, position);
+            if (local_ids) |ids| ids[position] = if (result.* == .stored) allocated else 0;
+        }
     }
+
+    const Reserved = struct {
+        copies: []?Event = &.{},
+        /// One owned `d` per address target, in tag order, across the whole batch.
+        d_values: []?[]u8 = &.{},
+        /// Index of each event's first entry in `d_values`.
+        d_start: []usize = &.{},
+
+        fn reserve(self: *Reserved, memory: *Memory, events: []const Event) Error!void {
+            const gpa = memory.gpa;
+            var id_targets: usize = 0;
+            var address_targets: usize = 0;
+            for (events) |*event| {
+                if (event.kind != kinds.deletion) continue;
+                for (event.tags) |tag| switch (kinds.Target.of(tag) orelse continue) {
+                    .id => id_targets += 1,
+                    .address => address_targets += 1,
+                };
+            }
+            try memory.order.ensureUnusedCapacity(gpa, events.len);
+            try memory.locals.ensureUnusedCapacity(gpa, events.len);
+            try memory.ids.ensureUnusedCapacity(gpa, @intCast(events.len));
+            try memory.deleted_ids.ensureUnusedCapacity(gpa, @intCast(id_targets));
+            try memory.deleted_addresses.ensureUnusedCapacity(gpa, address_targets);
+
+            self.copies = try gpa.alloc(?Event, events.len);
+            @memset(self.copies, null);
+            self.d_values = try gpa.alloc(?[]u8, address_targets);
+            @memset(self.d_values, null);
+            self.d_start = try gpa.alloc(usize, events.len);
+            var next_d: usize = 0;
+            for (events, self.copies, self.d_start) |*event, *copy, *start| {
+                copy.* = try dupeEvent(gpa, event);
+                start.* = next_d;
+                if (event.kind != kinds.deletion) continue;
+                for (event.tags) |tag| switch (kinds.Target.of(tag) orelse continue) {
+                    .id => {},
+                    .address => |address| {
+                        self.d_values[next_d] = try gpa.dupe(u8, address.d);
+                        next_d += 1;
+                    },
+                };
+            }
+        }
+
+        fn deinit(self: *Reserved, gpa: std.mem.Allocator) void {
+            for (self.copies) |copy| if (copy) |event| freeEvent(gpa, event);
+            for (self.d_values) |value| if (value) |d| gpa.free(d);
+            gpa.free(self.copies);
+            gpa.free(self.d_values);
+            gpa.free(self.d_start);
+        }
+    };
 
     fn queryErased(ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void {
         const self: *Memory = @ptrCast(@alignCast(ptr));
@@ -68,12 +139,12 @@ pub const Memory = struct {
     }
 
     fn put(self: *Memory, event: *const Event) Error!PutResult {
-        self.lock.lockUncancelable(self.io);
-        defer self.lock.unlock(self.io);
-        return self.insert(event);
+        var result: PutResult = undefined;
+        try self.putBatch(event[0..1], (&result)[0..1], null);
+        return result;
     }
 
-    fn insert(self: *Memory, event: *const Event) Error!PutResult {
+    fn insert(self: *Memory, event: *const Event, reserved: *Reserved, position_in_batch: usize) PutResult {
         std.debug.assert(kinds.classify(event.kind) != .ephemeral);
         if (self.ids.contains(event.id)) return .duplicate;
         if (self.deleted_ids.contains(event.id)) return .deleted;
@@ -86,33 +157,33 @@ pub const Memory = struct {
             if (!kinds.supersedes(event, &self.order.items[index])) return .outdated;
         }
 
-        try self.order.ensureUnusedCapacity(self.gpa, 1);
-        try self.ids.ensureUnusedCapacity(self.gpa, 1);
-
-        const owned = try dupeEvent(self.gpa, event);
-        if (incumbent) |index| {
-            const superseded = self.order.orderedRemove(index);
-            std.debug.assert(self.ids.remove(superseded.id));
-            freeEvent(self.gpa, superseded);
-        }
-        self.order.insertAssumeCapacity(self.insertionIndex(event), owned);
+        const owned = reserved.copies[position_in_batch].?;
+        reserved.copies[position_in_batch] = null;
+        if (incumbent) |index| self.remove(index);
+        const position = self.insertionIndex(event);
+        self.order.insertAssumeCapacity(position, owned);
+        self.locals.insertAssumeCapacity(position, self.next_local_id);
+        self.next_local_id += 1;
         self.ids.putAssumeCapacityNoClobber(owned.id, {});
 
         std.debug.assert(self.order.items.len == self.ids.count());
-        if (event.kind == kinds.deletion) try self.applyDeletion(event);
+        if (event.kind == kinds.deletion) self.applyDeletion(event, reserved.d_values[reserved.d_start[position_in_batch]..]);
         return .stored;
     }
 
-    fn applyDeletion(self: *Memory, request: *const Event) Error!void {
+    fn applyDeletion(self: *Memory, request: *const Event, d_values: []?[]u8) void {
+        var next_d: usize = 0;
         for (request.tags) |tag| switch (kinds.Target.of(tag) orelse continue) {
             .id => |id| {
                 const position = self.indexOfId(&id) orelse continue;
                 const target = &self.order.items[position];
                 if (target.kind == kinds.deletion or !std.mem.eql(u8, &target.pubkey, &request.pubkey)) continue;
-                try self.deleted_ids.put(self.gpa, id, {});
+                self.deleted_ids.putAssumeCapacity(id, {});
                 self.remove(position);
             },
             .address => |address| {
+                const owned_d = &d_values[next_d];
+                next_d += 1;
                 if (!std.mem.eql(u8, &address.pubkey, &request.pubkey)) continue;
                 var position: usize = 0;
                 while (position < self.order.items.len) {
@@ -121,12 +192,12 @@ pub const Memory = struct {
                         self.remove(position);
                     } else position += 1;
                 }
-                try self.recordDeletedAddress(address, request.created_at);
+                self.recordDeletedAddress(address, owned_d, request.created_at);
             },
         };
     }
 
-    fn recordDeletedAddress(self: *Memory, address: kinds.Address, until: i64) Error!void {
+    fn recordDeletedAddress(self: *Memory, address: kinds.Address, owned_d: *?[]u8, until: i64) void {
         for (self.deleted_addresses.items) |*deleted| {
             if (deleted.address.kind == address.kind and
                 std.mem.eql(u8, &deleted.address.pubkey, &address.pubkey) and
@@ -137,9 +208,9 @@ pub const Memory = struct {
             }
         }
         var owned = address;
-        owned.d = try self.gpa.dupe(u8, address.d);
-        errdefer self.gpa.free(owned.d);
-        try self.deleted_addresses.append(self.gpa, .{ .address = owned, .until = until });
+        owned.d = owned_d.*.?;
+        owned_d.* = null;
+        self.deleted_addresses.appendAssumeCapacity(.{ .address = owned, .until = until });
     }
 
     fn indexOfId(self: Memory, id: *const [32]u8) ?usize {
@@ -151,6 +222,7 @@ pub const Memory = struct {
     }
 
     fn remove(self: *Memory, position: usize) void {
+        _ = self.locals.orderedRemove(position);
         const removed = self.order.orderedRemove(position);
         std.debug.assert(self.ids.remove(removed.id));
         freeEvent(self.gpa, removed);
@@ -172,6 +244,7 @@ pub const Memory = struct {
         {
             self.lock.lockSharedUncancelable(self.io);
             defer self.lock.unlockShared(self.io);
+            if (sink.watermark) |watermark| watermark.* = self.next_local_id - 1;
 
             for (self.order.items) |event| {
                 if (open == 0) break;
@@ -613,4 +686,46 @@ test "a replaceable event supersedes the stored one and an older one is outdated
     var collector: Collector = .{};
     try memory.store().query(&.{.{}}, collector.sink());
     try testing.expectEqual(@as(u8, 2), collector.idAt(0));
+}
+
+test "a batch that fails to allocate leaves the store exactly as it was" {
+    const target_hex = "01" ** 32;
+    const address = "30000:" ++ "ab" ** 32 ++ ":slot";
+    const deletion_tags = [_]Tag{ &.{ "e", target_hex }, &.{ "a", address } };
+    var deletion = testEvent(5, 1700000300, kinds.deletion);
+    deletion.tags = &deletion_tags;
+    const batch = [_]Event{
+        testEvent(3, 1700000200, 1),
+        testEvent(4, 1700000250, 0),
+        deletion,
+    };
+
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{});
+        var memory = Memory.init(failing.allocator(), testing.io);
+        defer memory.deinit();
+        _ = try memory.store().put(&testEvent(1, 1700000000, 1));
+        _ = try memory.store().put(&testEvent(2, 1700000100, 0));
+
+        failing.fail_index = failing.alloc_index + fail_index;
+        var results: [batch.len]PutResult = undefined;
+        memory.store().putBatch(&batch, &results, null) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            failing.fail_index = std.math.maxInt(usize);
+            var collector: Collector = .{};
+            try memory.store().query(&.{.{}}, collector.sink());
+            try testing.expectEqual(@as(usize, 2), collector.len);
+            try testing.expectEqual(@as(u8, 2), collector.idAt(0));
+            try testing.expectEqual(@as(u8, 1), collector.idAt(1));
+            try testing.expectEqual(@as(usize, 0), memory.deleted_ids.count());
+            try testing.expectEqual(@as(usize, 0), memory.deleted_addresses.items.len);
+            continue;
+        };
+        try testing.expectEqual([_]PutResult{ .stored, .stored, .stored }, results);
+        try testing.expectEqual(@as(usize, 3), memory.count());
+        try testing.expectEqual(@as(usize, 1), memory.deleted_addresses.items.len);
+        break;
+    }
+    try testing.expect(fail_index > 0);
 }

@@ -24,6 +24,8 @@ pub const PutResult = enum {
 pub const Sink = struct {
     ptr: *anyopaque,
     emitFn: *const fn (ptr: *anyopaque, event: *const Event) Abort!void,
+    /// Receives the newest local id the query's snapshot could see; a live event at or below it was already visible.
+    watermark: ?*u64 = null,
 
     pub const Abort = error{Abort};
 
@@ -38,7 +40,7 @@ pub const Store = struct {
 
     pub const VTable = struct {
         put: *const fn (ptr: *anyopaque, event: *const Event) Error!PutResult,
-        putBatch: *const fn (ptr: *anyopaque, events: []const Event, results: []PutResult) Error!void,
+        putBatch: *const fn (ptr: *anyopaque, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void,
         query: *const fn (ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void,
     };
 
@@ -48,9 +50,11 @@ pub const Store = struct {
     }
 
     /// Stores `events` in one transaction; on error none of them is stored.
-    pub fn putBatch(self: Store, events: []const Event, results: []PutResult) Error!void {
+    /// `local_ids`, when given, receives the local id of each stored event.
+    pub fn putBatch(self: Store, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void {
         std.debug.assert(events.len == results.len);
-        return self.vtable.putBatch(self.ptr, events, results);
+        if (local_ids) |ids| std.debug.assert(ids.len == events.len);
+        return self.vtable.putBatch(self.ptr, events, results, local_ids);
     }
 
     /// Union of each filter's `limit` newest matches, newest first; a null `limit` is unbounded.
@@ -79,7 +83,8 @@ const StubStore = struct {
         return self.put_result;
     }
 
-    fn putBatch(ptr: *anyopaque, events: []const Event, results: []PutResult) Error!void {
+    fn putBatch(ptr: *anyopaque, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void {
+        _ = local_ids;
         for (events, results) |*event, *result| result.* = try put(ptr, event);
     }
 

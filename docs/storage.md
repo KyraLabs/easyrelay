@@ -33,9 +33,13 @@ watermark holds until its stored phase has read anything. The next id to hand ou
 `meta` database beside the indexes rather than being re-derived at startup from the newest
 surviving key, because deleting the newest event must not put its id back into circulation.
 
-An id allocated by a transaction that then aborts is skipped, never reissued. Skipping costs
-nothing. Reissuing would let a live event arrive at or below a watermark that had already passed
-it, and the subscription would drop the event it was waiting for.
+The counter is read and advanced inside each write transaction, never cached in the process, so
+it commits or rolls back with the events it numbered. An id allocated by a transaction that then
+aborts is therefore handed out again by the next one. That is safe because nothing outside the
+transaction ever saw it: a watermark is read from a committed snapshot, and an event is
+broadcast only after its batch commits. What must never happen is a committed id being reissued,
+which would let a live event arrive at or below a watermark that had already passed it, and the
+subscription would drop the event it was waiting for.
 
 ### The event record
 

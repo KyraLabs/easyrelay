@@ -85,6 +85,25 @@ fn database(txn: lmdb.Transaction, name: [*:0]const u8) Error!lmdb.Database {
     return lmdb.Database.open(txn, name, .{ .create = true }) catch error.Backend;
 }
 
+/// Read inside the transaction, so a second process writing the same environment cannot reuse an id.
+fn nextLocalId(txn: lmdb.Transaction) Error!u64 {
+    const meta = lmdb.Database.open(txn, meta_db, .{}) catch return error.Backend;
+    const value = (meta.get(next_local_id_key) catch return error.Backend) orelse return first_local_id;
+    if (value.len != 8) return error.Corrupt;
+    const next = std.mem.readInt(u64, value[0..8], .big);
+    if (next < first_local_id) return error.Corrupt;
+    return next;
+}
+
+fn snapshotWatermark(txn: lmdb.Transaction) Error!u64 {
+    return try nextLocalId(txn) - 1;
+}
+
+/// A failed commit has already freed the transaction, so it must not be aborted again.
+fn commit(txn: lmdb.Transaction) Error!void {
+    txn.commit() catch return error.Backend;
+}
+
 fn deletedUntil(txn: lmdb.Transaction, coordinate: *const Coordinate) Error!?i64 {
     const value = ((try database(txn, deleted_address_db)).get(coordinate.key()) catch return error.Backend) orelse return null;
     if (value.len != 8) return error.Corrupt;
@@ -240,7 +259,6 @@ const Choice = union(enum) {
 pub const Lmdb = struct {
     gpa: std.mem.Allocator,
     env: lmdb.Environment,
-    next_local_id: u64,
     max_scan: usize,
 
     pub fn open(
@@ -261,8 +279,8 @@ pub const Lmdb = struct {
         }) catch return error.Backend;
         errdefer env.deinit();
 
-        const next_local_id = readNextLocalId(env) catch return error.Backend;
-        return .{ .gpa = gpa, .env = env, .next_local_id = next_local_id, .max_scan = options.max_scan };
+        createTables(env) catch return error.Backend;
+        return .{ .gpa = gpa, .env = env, .max_scan = options.max_scan };
     }
 
     pub fn store(self: *Lmdb) Store {
@@ -282,7 +300,8 @@ pub const Lmdb = struct {
     ) Error!u64 {
         const size = record.encode(buffer, event) catch return error.Backend;
 
-        const local_id = self.next_local_id;
+        _ = self;
+        const local_id = try nextLocalId(txn);
         const key = encodeLocalId(local_id);
 
         (try database(txn, events_db)).set(&key, buffer[0..size]) catch return error.Backend;
@@ -292,8 +311,6 @@ pub const Lmdb = struct {
             return error.Backend;
         const next = encodeLocalId(local_id + 1);
         meta.set(next_local_id_key, &next) catch return error.Backend;
-
-        self.next_local_id = local_id + 1;
         return local_id;
     }
 
@@ -332,9 +349,9 @@ pub const Lmdb = struct {
         };
     }
 
-    fn putBatchErased(ptr: *anyopaque, events: []const Event, results: []PutResult) StoreError!void {
+    fn putBatchErased(ptr: *anyopaque, events: []const Event, results: []PutResult, local_ids: ?[]u64) StoreError!void {
         const self: *Lmdb = @ptrCast(@alignCast(ptr));
-        return self.putBatch(events, results) catch |err| switch (err) {
+        return self.putBatch(events, results, local_ids) catch |err| switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.Backend,
         };
@@ -351,22 +368,26 @@ pub const Lmdb = struct {
 
     fn put(self: *Lmdb, event: *const Event) Error!PutResult {
         var result: PutResult = undefined;
-        try self.putBatch(event[0..1], (&result)[0..1]);
+        try self.putBatch(event[0..1], (&result)[0..1], null);
         return result;
     }
 
-    fn putBatch(self: *Lmdb, events: []const Event, results: []PutResult) Error!void {
+    fn putBatch(self: *Lmdb, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
 
         const txn = lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite }) catch
             return error.Backend;
-        errdefer txn.abort();
-        for (events, results) |*event, *result| {
-            _ = arena_state.reset(.retain_capacity);
-            result.* = try self.insert(txn, arena_state.allocator(), event);
+        {
+            errdefer txn.abort();
+            for (events, results, 0..) |*event, *result, position| {
+                _ = arena_state.reset(.retain_capacity);
+                const allocated = try nextLocalId(txn);
+                result.* = try self.insert(txn, arena_state.allocator(), event);
+                if (local_ids) |ids| ids[position] = if (result.* == .stored) allocated else 0;
+            }
         }
-        txn.commit() catch return error.Backend;
+        try commit(txn);
     }
 
     fn insert(self: *Lmdb, txn: lmdb.Transaction, arena: std.mem.Allocator, event: *const Event) Error!PutResult {
@@ -439,11 +460,12 @@ pub const Lmdb = struct {
             left.* = filter.limit orelse std.math.maxInt(u64);
             if (left.* != 0) pending += 1;
         }
-        if (pending == 0) return;
-
         const txn = lmdb.Transaction.init(self.env, .{ .mode = .ReadOnly }) catch
             return error.Backend;
         defer txn.abort();
+
+        if (sink.watermark) |watermark| watermark.* = try snapshotWatermark(txn);
+        if (pending == 0) return;
 
         var sources: std.ArrayList(Source) = .empty;
         defer for (sources.items) |*source| source.deinit();
@@ -533,24 +555,17 @@ pub const Lmdb = struct {
 };
 
 /// Creates every table, because a read-only transaction cannot.
-fn readNextLocalId(env: lmdb.Environment) !u64 {
+fn createTables(env: lmdb.Environment) !void {
     const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
-    errdefer txn.abort();
-
-    const meta = try lmdb.Database.open(txn, meta_db, .{ .create = true });
-    for ([_][*:0]const u8{ events_db, by_id_db, by_replaceable_db, by_address_db, deleted_db, deleted_address_db }) |name| {
-        _ = try lmdb.Database.open(txn, name, .{ .create = true });
+    {
+        errdefer txn.abort();
+        for ([_][*:0]const u8{ meta_db, events_db, by_id_db, by_replaceable_db, by_address_db, deleted_db, deleted_address_db }) |name| {
+            _ = try lmdb.Database.open(txn, name, .{ .create = true });
+        }
+        for (std.enums.values(index.Index)) |which| _ = try lmdb.Database.open(txn, which.name(), .{ .create = true });
+        _ = try nextLocalId(txn);
     }
-    for (std.enums.values(index.Index)) |which| _ = try lmdb.Database.open(txn, which.name(), .{ .create = true });
-
-    const stored = try meta.get(next_local_id_key);
-    const next = if (stored) |bytes| blk: {
-        if (bytes.len != 8) return error.Corrupt;
-        break :blk std.mem.readInt(u64, bytes[0..8], .big);
-    } else first_local_id;
-
-    try txn.commit();
-    return next;
+    try commit(txn);
 }
 
 const testing = std.testing;
@@ -589,8 +604,10 @@ test "open twice over the same directory reaches the same environment" {
         defer backend.close();
 
         const txn = try lmdb.Transaction.init(backend.env, .{ .mode = .ReadWrite });
-        errdefer txn.abort();
-        try txn.set("k", "v");
+        txn.set("k", "v") catch |err| {
+            txn.abort();
+            return err;
+        };
         try txn.commit();
     }
 
@@ -629,8 +646,10 @@ fn testEvent(id_byte: u8, created_at: i64) Event {
 
 fn appendOne(backend: *Lmdb, buffer: []u8, event: *const Event) !u64 {
     const txn = try lmdb.Transaction.init(backend.env, .{ .mode = .ReadWrite });
-    errdefer txn.abort();
-    const local_id = try backend.append(txn, buffer, event);
+    const local_id = backend.append(txn, buffer, event) catch |err| {
+        txn.abort();
+        return err;
+    };
     try txn.commit();
     return local_id;
 }
@@ -1202,9 +1221,12 @@ test "the LMDB planner agrees with brute force over the memory store" {
             }
             const want = try arena.alloc(PutResult, batch.len);
             const got = try arena.alloc(PutResult, batch.len);
-            try oracle.store().putBatch(batch, want);
-            try fixture.backend.store().putBatch(batch, got);
+            const want_ids = try arena.alloc(u64, batch.len);
+            const got_ids = try arena.alloc(u64, batch.len);
+            try oracle.store().putBatch(batch, want, want_ids);
+            try fixture.backend.store().putBatch(batch, got, got_ids);
             try testing.expectEqualSlices(PutResult, want, got);
+            try testing.expectEqualSlices(u64, want_ids, got_ids);
             try published.appendSlice(arena, batch);
         }
 
@@ -1213,10 +1235,17 @@ test "the LMDB planner agrees with brute force over the memory store" {
             for (filters) |*filter| filter.* = try randomFilter(random, arena, &authors, published.items);
 
             var want: IdCollector = .{ .gpa = arena };
-            try oracle.store().query(filters, want.sink());
+            var want_watermark: u64 = 0;
+            var want_sink = want.sink();
+            want_sink.watermark = &want_watermark;
+            try oracle.store().query(filters, want_sink);
             var got: IdCollector = .{ .gpa = arena };
-            try fixture.backend.store().query(filters, got.sink());
+            var got_watermark: u64 = 0;
+            var got_sink = got.sink();
+            got_sink.watermark = &got_watermark;
+            try fixture.backend.store().query(filters, got_sink);
             try testing.expectEqualSlices([32]u8, want.ids.items, got.ids.items);
+            try testing.expectEqual(want_watermark, got_watermark);
         }
     }
 }
@@ -1261,6 +1290,26 @@ test "a deletion holds across a restart" {
     try testing.expectEqual(PutResult.deleted, try backend.store().put(&note));
 }
 
+test "the watermark is the newest local id a query's snapshot holds" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    var watermark: u64 = 99;
+    var collector: Collector = .{};
+    var sink = collector.sink();
+    sink.watermark = &watermark;
+    try fixture.backend.store().query(&.{.{}}, sink);
+    try testing.expectEqual(@as(u64, 0), watermark);
+
+    for ([_]u8{ 1, 2, 3 }) |id_byte| {
+        const event = kindEvent(id_byte, 1700000000, 1);
+        _ = try fixture.backend.store().put(&event);
+    }
+    try fixture.backend.store().query(&.{.{ .limit = 0 }}, sink);
+    try testing.expectEqual(@as(u64, 3), watermark);
+}
+
 test "a query on a store that has never been written answers nothing" {
     var fixture: Fixture = undefined;
     try fixture.init();
@@ -1269,4 +1318,96 @@ test "a query on a store that has never been written answers nothing" {
     var collector: Collector = .{};
     try fixture.backend.store().query(&.{ .{}, .{ .kinds = &.{1} }, .{ .authors = &.{[_]u8{1} ** 32} } }, collector.sink());
     try testing.expectEqual(@as(usize, 0), collector.len);
+}
+
+test "two handles on one environment never reuse a local id" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+
+    var first = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+    defer first.close();
+    var second = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+    defer second.close();
+
+    for (0..3) |round| {
+        const base: u8 = @intCast(round * 2 + 1);
+        const at: i64 = 1700000000 + @as(i64, base);
+        try testing.expectEqual(PutResult.stored, try first.store().put(&kindEvent(base, at, 1)));
+        try testing.expectEqual(PutResult.stored, try second.store().put(&kindEvent(base + 1, at + 1, 1)));
+    }
+
+    var collector: Collector = .{};
+    try first.store().query(&.{.{}}, collector.sink());
+    try testing.expectEqual(@as(usize, 6), collector.len);
+    for (0..6) |position| try testing.expectEqual(@as(u8, @intCast(6 - position)), collector.idAt(position));
+}
+
+test "an ids query reads each event once, however often its id repeats" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+    defer backend.close();
+
+    var tags: [2000]nostr.event.Tag = undefined;
+    for (&tags) |*tag| tag.* = &.{ "t", "x" };
+    var note = kindEvent(1, 1700000000, 1);
+    note.tags = &tags;
+    _ = try backend.store().put(&note);
+
+    var ids: [1000][32]u8 = undefined;
+    for (&ids) |*id| id.* = note.id;
+    var measured = testing.FailingAllocator.init(testing.allocator, .{});
+    backend.gpa = measured.allocator();
+    defer backend.gpa = testing.allocator;
+    var collector: Collector = .{};
+    try backend.store().query(&.{.{ .ids = &ids, .limit = 1 }}, collector.sink());
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    try testing.expect(measured.allocated_bytes < 1024 * 1024);
+}
+
+test "a commit the disk refuses leaves the store answering, not crashing" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+    defer backend.close();
+
+    const ignore: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    var previous_action: std.posix.Sigaction = undefined;
+    std.posix.sigaction(.XFSZ, &ignore, &previous_action);
+    defer std.posix.sigaction(.XFSZ, &previous_action, null);
+    const previous_limit = try std.posix.getrlimit(.FSIZE);
+    try std.posix.setrlimit(.FSIZE, .{ .cur = 128 * 1024, .max = previous_limit.max });
+    var limited = true;
+    defer if (limited) std.posix.setrlimit(.FSIZE, previous_limit) catch {};
+
+    const content = "z" ** 4096;
+    var refused: usize = 0;
+    var id: u8 = 1;
+    while (id < 200 and refused < 5) : (id += 1) {
+        var event = kindEvent(id, 1700000000 + @as(i64, id), 1);
+        event.content = content;
+        _ = backend.store().put(&event) catch {
+            refused += 1;
+        };
+    }
+    try testing.expectEqual(@as(usize, 5), refused);
+
+    try std.posix.setrlimit(.FSIZE, previous_limit);
+    limited = false;
+    for (0..20) |_| {
+        var event = kindEvent(id, 1700000000 + @as(i64, id), 1);
+        event.content = content;
+        try testing.expectEqual(PutResult.stored, try backend.store().put(&event));
+        id += 1;
+    }
+    var collector: Collector = .{ .stop_after = 1 };
+    try testing.expectError(error.Abort, backend.store().query(&.{.{}}, collector.sink()));
+    try testing.expectEqual(id - 1, collector.idAt(0));
 }

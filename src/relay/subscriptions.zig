@@ -13,6 +13,8 @@ pub const Limits = struct {
 pub const Subscription = struct {
     id: []const u8,
     filters: []const Filter,
+    /// Live events at or below this local id were visible to the stored phase.
+    watermark: u64 = 0,
     arena: std.heap.ArenaAllocator,
 };
 
@@ -42,6 +44,11 @@ pub const Registry = struct {
 
     pub fn items(self: Registry) []const Subscription {
         return self.entries.items;
+    }
+
+    pub fn setWatermark(self: *Registry, id: []const u8, watermark: u64) void {
+        const index = self.indexOf(id) orelse return;
+        self.entries.items[index].watermark = watermark;
     }
 
     pub fn find(self: Registry, id: []const u8) ?*const Subscription {

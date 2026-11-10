@@ -123,7 +123,7 @@ pub const Session = struct {
         };
 
         if (kinds.classify(event.kind) == .ephemeral) {
-            self.shared.hub.broadcast(context.arena, &event);
+            self.shared.hub.broadcast(context.arena, &event, null);
             return self.sendOk(.{ .event_id = event.id, .accepted = true });
         }
 
@@ -144,8 +144,11 @@ pub const Session = struct {
             return;
         }
 
-        const result = self.shared.store.put(&event) catch |err| return self.sendOk(write_queue.failure(event.id, err));
-        if (result == .stored) self.shared.hub.broadcast(context.arena, &event);
+        var result: store.PutResult = undefined;
+        var local_id: u64 = 0;
+        self.shared.store.putBatch((&event)[0..1], (&result)[0..1], (&local_id)[0..1]) catch |err|
+            return self.sendOk(write_queue.failure(event.id, err));
+        if (result == .stored) self.shared.hub.broadcast(context.arena, &event, local_id);
         return self.sendOk(write_queue.ok(event.id, result));
     }
 
@@ -182,7 +185,10 @@ pub const Session = struct {
             );
         };
 
-        self.shared.store.query(bounded, sink.sink()) catch |err| switch (err) {
+        var watermark: u64 = 0;
+        var store_sink = sink.sink();
+        store_sink.watermark = &watermark;
+        self.shared.store.query(bounded, store_sink) catch |err| switch (err) {
             error.Abort => return sink.failure orelse error.WriteFailed,
             error.OutOfMemory, error.Backend => {
                 _ = self.subscriber.registry.close(req.subscription_id);
@@ -194,6 +200,7 @@ pub const Session = struct {
             },
         };
 
+        self.subscriber.registry.setWatermark(req.subscription_id, watermark);
         try self.sendEose(req.subscription_id);
     }
 
@@ -686,7 +693,8 @@ const FailingStore = struct {
         return .stored;
     }
 
-    fn putBatch(ptr: *anyopaque, events: []const Event, results: []store.PutResult) store.Error!void {
+    fn putBatch(ptr: *anyopaque, events: []const Event, results: []store.PutResult, local_ids: ?[]u64) store.Error!void {
+        _ = local_ids;
         for (events, results) |*event, *result| result.* = try put(ptr, event);
     }
 
@@ -747,4 +755,25 @@ test "an event the write queue cannot take is refused with rate-limited" {
 
     try harness.handle(try harness.eventMessage(try harness.signedEvent("refused")));
     try testing.expect(std.mem.indexOf(u8, harness.recorder.only(), ",false,\"rate-limited: the write queue is full\"]") != null);
+}
+
+test "an event the stored phase already sent is not delivered live as well" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"before\",{}]");
+    const event = try harness.signedEvent("raced");
+    var result: store.PutResult = undefined;
+    var local_id: u64 = 0;
+    try harness.shared.store.putBatch((&event)[0..1], (&result)[0..1], (&local_id)[0..1]);
+    try testing.expectEqual(store.PutResult.stored, result);
+
+    harness.recorder.clear();
+    try harness.handle("[\"REQ\",\"after\",{}]");
+    try testing.expectEqual(@as(usize, 2), harness.recorder.messages.items.len);
+
+    harness.shared.hub.broadcast(harness.arena(), &event, local_id);
+    try testing.expectEqual(@as(usize, 1), harness.delivered.items.len);
+    try testing.expect(std.mem.startsWith(u8, harness.delivered.items[0], "[\"EVENT\",\"before\","));
 }

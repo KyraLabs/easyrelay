@@ -78,7 +78,8 @@ pub const Hub = struct {
         return self.members.items.len;
     }
 
-    pub fn broadcast(self: *Hub, arena: std.mem.Allocator, event: *const Event) void {
+    /// `local_id` is null for an ephemeral event, which no stored phase can have seen.
+    pub fn broadcast(self: *Hub, arena: std.mem.Allocator, event: *const Event, local_id: ?u64) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
@@ -89,6 +90,7 @@ pub const Hub = struct {
             defer member.mutex.unlock(self.io);
 
             for (member.registry.items()) |subscription| {
+                if (local_id) |id| if (id <= subscription.watermark) continue;
                 if (!matchesAny(subscription.filters, event)) continue;
 
                 const body = serialized orelse body: {
@@ -203,7 +205,7 @@ test "an event reaches the subscriptions that match it and no others" {
     try testing.expectEqual(@as(usize, 2), connections.count());
 
     const event = testEvent(1);
-    connections.broadcast(arena_state.allocator(), &event);
+    connections.broadcast(arena_state.allocator(), &event, null);
 
     try testing.expectEqual(@as(usize, 1), wants_notes.received.items.len);
     try testing.expectEqual(@as(usize, 0), wants_reactions.received.items.len);
@@ -235,7 +237,7 @@ test "a subscriber that has left is not delivered to" {
     try testing.expectEqual(@as(usize, 0), connections.count());
 
     const event = testEvent(1);
-    connections.broadcast(arena_state.allocator(), &event);
+    connections.broadcast(arena_state.allocator(), &event, null);
     try testing.expectEqual(@as(usize, 0), listener.received.items.len);
 }
 
@@ -258,7 +260,7 @@ test "a delivered event with control bytes is valid JSON" {
 
     var event = testEvent(1);
     event.content = "control\x01byte";
-    connections.broadcast(arena_state.allocator(), &event);
+    connections.broadcast(arena_state.allocator(), &event, null);
 
     try testing.expectEqual(@as(usize, 1), listener.received.items.len);
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), listener.received.items[0], .{});
@@ -289,4 +291,29 @@ test "a reply reaches only the connection generation it was addressed to" {
     try testing.expectEqual(@as(usize, 2), listener.received.items.len);
     try testing.expectEqualStrings("one", listener.received.items[0]);
     try testing.expectEqualStrings("two", listener.received.items[1]);
+}
+
+test "a live event at or below a subscription's watermark is not delivered again" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var connections = Hub.init(testing.allocator, testing.io);
+    defer connections.deinit();
+
+    var listener = Listener{};
+    defer listener.deinit();
+    var member: Subscriber = .{
+        .registry = subscriptions.Registry.init(testing.allocator, .{}),
+        .delivery = listener.delivery(),
+    };
+    defer member.registry.deinit();
+    try member.registry.open("s", &[_]nostr.filter.Filter{.{}});
+    member.registry.setWatermark("s", 5);
+    try connections.join(&member);
+
+    const event = testEvent(1);
+    connections.broadcast(arena_state.allocator(), &event, 5);
+    try testing.expectEqual(@as(usize, 0), listener.received.items.len);
+    connections.broadcast(arena_state.allocator(), &event, 6);
+    connections.broadcast(arena_state.allocator(), &event, null);
+    try testing.expectEqual(@as(usize, 2), listener.received.items.len);
 }
