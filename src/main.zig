@@ -68,10 +68,16 @@ fn serve(gpa: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
     var connections = easyrelay.hub.Hub.init(gpa, io);
     defer connections.deinit();
 
+    var writer = try easyrelay.writer.Writer.init(gpa, io, events.store(), &connections, 4096);
+    defer writer.deinit();
+    try writer.start();
+    defer writer.stop();
+
     const shared: easyrelay.session.Shared = .{
         .io = io,
         .store = events.store(),
         .hub = &connections,
+        .writer = &writer,
     };
     var app: easyrelay.server.App = .{ .gpa = gpa, .shared = &shared };
 

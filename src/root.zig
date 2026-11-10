@@ -26,6 +26,8 @@ pub const subscriptions = @import("relay/subscriptions.zig");
 
 pub const hub = @import("relay/hub.zig");
 
+pub const writer = @import("relay/writer.zig");
+
 pub const diagnostics = @import("relay/diagnostics.zig");
 
 pub const server = @import("server/server.zig");

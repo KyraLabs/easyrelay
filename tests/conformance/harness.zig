@@ -10,6 +10,7 @@ pub const Relay = struct {
     threaded: std.Io.Threaded,
     events: easyrelay.memory.Memory,
     connections: easyrelay.hub.Hub,
+    writer: easyrelay.writer.Writer,
     shared: easyrelay.session.Shared,
     app: easyrelay.server.App,
     server: easyrelay.server.Server,
@@ -26,6 +27,7 @@ pub const Relay = struct {
             .events = undefined,
             .port = next_port.fetchAdd(1, .monotonic),
             .connections = undefined,
+            .writer = undefined,
             .shared = undefined,
             .app = undefined,
             .server = undefined,
@@ -35,10 +37,13 @@ pub const Relay = struct {
         const relay_io = self.threaded.io();
         self.events = easyrelay.memory.Memory.init(gpa, relay_io);
         self.connections = easyrelay.hub.Hub.init(gpa, relay_io);
+        self.writer = try easyrelay.writer.Writer.init(gpa, relay_io, self.events.store(), &self.connections, 64);
+        try self.writer.start();
         self.shared = .{
             .io = relay_io,
             .store = self.events.store(),
             .hub = &self.connections,
+            .writer = &self.writer,
             .limits = limits,
         };
         self.app = .{ .gpa = gpa, .shared = &self.shared };
@@ -60,6 +65,8 @@ pub const Relay = struct {
         self.server.stop();
         self.listener.join();
         self.server.deinit();
+        self.writer.stop();
+        self.writer.deinit();
         self.connections.deinit();
         self.events.deinit();
         self.threaded.deinit();

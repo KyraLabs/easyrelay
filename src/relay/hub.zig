@@ -21,6 +21,8 @@ pub const Subscriber = struct {
     mutex: std.Io.Mutex = .init,
     registry: subscriptions.Registry,
     delivery: Delivery,
+    /// Assigned by `join`; tells a reply for a closed connection from one for a new one at the same address.
+    generation: u64 = 0,
 };
 
 pub const Hub = struct {
@@ -28,6 +30,7 @@ pub const Hub = struct {
     io: std.Io,
     mutex: std.Io.Mutex = .init,
     members: std.ArrayList(*Subscriber) = .empty,
+    next_generation: u64 = 1,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Hub {
         return .{ .gpa = gpa, .io = io };
@@ -42,6 +45,20 @@ pub const Hub = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         try self.members.append(self.gpa, subscriber);
+        subscriber.generation = self.next_generation;
+        self.next_generation += 1;
+    }
+
+    /// Sends `message` to `subscriber` if it is still the connection that `generation` names.
+    pub fn reply(self: *Hub, subscriber: *Subscriber, generation: u64, message: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.members.items) |member| {
+            if (member == subscriber and member.generation == generation) {
+                member.delivery.send(message);
+                return;
+            }
+        }
     }
 
     pub fn leave(self: *Hub, subscriber: *Subscriber) void {
@@ -246,4 +263,30 @@ test "a delivered event with control bytes is valid JSON" {
     try testing.expectEqual(@as(usize, 1), listener.received.items.len);
     const parsed = try std.json.parseFromSliceLeaky(std.json.Value, arena_state.allocator(), listener.received.items[0], .{});
     try testing.expectEqualStrings("control\x01byte", parsed.array.items[2].object.get("content").?.string);
+}
+
+test "a reply reaches only the connection generation it was addressed to" {
+    var connections = Hub.init(testing.allocator, testing.io);
+    defer connections.deinit();
+
+    var listener = Listener{};
+    defer listener.deinit();
+    var member: Subscriber = .{
+        .registry = subscriptions.Registry.init(testing.allocator, .{}),
+        .delivery = listener.delivery(),
+    };
+    defer member.registry.deinit();
+
+    try connections.join(&member);
+    const first = member.generation;
+    connections.reply(&member, first, "one");
+    connections.leave(&member);
+    connections.reply(&member, first, "after leaving");
+    try connections.join(&member);
+    connections.reply(&member, first, "stale generation");
+    connections.reply(&member, member.generation, "two");
+
+    try testing.expectEqual(@as(usize, 2), listener.received.items.len);
+    try testing.expectEqualStrings("one", listener.received.items[0]);
+    try testing.expectEqualStrings("two", listener.received.items[1]);
 }

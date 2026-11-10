@@ -5,6 +5,7 @@ const codec = @import("codec.zig");
 const hub = @import("hub.zig");
 const subscriptions = @import("subscriptions.zig");
 const validation = @import("validation.zig");
+const write_queue = @import("writer.zig");
 const kinds = @import("../storage/kind.zig");
 const store = @import("../storage/store.zig");
 
@@ -42,6 +43,8 @@ pub const Shared = struct {
     io: std.Io,
     store: store.Store,
     hub: *hub.Hub,
+    /// When set, events are committed on the writer thread, which sends their `OK`.
+    writer: ?*write_queue.Writer = null,
     limits: Limits = .{},
 };
 
@@ -124,39 +127,26 @@ pub const Session = struct {
             return self.sendOk(.{ .event_id = event.id, .accepted = true });
         }
 
-        const result = self.shared.store.put(&event) catch |err| switch (err) {
-            error.OutOfMemory => return self.sendOk(.{
+        if (self.shared.writer) |queue| {
+            const reply: write_queue.Reply = .{ .subscriber = self.subscriber, .generation = self.subscriber.generation };
+            queue.submit(&event, reply) catch |err| return self.sendOk(.{
                 .event_id = event.id,
                 .accepted = false,
-                .prefix = .internal,
-                .reason = "the relay ran out of memory storing this event",
-            }),
-            error.Backend => return self.sendOk(.{
-                .event_id = event.id,
-                .accepted = false,
-                .prefix = .internal,
-                .reason = "the store could not accept this event",
-            }),
-        };
+                .prefix = switch (err) {
+                    error.QueueFull => .rate_limited,
+                    error.OutOfMemory => .internal,
+                },
+                .reason = switch (err) {
+                    error.QueueFull => "the write queue is full",
+                    error.OutOfMemory => "the relay ran out of memory queueing this event",
+                },
+            });
+            return;
+        }
 
-        return switch (result) {
-            .stored => {
-                self.shared.hub.broadcast(context.arena, &event);
-                return self.sendOk(.{ .event_id = event.id, .accepted = true });
-            },
-            .duplicate => self.sendOk(.{
-                .event_id = event.id,
-                .accepted = true,
-                .prefix = .duplicate,
-                .reason = "already stored",
-            }),
-            .outdated => self.sendOk(.{
-                .event_id = event.id,
-                .accepted = true,
-                .prefix = .duplicate,
-                .reason = "a newer version is stored",
-            }),
-        };
+        const result = self.shared.store.put(&event) catch |err| return self.sendOk(write_queue.failure(event.id, err));
+        if (result == .stored) self.shared.hub.broadcast(context.arena, &event);
+        return self.sendOk(write_queue.ok(event.id, result));
     }
 
     fn subscribe(self: *Session, context: Context, req: codec.ClientMessage.Req) Error!void {
@@ -737,4 +727,24 @@ test "a subscription the store cannot answer is closed, not left open" {
         try testing.expect(std.mem.startsWith(u8, answer, "[\"CLOSED\",\"sub-1\",\"error:"));
         try testing.expectEqual(@as(usize, 0), harness.subscriber.registry.count());
     }
+}
+
+test "an event the write queue cannot take is refused with rate-limited" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+
+    var queue = try write_queue.Writer.init(testing.allocator, harness.shared.io, harness.shared.store, &harness.connections, 1);
+    defer {
+        queue.start() catch {};
+        queue.stop();
+        queue.deinit();
+    }
+    harness.shared.writer = &queue;
+
+    try harness.handle(try harness.eventMessage(try harness.signedEvent("queued")));
+    try testing.expectEqual(@as(usize, 0), harness.recorder.messages.items.len);
+
+    try harness.handle(try harness.eventMessage(try harness.signedEvent("refused")));
+    try testing.expect(std.mem.indexOf(u8, harness.recorder.only(), ",false,\"rate-limited: the write queue is full\"]") != null);
 }
