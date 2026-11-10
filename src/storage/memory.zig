@@ -1,6 +1,7 @@
 const std = @import("std");
 const nostr = @import("nostr");
 
+const kinds = @import("kind.zig");
 const store = @import("store.zig");
 const Error = store.Error;
 const PutResult = store.PutResult;
@@ -56,12 +57,23 @@ pub const Memory = struct {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
 
+        std.debug.assert(kinds.classify(event.kind) != .ephemeral);
         if (self.ids.contains(event.id)) return .duplicate;
+
+        const incumbent = self.incumbentIndex(event);
+        if (incumbent) |index| {
+            if (!kinds.supersedes(event, &self.order.items[index])) return .outdated;
+        }
 
         try self.order.ensureUnusedCapacity(self.gpa, 1);
         try self.ids.ensureUnusedCapacity(self.gpa, 1);
 
         const owned = try dupeEvent(self.gpa, event);
+        if (incumbent) |index| {
+            const superseded = self.order.orderedRemove(index);
+            std.debug.assert(self.ids.remove(superseded.id));
+            freeEvent(self.gpa, superseded);
+        }
         self.order.insertAssumeCapacity(self.insertionIndex(event), owned);
         self.ids.putAssumeCapacityNoClobber(owned.id, {});
 
@@ -78,9 +90,10 @@ pub const Memory = struct {
             if (left.* != 0) open += 1;
         }
 
-        // Shallow copies stay valid after unlocking: stored events are freed only by deinit.
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
         var matched: std.ArrayList(Event) = .empty;
-        defer matched.deinit(self.gpa);
         {
             self.lock.lockSharedUncancelable(self.io);
             defer self.lock.unlockShared(self.io);
@@ -94,11 +107,19 @@ pub const Memory = struct {
                     if (left.* == 0) open -= 1;
                     wanted = true;
                 }
-                if (wanted) try matched.append(self.gpa, event);
+                if (wanted) try matched.append(arena, try dupeEvent(arena, &event));
             }
         }
 
         for (matched.items) |*event| try sink.emit(event);
+    }
+
+    fn incumbentIndex(self: Memory, event: *const Event) ?usize {
+        if (kinds.classify(event.kind) == .regular) return null;
+        for (self.order.items, 0..) |*stored, index| {
+            if (kinds.sameCoordinate(event, stored)) return index;
+        }
+        return null;
     }
 
     fn insertionIndex(self: Memory, event: *const Event) usize {
@@ -176,6 +197,7 @@ fn testEvent(id_byte: u8, created_at: i64, kind: u16) Event {
 
 const Collector = struct {
     ids: [8][32]u8 = undefined,
+    content_bytes: [8][64]u8 = undefined,
     contents: [8][]const u8 = undefined,
     len: usize = 0,
     stop_after: usize = 8,
@@ -188,7 +210,9 @@ const Collector = struct {
         const self: *Collector = @ptrCast(@alignCast(ptr));
         if (self.len == self.stop_after) return error.Abort;
         self.ids[self.len] = event.id;
-        self.contents[self.len] = event.content;
+        const copy = self.content_bytes[self.len][0..event.content.len];
+        @memcpy(copy, event.content);
+        self.contents[self.len] = copy;
         self.len += 1;
     }
 
@@ -496,4 +520,22 @@ test "a query does not hold the lock while its sink runs" {
 
     try testing.expectEqual(@as(usize, 1), republisher.emitted);
     try testing.expectEqual(@as(usize, 2), memory.count());
+}
+
+test "a replaceable event supersedes the stored one and an older one is outdated" {
+    var memory = Memory.init(testing.allocator, testing.io);
+    defer memory.deinit();
+
+    const old = testEvent(1, 1700000000, 0);
+    const new = testEvent(2, 1700000100, 0);
+    const older = testEvent(3, 1699999999, 0);
+    try testing.expectEqual(PutResult.stored, try memory.store().put(&old));
+    try testing.expectEqual(PutResult.stored, try memory.store().put(&new));
+    try testing.expectEqual(PutResult.outdated, try memory.store().put(&older));
+    try testing.expectEqual(PutResult.outdated, try memory.store().put(&old));
+    try testing.expectEqual(@as(usize, 1), memory.count());
+
+    var collector: Collector = .{};
+    try memory.store().query(&.{.{}}, collector.sink());
+    try testing.expectEqual(@as(u8, 2), collector.idAt(0));
 }

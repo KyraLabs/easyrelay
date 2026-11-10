@@ -10,6 +10,8 @@ pub const lmdb = @import("storage/lmdb.zig");
 
 pub const record = @import("storage/record.zig");
 
+pub const kind = @import("storage/kind.zig");
+
 pub const validation = @import("relay/validation.zig");
 
 pub const filter = @import("relay/filter.zig");

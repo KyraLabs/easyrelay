@@ -14,6 +14,8 @@ pub const QueryError = Error || Sink.Abort;
 pub const PutResult = enum {
     stored,
     duplicate,
+    /// A replaceable or addressable event lost the tie-break to the one already stored.
+    outdated,
 };
 
 /// The emitted event borrows the store's memory and is valid only until `emit` returns.
@@ -37,6 +39,7 @@ pub const Store = struct {
         query: *const fn (ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void,
     };
 
+    /// Ephemeral events must not be passed; they are never stored.
     pub fn put(self: Store, event: *const Event) Error!PutResult {
         return self.vtable.put(self.ptr, event);
     }

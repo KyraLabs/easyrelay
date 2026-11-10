@@ -5,6 +5,7 @@ const codec = @import("codec.zig");
 const hub = @import("hub.zig");
 const subscriptions = @import("subscriptions.zig");
 const validation = @import("validation.zig");
+const kinds = @import("../storage/kind.zig");
 const store = @import("../storage/store.zig");
 
 const Event = nostr.event.Event;
@@ -118,6 +119,11 @@ pub const Session = struct {
             }),
         };
 
+        if (kinds.classify(event.kind) == .ephemeral) {
+            self.shared.hub.broadcast(context.arena, &event);
+            return self.sendOk(.{ .event_id = event.id, .accepted = true });
+        }
+
         const result = self.shared.store.put(&event) catch |err| switch (err) {
             error.OutOfMemory => return self.sendOk(.{
                 .event_id = event.id,
@@ -143,6 +149,12 @@ pub const Session = struct {
                 .accepted = true,
                 .prefix = .duplicate,
                 .reason = "already stored",
+            }),
+            .outdated => self.sendOk(.{
+                .event_id = event.id,
+                .accepted = true,
+                .prefix = .duplicate,
+                .reason = "a newer version is stored",
             }),
         };
     }

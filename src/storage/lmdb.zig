@@ -2,6 +2,7 @@ const std = @import("std");
 const lmdb = @import("lmdb");
 const nostr = @import("nostr");
 
+const kinds = @import("kind.zig");
 const record = @import("record.zig");
 const store = @import("store.zig");
 
@@ -33,6 +34,8 @@ const events_db = "events";
 const meta_db = "meta";
 const by_id_db = "by_id";
 const by_created_at_db = "by_created_at";
+const by_replaceable_db = "by_replaceable";
+const by_address_db = "by_address";
 const next_local_id_key = "next_local_id";
 
 /// Zero is reserved as the watermark before any event.
@@ -59,6 +62,55 @@ fn createdAtKey(created_at: i64, id: *const [32]u8) CreatedAtKey {
     key[0..8].* = descendingTime(created_at);
     key[8..40].* = id.*;
     return key;
+}
+
+/// The `d` value is hashed because LMDB keys are capped at 511 bytes.
+const Coordinate = struct {
+    db: [*:0]const u8,
+    bytes: [66]u8,
+    len: usize,
+
+    fn of(event: *const Event) ?Coordinate {
+        var coordinate: Coordinate = .{ .db = undefined, .bytes = undefined, .len = 34 };
+        coordinate.bytes[0..32].* = event.pubkey;
+        std.mem.writeInt(u16, coordinate.bytes[32..34], event.kind, .big);
+        switch (kinds.classify(event.kind)) {
+            .replaceable => coordinate.db = by_replaceable_db,
+            .addressable => {
+                coordinate.db = by_address_db;
+                std.crypto.hash.sha2.Sha256.hash(kinds.dValue(event), coordinate.bytes[34..66], .{});
+                coordinate.len = 66;
+            },
+            .regular, .ephemeral => return null,
+        }
+        return coordinate;
+    }
+
+    fn key(self: *const Coordinate) []const u8 {
+        return self.bytes[0..self.len];
+    }
+};
+
+fn database(txn: lmdb.Transaction, name: [*:0]const u8) Error!lmdb.Database {
+    return lmdb.Database.open(txn, name, .{ .create = true }) catch error.Backend;
+}
+
+fn writeIndexes(txn: lmdb.Transaction, event: *const Event, local_key: *const [8]u8) Error!void {
+    (try database(txn, by_id_db)).set(&event.id, local_key) catch return error.Backend;
+    const created_at_key = createdAtKey(event.created_at, &event.id);
+    (try database(txn, by_created_at_db)).set(&created_at_key, local_key) catch return error.Backend;
+    if (Coordinate.of(event)) |coordinate| {
+        (try database(txn, coordinate.db)).set(coordinate.key(), local_key) catch return error.Backend;
+    }
+}
+
+fn deleteIndexes(txn: lmdb.Transaction, event: *const Event) Error!void {
+    (try database(txn, by_id_db)).delete(&event.id) catch return error.Backend;
+    const created_at_key = createdAtKey(event.created_at, &event.id);
+    (try database(txn, by_created_at_db)).delete(&created_at_key) catch return error.Backend;
+    if (Coordinate.of(event)) |coordinate| {
+        (try database(txn, coordinate.db)).delete(coordinate.key()) catch return error.Backend;
+    }
 }
 
 pub const Lmdb = struct {
@@ -108,18 +160,8 @@ pub const Lmdb = struct {
         const local_id = self.next_local_id;
         const key = encodeLocalId(local_id);
 
-        const events = lmdb.Database.open(txn, events_db, .{ .create = true }) catch
-            return error.Backend;
-        events.set(&key, buffer[0..size]) catch return error.Backend;
-
-        const by_id = lmdb.Database.open(txn, by_id_db, .{ .create = true }) catch
-            return error.Backend;
-        by_id.set(&event.id, &key) catch return error.Backend;
-
-        const by_created_at = lmdb.Database.open(txn, by_created_at_db, .{ .create = true }) catch
-            return error.Backend;
-        const index_key = createdAtKey(event.created_at, &event.id);
-        by_created_at.set(&index_key, &key) catch return error.Backend;
+        (try database(txn, events_db)).set(&key, buffer[0..size]) catch return error.Backend;
+        try writeIndexes(txn, event, &key);
 
         const meta = lmdb.Database.open(txn, meta_db, .{ .create = true }) catch
             return error.Backend;
@@ -183,9 +225,28 @@ pub const Lmdb = struct {
             return error.Backend;
         errdefer txn.abort();
 
+        std.debug.assert(kinds.classify(event.kind) != .ephemeral);
         if (try self.contains(txn, &event.id)) {
             txn.abort();
             return .duplicate;
+        }
+
+        if (Coordinate.of(event)) |coordinate| {
+            var arena = std.heap.ArenaAllocator.init(self.gpa);
+            defer arena.deinit();
+            const found = (try database(txn, coordinate.db)).get(coordinate.key()) catch return error.Backend;
+            if (found) |value| {
+                if (value.len != 8) return error.Corrupt;
+                const incumbent_id = std.mem.readInt(u64, value[0..8], .big);
+                const incumbent = (try self.read(txn, arena.allocator(), incumbent_id)) orelse return error.Corrupt;
+                if (!kinds.supersedes(event, &incumbent)) {
+                    txn.abort();
+                    return .outdated;
+                }
+                try deleteIndexes(txn, &incumbent);
+                const incumbent_key = encodeLocalId(incumbent_id);
+                (try database(txn, events_db)).delete(&incumbent_key) catch return error.Backend;
+            }
         }
 
         _ = try self.append(txn, buffer, event);
@@ -675,4 +736,98 @@ test "events published before a restart are queryable after it" {
     try testing.expectEqual(@as(usize, 1), collector.len);
     try testing.expectEqual(@as(u8, 9), collector.idAt(0));
     try testing.expectEqualStrings("survives", collector.contents[0]);
+}
+
+fn entryCount(backend: *Lmdb, name: [*:0]const u8) !usize {
+    const txn = try lmdb.Transaction.init(backend.env, .{ .mode = .ReadWrite });
+    defer txn.abort();
+    const db = try database(txn, name);
+    return (try db.stat()).entries;
+}
+
+test "a superseded replaceable event is removed from every table" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    const old = kindEvent(1, 1700000000, 0);
+    const new = kindEvent(2, 1700000100, 0);
+    try testing.expectEqual(PutResult.stored, try fixture.backend.store().put(&old));
+    try testing.expectEqual(PutResult.stored, try fixture.backend.store().put(&new));
+    try testing.expectEqual(PutResult.outdated, try fixture.backend.store().put(&old));
+
+    for ([_][*:0]const u8{ events_db, by_id_db, by_created_at_db, by_replaceable_db }) |name| {
+        try testing.expectEqual(@as(usize, 1), try entryCount(&fixture.backend, name));
+    }
+
+    var collector: Collector = .{};
+    try fixture.backend.store().query(&.{.{}}, collector.sink());
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    try testing.expectEqual(@as(u8, 2), collector.idAt(0));
+}
+
+test "a replaceable tie on created_at keeps the lexically smaller id" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    const larger = kindEvent(0xbb, 1700000000, 3);
+    const smaller = kindEvent(0xaa, 1700000000, 3);
+    try testing.expectEqual(PutResult.stored, try fixture.backend.store().put(&larger));
+    try testing.expectEqual(PutResult.stored, try fixture.backend.store().put(&smaller));
+    try testing.expectEqual(PutResult.outdated, try fixture.backend.store().put(&larger));
+
+    var collector: Collector = .{};
+    try fixture.backend.store().query(&.{.{}}, collector.sink());
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    try testing.expectEqual(@as(u8, 0xaa), collector.idAt(0));
+}
+
+test "addressable events replace only within their d coordinate, and a long d value fits" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+
+    const long_d = "d" ** 600;
+    var a1 = kindEvent(1, 1700000000, 30023);
+    a1.tags = &.{&.{ "d", long_d }};
+    var b1 = kindEvent(2, 1700000000, 30023);
+    b1.tags = &.{&.{ "d", "b" }};
+    var a2 = kindEvent(3, 1700000100, 30023);
+    a2.tags = &.{&.{ "d", long_d }};
+    var bare = kindEvent(4, 1700000200, 30023);
+    bare.tags = &.{&.{"d"}};
+    var absent = kindEvent(5, 1700000300, 30023);
+    absent.tags = &.{};
+
+    for ([_]*const Event{ &a1, &b1, &a2, &bare, &absent }) |event| {
+        try testing.expectEqual(PutResult.stored, try fixture.backend.store().put(event));
+    }
+
+    var collector: Collector = .{};
+    try fixture.backend.store().query(&.{.{}}, collector.sink());
+    try testing.expectEqual(@as(usize, 3), collector.len);
+    try testing.expectEqual(@as(u8, 5), collector.idAt(0));
+    try testing.expectEqual(@as(u8, 3), collector.idAt(1));
+    try testing.expectEqual(@as(u8, 2), collector.idAt(2));
+    try testing.expectEqual(@as(usize, 3), try entryCount(&fixture.backend, by_address_db));
+}
+
+test "replacement holds across a restart" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+
+    {
+        var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+        defer backend.close();
+        const new = kindEvent(2, 1700000100, 10002);
+        _ = try backend.store().put(&new);
+    }
+
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+    defer backend.close();
+    const old = kindEvent(1, 1700000000, 10002);
+    try testing.expectEqual(PutResult.outdated, try backend.store().put(&old));
 }

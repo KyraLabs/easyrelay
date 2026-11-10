@@ -81,7 +81,7 @@ available, because nothing bounds how many events may share one `created_at`.
 | `by_kind` | `kind`, `created_at`, `event_id` | `kinds` |
 | `by_author_kind` | `pubkey`, `kind`, `created_at`, `event_id` | `authors` + `kinds` |
 | `by_tag` | `tag_name` (1 B), `tag_value`, `created_at`, `event_id` | `#<letter>` |
-| `by_address` | `pubkey`, `kind`, `d_value` | addressable replacement |
+| `by_address` | `pubkey`, `kind`, `sha256(d_value)` | addressable replacement |
 | `by_replaceable` | `pubkey`, `kind` | replaceable replacement |
 | `by_expiration` | `expires_at`, `event_id` | NIP-40 reaper |
 | `deleted` | `event_id` (32 B) | NIP-09 tombstones |
@@ -89,6 +89,9 @@ available, because nothing bounds how many events may share one `created_at`.
 The `event_id` in the key costs 32 bytes an entry where the `local_id` would have cost 8. That
 is the price of the tie-break being a property of the key order rather than of a sort, and it is
 worth paying: it is what keeps a query streaming.
+
+`by_address` hashes the `d` value because LMDB caps a key at 511 bytes and a `d` value is
+bounded only by the event size. A collision would need a SHA-256 preimage.
 
 `by_author_kind` is a deliberate denormalisation: the `authors` + `kinds` combination is the
 single most common shape in real client traffic, and serving it from one cursor rather than
