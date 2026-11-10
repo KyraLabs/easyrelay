@@ -76,7 +76,7 @@ pub fn main(init: std.process.Init) !void {
 /// while the surface is small. Every setting below is a default in
 /// docs/configuration.md, not a value invented for this function.
 fn serve(gpa: std.mem.Allocator, io: Io, stdout: *Io.Writer) !void {
-    var events = easyrelay.memory.Memory.init(gpa);
+    var events = easyrelay.memory.Memory.init(gpa, io);
     defer events.deinit();
 
     var connections = easyrelay.hub.Hub.init(gpa, io);

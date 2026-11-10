@@ -34,7 +34,7 @@ pub const Relay = struct {
         self.* = .{
             .gpa = gpa,
             .threaded = .init(gpa, .{}),
-            .events = easyrelay.memory.Memory.init(gpa),
+            .events = undefined,
             .port = next_port.fetchAdd(1, .monotonic),
             .connections = undefined,
             .shared = undefined,
@@ -44,6 +44,7 @@ pub const Relay = struct {
         };
 
         const relay_io = self.threaded.io();
+        self.events = easyrelay.memory.Memory.init(gpa, relay_io);
         self.connections = easyrelay.hub.Hub.init(gpa, relay_io);
         self.shared = .{
             .io = relay_io,

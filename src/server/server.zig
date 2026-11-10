@@ -248,7 +248,7 @@ test "a client publishes over a real connection and is answered OK" {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var backing = memory.Memory.init(testing.allocator);
+    var backing = memory.Memory.init(testing.allocator, testing.io);
     defer backing.deinit();
     var connections = hub.Hub.init(testing.allocator, io);
     defer connections.deinit();
@@ -313,7 +313,7 @@ test "one connection subscribes, another publishes, and the first receives it li
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    var backing = memory.Memory.init(testing.allocator);
+    var backing = memory.Memory.init(testing.allocator, testing.io);
     defer backing.deinit();
     var connections = hub.Hub.init(testing.allocator, io);
     defer connections.deinit();

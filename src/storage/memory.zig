@@ -31,6 +31,9 @@ const Tag = nostr.event.Tag;
 
 pub const Memory = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
+    /// Held shared for the whole of a query, because emitted events borrow `order`.
+    lock: std.Io.RwLock = .init,
     /// Stored events, newest first, each one owned by this store.
     ///
     /// Kept in order on insert rather than sorted per query, because that is
@@ -40,8 +43,8 @@ pub const Memory = struct {
     /// The ids in `order`, for duplicate detection without a scan.
     ids: std.AutoHashMapUnmanaged([32]u8, void),
 
-    pub fn init(gpa: std.mem.Allocator) Memory {
-        return .{ .gpa = gpa, .order = .empty, .ids = .empty };
+    pub fn init(gpa: std.mem.Allocator, io: std.Io) Memory {
+        return .{ .gpa = gpa, .io = io, .order = .empty, .ids = .empty };
     }
 
     pub fn deinit(self: *Memory) void {
@@ -61,7 +64,9 @@ pub const Memory = struct {
     }
 
     /// How many events are stored.
-    fn count(self: Memory) usize {
+    fn count(self: *Memory) usize {
+        self.lock.lockSharedUncancelable(self.io);
+        defer self.lock.unlockShared(self.io);
         return self.order.items.len;
     }
 
@@ -83,6 +88,9 @@ pub const Memory = struct {
     }
 
     fn put(self: *Memory, event: *const Event) Error!PutResult {
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+
         if (self.ids.contains(event.id)) return .duplicate;
 
         // Reserve both slots before copying, so a failure leaves the store
@@ -104,6 +112,9 @@ pub const Memory = struct {
         limit: usize,
         sink: Sink,
     ) QueryError!void {
+        self.lock.lockSharedUncancelable(self.io);
+        defer self.lock.unlockShared(self.io);
+
         var emitted: usize = 0;
         for (self.order.items) |*event| {
             if (emitted == limit) break;
@@ -230,7 +241,7 @@ const Collector = struct {
 };
 
 test "put stores an event" {
-    var memory = Memory.init(testing.allocator);
+    var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
     const event = testEvent(1, 1700000000, 1);
@@ -239,7 +250,7 @@ test "put stores an event" {
 }
 
 test "the same id twice is a duplicate and changes nothing" {
-    var memory = Memory.init(testing.allocator);
+    var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
     const event = testEvent(1, 1700000000, 1);
@@ -249,7 +260,7 @@ test "the same id twice is a duplicate and changes nothing" {
 }
 
 test "query streams newest first" {
-    var memory = Memory.init(testing.allocator);
+    var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
     // Inserted oldest, newest, middle, so that insertion order cannot be
@@ -270,7 +281,7 @@ test "query streams newest first" {
 }
 
 test "events sharing a created_at are ordered by ascending id" {
-    var memory = Memory.init(testing.allocator);
+    var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
     for ([_]Event{
@@ -288,7 +299,7 @@ test "events sharing a created_at are ordered by ascending id" {
 }
 
 test "a filter constrains what is emitted" {
-    var memory = Memory.init(testing.allocator);
+    var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
     for ([_]Event{
@@ -304,7 +315,7 @@ test "a filter constrains what is emitted" {
 }
 
 test "filters are OR-ed with each other" {
-    var memory = Memory.init(testing.allocator);
+    var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
     for ([_]Event{
@@ -323,7 +334,7 @@ test "filters are OR-ed with each other" {
 }
 
 test "an event matching several filters is emitted once" {
-    var memory = Memory.init(testing.allocator);
+    var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
     const event = testEvent(1, 1700000000, 1);
@@ -340,7 +351,7 @@ test "an event matching several filters is emitted once" {
 }
 
 test "limit bounds the stored phase across the whole merge" {
-    var memory = Memory.init(testing.allocator);
+    var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
     for ([_]Event{
@@ -361,7 +372,7 @@ test "limit bounds the stored phase across the whole merge" {
 }
 
 test "no filters and a zero limit both emit nothing" {
-    var memory = Memory.init(testing.allocator);
+    var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
     const event = testEvent(1, 1700000000, 1);
@@ -377,7 +388,7 @@ test "no filters and a zero limit both emit nothing" {
 }
 
 test "a sink that aborts stops the query" {
-    var memory = Memory.init(testing.allocator);
+    var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
     for ([_]Event{
@@ -391,7 +402,7 @@ test "a sink that aborts stops the query" {
 }
 
 test "the store keeps its own copy of what the event borrows" {
-    var memory = Memory.init(testing.allocator);
+    var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
     const content = try testing.allocator.dupe(u8, "borrowed content");
@@ -421,4 +432,49 @@ test "the store keeps its own copy of what the event borrows" {
 
     try testing.expectEqual(@as(usize, 1), collector.len);
     try testing.expectEqualStrings("borrowed content", collector.contents[0]);
+}
+
+const ConcurrentWriter = struct {
+    store: Store,
+    first_id: u8,
+
+    fn run(self: ConcurrentWriter) void {
+        for (0..500) |i| {
+            var event = testEvent(self.first_id, @intCast(i), 1);
+            std.mem.writeInt(u32, event.id[1..5], @intCast(i), .little);
+            _ = self.store.put(&event) catch |err| std.debug.panic("put failed: {t}", .{err});
+        }
+    }
+};
+
+const ConcurrentReader = struct {
+    store: Store,
+
+    fn run(self: ConcurrentReader) void {
+        for (0..200) |_| {
+            var collector: Collector = .{};
+            self.store.query(&.{.{}}, 8, collector.sink()) catch |err| std.debug.panic("query failed: {t}", .{err});
+        }
+    }
+};
+
+test "concurrent puts and queries keep every event" {
+    var memory = Memory.init(testing.allocator, testing.io);
+    defer memory.deinit();
+
+    var writers: [4]std.Thread = undefined;
+    var readers: [2]std.Thread = undefined;
+    for (&writers, 0..) |*thread, index| {
+        thread.* = try std.Thread.spawn(.{}, ConcurrentWriter.run, .{ConcurrentWriter{
+            .store = memory.store(),
+            .first_id = @intCast(index),
+        }});
+    }
+    for (&readers) |*thread| {
+        thread.* = try std.Thread.spawn(.{}, ConcurrentReader.run, .{ConcurrentReader{ .store = memory.store() }});
+    }
+    for (writers) |thread| thread.join();
+    for (readers) |thread| thread.join();
+
+    try testing.expectEqual(@as(usize, 2000), memory.count());
 }
