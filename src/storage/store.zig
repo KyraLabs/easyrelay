@@ -88,12 +88,7 @@ pub const Store = struct {
 
     pub const VTable = struct {
         put: *const fn (ptr: *anyopaque, event: *const Event) Error!PutResult,
-        query: *const fn (
-            ptr: *anyopaque,
-            filters: []const Filter,
-            limit: usize,
-            sink: Sink,
-        ) QueryError!void,
+        query: *const fn (ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void,
     };
 
     /// Stores `event` and reports what became of it.
@@ -105,33 +100,11 @@ pub const Store = struct {
         return self.vtable.put(self.ptr, event);
     }
 
-    /// Streams every stored event matching *any* of `filters` to `sink`.
-    ///
-    /// The contract is docs/protocol.md's, it is identical for every backend,
-    /// and it is what the property test in docs/testing.md holds them to:
-    ///
-    /// - **Union.** Filters are OR-ed with each other, and the fields within
-    ///   one filter are AND-ed. An event matching several filters is emitted
-    ///   once.
-    /// - **Order.** Newest first by `created_at`, ties broken by ascending id.
-    /// - **Bound.** At most `limit` events, applied across the merged result
-    ///   and selecting the globally newest. `Filter.limit` is ignored, because
-    ///   it cannot express a bound that spans filters: applying it per filter
-    ///   and concatenating returns plausible and wrong events. The caller
-    ///   resolves the effective limit from the subscription and from the
-    ///   configured `default_limit` and `max_limit`.
-    /// - **No materialisation.** Events reach `sink` as they are found, not
-    ///   after the answer is complete.
-    ///
-    /// A `limit` of zero emits nothing, which is what an empty filter array
-    /// and a zero limit both mean: no stored events, then `EOSE`.
-    pub fn query(
-        self: Store,
-        filters: []const Filter,
-        limit: usize,
-        sink: Sink,
-    ) QueryError!void {
-        return self.vtable.query(self.ptr, filters, limit, sink);
+    /// Streams, newest first with ties broken by ascending id, the union of
+    /// each filter's `limit` newest matches, each event once. A null `limit`
+    /// is unbounded; the relay resolves defaults and caps before calling.
+    pub fn query(self: Store, filters: []const Filter, sink: Sink) QueryError!void {
+        return self.vtable.query(self.ptr, filters, sink);
     }
 };
 
@@ -145,7 +118,6 @@ const StubStore = struct {
     last_put: ?*const Event = null,
     events: []const Event = &.{},
     last_filters: []const Filter = &.{},
-    last_limit: usize = 0,
 
     const vtable: Store.VTable = .{ .put = put, .query = query };
 
@@ -159,15 +131,9 @@ const StubStore = struct {
         return self.put_result;
     }
 
-    fn query(
-        ptr: *anyopaque,
-        filters: []const Filter,
-        limit: usize,
-        sink: Sink,
-    ) QueryError!void {
+    fn query(ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void {
         const self: *StubStore = @ptrCast(@alignCast(ptr));
         self.last_filters = filters;
-        self.last_limit = limit;
         for (self.events) |*event| try sink.emit(event);
     }
 };
@@ -212,17 +178,17 @@ test "put carries the event and the result across the vtable" {
     try testing.expectEqual(@as(?*const Event, &event), stub.last_put);
 }
 
-test "query carries the filters and the limit across the vtable" {
+test "query carries the filters across the vtable" {
     const events = [_]Event{ testEvent(1), testEvent(2) };
     var stub: StubStore = .{ .events = &events };
     const store = stub.store();
 
-    const filters = [_]Filter{ .{ .kinds = &.{1} }, .{ .kinds = &.{7} } };
+    const filters = [_]Filter{ .{ .kinds = &.{1}, .limit = 500 }, .{ .kinds = &.{7} } };
     var collector: Collector = .{};
-    try store.query(&filters, 500, collector.sink());
+    try store.query(&filters, collector.sink());
 
     try testing.expectEqual(@as(usize, 2), stub.last_filters.len);
-    try testing.expectEqual(@as(usize, 500), stub.last_limit);
+    try testing.expectEqual(@as(?u32, 500), stub.last_filters[0].limit);
     try testing.expectEqual(@as(usize, 2), collector.len);
     try testing.expectEqualSlices(u8, &events[0].id, &collector.ids[0]);
 }
@@ -233,6 +199,6 @@ test "a sink stops a query by returning Abort" {
     const store = stub.store();
 
     var collector: Collector = .{ .stop_after = 1 };
-    try testing.expectError(error.Abort, store.query(&.{}, 500, collector.sink()));
+    try testing.expectError(error.Abort, store.query(&.{}, collector.sink()));
     try testing.expectEqual(@as(usize, 1), collector.len);
 }

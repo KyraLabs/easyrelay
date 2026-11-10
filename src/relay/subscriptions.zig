@@ -136,19 +136,15 @@ fn copyFilter(arena: std.mem.Allocator, filter: Filter) Error!Filter {
     return copy;
 }
 
-/// The bound the store applies to a `REQ`'s stored phase.
-///
-/// A `REQ` carries several filters, each free to name its own `limit`, while
-/// the bound applies across the merged result (docs/protocol.md). The largest
-/// request wins, so that no filter is served fewer events than it asked for,
-/// and `max_limit` caps the answer.
-pub fn resolveLimit(filters: []const Filter, limits: Limits) usize {
-    var requested: ?usize = null;
-    for (filters) |filter| {
-        const filter_limit = filter.limit orelse continue;
-        requested = @max(requested orelse 0, filter_limit);
+/// Copies `filters` with each `limit` defaulted and capped, for the stored phase.
+pub fn resolveLimits(arena: std.mem.Allocator, filters: []const Filter, limits: Limits) error{OutOfMemory}![]const Filter {
+    const cap = @min(limits.max_limit, std.math.maxInt(u32));
+    const resolved = try arena.dupe(Filter, filters);
+    for (resolved) |*filter| {
+        const requested: usize = filter.limit orelse limits.default_limit;
+        filter.limit = @intCast(@min(requested, cap));
     }
-    return @min(requested orelse limits.default_limit, limits.max_limit);
+    return resolved;
 }
 
 const testing = std.testing;
@@ -220,14 +216,18 @@ test "closing frees the subscription and reports whether there was one" {
     try testing.expectEqual(@as(usize, 0), registry.count());
 }
 
-test "the stored bound is the largest a filter asked for, capped by max_limit" {
+test "each filter's limit is defaulted and capped on its own" {
     const limits = Limits{ .max_limit = 100, .default_limit = 20 };
+    const filters = [_]Filter{ .{}, .{ .limit = 10 }, .{ .limit = 5000 }, .{ .limit = 0 } };
 
-    try testing.expectEqual(@as(usize, 20), resolveLimit(&.{.{}}, limits));
-    try testing.expectEqual(@as(usize, 20), resolveLimit(&.{}, limits));
-    try testing.expectEqual(@as(usize, 50), resolveLimit(&.{ .{ .limit = 10 }, .{ .limit = 50 } }, limits));
-    try testing.expectEqual(@as(usize, 100), resolveLimit(&.{.{ .limit = 5000 }}, limits));
-    try testing.expectEqual(@as(usize, 0), resolveLimit(&.{.{ .limit = 0 }}, limits));
+    const resolved = try resolveLimits(testing.allocator, &filters, limits);
+    defer testing.allocator.free(resolved);
+
+    try testing.expectEqual(@as(?u32, 20), resolved[0].limit);
+    try testing.expectEqual(@as(?u32, 10), resolved[1].limit);
+    try testing.expectEqual(@as(?u32, 100), resolved[2].limit);
+    try testing.expectEqual(@as(?u32, 0), resolved[3].limit);
+    try testing.expectEqual(@as(?u32, null), filters[0].limit);
 }
 
 test "a replacement that cannot be built leaves the old subscription serving" {

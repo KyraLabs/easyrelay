@@ -97,7 +97,7 @@ test "stored events are streamed newest first" {
     try expectEose(&client, "s");
 }
 
-test "one REQ naming several limits is bounded by the largest across the merge" {
+test "each filter's limit bounds only the events that filter selects" {
     const relay = try Relay.start(testing.allocator, .{});
     defer relay.stop();
 
@@ -107,7 +107,6 @@ test "one REQ naming several limits is bounded by the largest across the merge" 
     var client = try Client.connect(relay);
     defer client.close();
 
-    // Two kinds, two events each, published oldest first.
     for ([_]u16{ 1, 7, 1, 7 }, 0..) |kind, offset| {
         const event = try author.event(
             client.allocator(),
@@ -120,17 +119,35 @@ test "one REQ naming several limits is bounded by the largest across the merge" 
         try expectOk(&client, true, "");
     }
 
-    // The bound is three, not one, not two, and not four: the largest limit
-    // any filter asked for, applied across the merged result.
     try client.send("[\"REQ\",\"s\",{\"kinds\":[1],\"limit\":1},{\"kinds\":[7],\"limit\":3}]");
-    var received: usize = 0;
-    while (true) {
-        const answer = try client.receiveJson();
-        if (std.mem.eql(u8, answer.array.items[0].string, "EOSE")) break;
-        try testing.expectEqualStrings("EVENT", answer.array.items[0].string);
-        received += 1;
+    const expected = [_]struct { kind: u16, created_at: i64 }{
+        .{ .kind = 7, .created_at = harness.event_time + 3 },
+        .{ .kind = 1, .created_at = harness.event_time + 2 },
+        .{ .kind = 7, .created_at = harness.event_time + 1 },
+    };
+    for (expected) |want| {
+        const event = try expectEventFor(&client, "s");
+        try testing.expectEqual(want.kind, event.kind);
+        try testing.expectEqual(want.created_at, event.created_at);
     }
-    try testing.expectEqual(@as(usize, 3), received);
+    try expectEose(&client, "s");
+}
+
+test "a filter with limit 0 replays nothing even beside another filter" {
+    const relay = try Relay.start(testing.allocator, .{});
+    defer relay.stop();
+
+    var author = try harness.Author.init(12);
+    defer author.deinit();
+
+    var client = try Client.connect(relay);
+    defer client.close();
+
+    try client.sendEvent(try author.event(client.allocator(), harness.event_time, 1, &.{}, "must not replay"));
+    try expectOk(&client, true, "");
+
+    try client.send("[\"REQ\",\"s\",{\"kinds\":[1],\"limit\":0},{\"kinds\":[7],\"limit\":1}]");
+    try expectEose(&client, "s");
 }
 
 test "an event whose id does not match its content is rejected as invalid" {

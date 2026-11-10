@@ -148,9 +148,10 @@ Matching rules:
 - Events are streamed newest-first by `created_at`, tie-broken by ascending id.
 
 The relay caps `limit` at its configured `max_limit` and applies `default_limit` when the field
-is absent. Both are advertised in the NIP-11 document. When several filters in one `REQ` name
-different limits, the largest applies across the merged result, so that no filter is served
-fewer events than it asked for.
+is absent. Both are advertised in the NIP-11 document. Each filter's `limit` bounds only the
+events that filter selects: the stored phase is the union of each filter's newest matches, each
+event sent once. A filter with `limit: 0` contributes no stored events, whatever the other
+filters ask for.
 
 ## Kind semantics
 

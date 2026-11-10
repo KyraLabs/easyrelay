@@ -77,14 +77,9 @@ pub const Memory = struct {
         return self.put(event);
     }
 
-    fn queryErased(
-        ptr: *anyopaque,
-        filters: []const Filter,
-        limit: usize,
-        sink: Sink,
-    ) QueryError!void {
+    fn queryErased(ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void {
         const self: *Memory = @ptrCast(@alignCast(ptr));
-        return self.query(filters, limit, sink);
+        return self.query(filters, sink);
     }
 
     fn put(self: *Memory, event: *const Event) Error!PutResult {
@@ -106,23 +101,29 @@ pub const Memory = struct {
         return .stored;
     }
 
-    fn query(
-        self: *Memory,
-        filters: []const Filter,
-        limit: usize,
-        sink: Sink,
-    ) QueryError!void {
+    fn query(self: *Memory, filters: []const Filter, sink: Sink) QueryError!void {
+        const remaining = try self.gpa.alloc(u64, filters.len);
+        defer self.gpa.free(remaining);
+        var open: usize = 0;
+        for (filters, remaining) |filter, *left| {
+            left.* = filter.limit orelse std.math.maxInt(u64);
+            if (left.* != 0) open += 1;
+        }
+
         self.lock.lockSharedUncancelable(self.io);
         defer self.lock.unlockShared(self.io);
 
-        var emitted: usize = 0;
         for (self.order.items) |*event| {
-            if (emitted == limit) break;
-            if (!matchesAny(filters, event)) continue;
-            try sink.emit(event);
-            emitted += 1;
+            if (open == 0) break;
+            var wanted = false;
+            for (filters, remaining) |filter, *left| {
+                if (left.* == 0 or !filter.matches(event.*)) continue;
+                left.* -= 1;
+                if (left.* == 0) open -= 1;
+                wanted = true;
+            }
+            if (wanted) try sink.emit(event);
         }
-        std.debug.assert(emitted <= limit);
     }
 
     /// Where `event` belongs in `order`, by binary search.
@@ -142,16 +143,6 @@ pub const Memory = struct {
 fn isNewer(a: *const Event, b: *const Event) bool {
     if (a.created_at != b.created_at) return a.created_at > b.created_at;
     return std.mem.order(u8, &a.id, &b.id) == .lt;
-}
-
-/// Filters are OR-ed with each other; the fields within one are AND-ed by
-/// `Filter.matches`. An empty filter array constrains nothing into existence:
-/// it matches no event, which is not the same as the empty filter `{}`.
-fn matchesAny(filters: []const Filter, event: *const Event) bool {
-    for (filters) |filter| {
-        if (filter.matches(event.*)) return true;
-    }
-    return false;
 }
 
 /// Copies everything `event` borrows. The caller's per-request arena is reset
@@ -272,7 +263,7 @@ test "query streams newest first" {
     }) |event| _ = try memory.store().put(&event);
 
     var collector: Collector = .{};
-    try memory.store().query(&.{.{}}, 10, collector.sink());
+    try memory.store().query(&.{.{}}, collector.sink());
 
     try testing.expectEqual(@as(usize, 3), collector.len);
     try testing.expectEqual(@as(u8, 3), collector.idAt(0));
@@ -291,7 +282,7 @@ test "events sharing a created_at are ordered by ascending id" {
     }) |event| _ = try memory.store().put(&event);
 
     var collector: Collector = .{};
-    try memory.store().query(&.{.{}}, 10, collector.sink());
+    try memory.store().query(&.{.{}}, collector.sink());
 
     try testing.expectEqual(@as(u8, 0xaa), collector.idAt(0));
     try testing.expectEqual(@as(u8, 0xbb), collector.idAt(1));
@@ -308,7 +299,7 @@ test "a filter constrains what is emitted" {
     }) |event| _ = try memory.store().put(&event);
 
     var collector: Collector = .{};
-    try memory.store().query(&.{.{ .kinds = &.{7} }}, 10, collector.sink());
+    try memory.store().query(&.{.{ .kinds = &.{7} }}, collector.sink());
 
     try testing.expectEqual(@as(usize, 1), collector.len);
     try testing.expectEqual(@as(u8, 2), collector.idAt(0));
@@ -326,7 +317,7 @@ test "filters are OR-ed with each other" {
 
     var collector: Collector = .{};
     const filters = [_]Filter{ .{ .kinds = &.{1} }, .{ .kinds = &.{7} } };
-    try memory.store().query(&filters, 10, collector.sink());
+    try memory.store().query(&filters, collector.sink());
 
     try testing.expectEqual(@as(usize, 2), collector.len);
     try testing.expectEqual(@as(u8, 2), collector.idAt(0));
@@ -345,12 +336,12 @@ test "an event matching several filters is emitted once" {
         .{ .kinds = &.{1} },
         .{ .authors = &.{[_]u8{0xab} ** 32} },
     };
-    try memory.store().query(&filters, 10, collector.sink());
+    try memory.store().query(&filters, collector.sink());
 
     try testing.expectEqual(@as(usize, 1), collector.len);
 }
 
-test "limit bounds the stored phase across the whole merge" {
+test "each filter's limit bounds only that filter's matches" {
     var memory = Memory.init(testing.allocator, testing.io);
     defer memory.deinit();
 
@@ -358,17 +349,51 @@ test "limit bounds the stored phase across the whole merge" {
         testEvent(1, 1700000000, 1),
         testEvent(2, 1700000100, 7),
         testEvent(3, 1700000200, 1),
+        testEvent(4, 1700000300, 7),
     }) |event| _ = try memory.store().put(&event);
 
-    // Two filters, three matching events, and a limit of two: the answer is
-    // the two globally newest, not two per filter.
     var collector: Collector = .{};
-    const filters = [_]Filter{ .{ .kinds = &.{1} }, .{ .kinds = &.{7} } };
-    try memory.store().query(&filters, 2, collector.sink());
+    const filters = [_]Filter{ .{ .kinds = &.{1}, .limit = 1 }, .{ .kinds = &.{7}, .limit = 2 } };
+    try memory.store().query(&filters, collector.sink());
 
-    try testing.expectEqual(@as(usize, 2), collector.len);
-    try testing.expectEqual(@as(u8, 3), collector.idAt(0));
-    try testing.expectEqual(@as(u8, 2), collector.idAt(1));
+    try testing.expectEqual(@as(usize, 3), collector.len);
+    try testing.expectEqual(@as(u8, 4), collector.idAt(0));
+    try testing.expectEqual(@as(u8, 3), collector.idAt(1));
+    try testing.expectEqual(@as(u8, 2), collector.idAt(2));
+}
+
+test "a zero limit excludes its filter's matches but not another filter's" {
+    var memory = Memory.init(testing.allocator, testing.io);
+    defer memory.deinit();
+
+    for ([_]Event{
+        testEvent(1, 1700000000, 1),
+        testEvent(2, 1700000100, 7),
+    }) |event| _ = try memory.store().put(&event);
+
+    var collector: Collector = .{};
+    const filters = [_]Filter{ .{ .kinds = &.{1}, .limit = 0 }, .{ .kinds = &.{7}, .limit = 1 } };
+    try memory.store().query(&filters, collector.sink());
+
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    try testing.expectEqual(@as(u8, 2), collector.idAt(0));
+}
+
+test "an event two filters select is emitted once and counts against both" {
+    var memory = Memory.init(testing.allocator, testing.io);
+    defer memory.deinit();
+
+    for ([_]Event{
+        testEvent(1, 1700000000, 1),
+        testEvent(2, 1700000100, 1),
+    }) |event| _ = try memory.store().put(&event);
+
+    var collector: Collector = .{};
+    const filters = [_]Filter{ .{ .kinds = &.{1}, .limit = 1 }, .{ .authors = &.{[_]u8{0xab} ** 32}, .limit = 1 } };
+    try memory.store().query(&filters, collector.sink());
+
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    try testing.expectEqual(@as(u8, 2), collector.idAt(0));
 }
 
 test "no filters and a zero limit both emit nothing" {
@@ -379,11 +404,11 @@ test "no filters and a zero limit both emit nothing" {
     _ = try memory.store().put(&event);
 
     var no_filters: Collector = .{};
-    try memory.store().query(&.{}, 10, no_filters.sink());
+    try memory.store().query(&.{}, no_filters.sink());
     try testing.expectEqual(@as(usize, 0), no_filters.len);
 
     var zero_limit: Collector = .{};
-    try memory.store().query(&.{.{}}, 0, zero_limit.sink());
+    try memory.store().query(&.{.{ .limit = 0 }}, zero_limit.sink());
     try testing.expectEqual(@as(usize, 0), zero_limit.len);
 }
 
@@ -397,7 +422,7 @@ test "a sink that aborts stops the query" {
     }) |event| _ = try memory.store().put(&event);
 
     var collector: Collector = .{ .stop_after = 1 };
-    try testing.expectError(error.Abort, memory.store().query(&.{.{}}, 10, collector.sink()));
+    try testing.expectError(error.Abort, memory.store().query(&.{.{}}, collector.sink()));
     try testing.expectEqual(@as(usize, 1), collector.len);
 }
 
@@ -428,7 +453,7 @@ test "the store keeps its own copy of what the event borrows" {
     testing.allocator.free(content);
 
     var collector: Collector = .{};
-    try memory.store().query(&.{.{ .tags = &.{.{ .letter = 'e', .values = &.{"borrowed tag value"} }} }}, 10, collector.sink());
+    try memory.store().query(&.{.{ .tags = &.{.{ .letter = 'e', .values = &.{"borrowed tag value"} }} }}, collector.sink());
 
     try testing.expectEqual(@as(usize, 1), collector.len);
     try testing.expectEqualStrings("borrowed content", collector.contents[0]);
@@ -453,7 +478,7 @@ const ConcurrentReader = struct {
     fn run(self: ConcurrentReader) void {
         for (0..200) |_| {
             var collector: Collector = .{};
-            self.store.query(&.{.{}}, 8, collector.sink()) catch |err| std.debug.panic("query failed: {t}", .{err});
+            self.store.query(&.{.{ .limit = 8 }}, collector.sink()) catch |err| std.debug.panic("query failed: {t}", .{err});
         }
     }
 };

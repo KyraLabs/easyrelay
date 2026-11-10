@@ -120,7 +120,7 @@ pub const Session = struct {
             // parsing the event a second time to measure it exactly would cost
             // more than the shade is worth.
             .event => |event| try self.publish(context, event, data.len),
-            .req => |req| try self.subscribe(req),
+            .req => |req| try self.subscribe(context, req),
             // Closing a subscription that is not open is not an error, and
             // NIP-01 gives the relay nothing to say about it.
             .close => |close| {
@@ -201,7 +201,7 @@ pub const Session = struct {
 
     /// Opens or replaces a subscription, answers it from the store, and closes
     /// the stored phase with `EOSE`.
-    fn subscribe(self: *Session, req: codec.ClientMessage.Req) Error!void {
+    fn subscribe(self: *Session, context: Context, req: codec.ClientMessage.Req) Error!void {
         // Held across the whole stored phase. A live event delivered in the
         // middle of it would reach the client before `EOSE`, and
         // docs/protocol.md promises that every stored event precedes it.
@@ -228,9 +228,16 @@ pub const Session = struct {
             .session = self,
             .subscription_id = req.subscription_id,
         };
-        const limit = subscriptions.resolveLimit(req.filters, self.shared.limits.subscription);
+        const bounded = subscriptions.resolveLimits(context.arena, req.filters, self.shared.limits.subscription) catch {
+            _ = self.subscriber.registry.close(req.subscription_id);
+            return self.sendClosed(
+                req.subscription_id,
+                .internal,
+                "the relay ran out of memory opening this subscription",
+            );
+        };
 
-        self.shared.store.query(req.filters, limit, sink.sink()) catch |err| switch (err) {
+        self.shared.store.query(bounded, sink.sink()) catch |err| switch (err) {
             // The sink stops the query when it cannot send, and the reason it
             // could not is worth more than the fact that it stopped.
             error.Abort => return sink.failure orelse error.WriteFailed,
@@ -759,14 +766,9 @@ const FailingStore = struct {
         return .stored;
     }
 
-    fn query(
-        ptr: *anyopaque,
-        filters: []const nostr.filter.Filter,
-        limit: usize,
-        sink: store.Sink,
-    ) store.QueryError!void {
+    fn query(ptr: *anyopaque, filters: []const nostr.filter.Filter, sink: store.Sink) store.QueryError!void {
         const self: *FailingStore = @ptrCast(@alignCast(ptr));
-        _ = .{ filters, limit, sink };
+        _ = .{ filters, sink };
         if (self.query_error) |failure| return failure;
     }
 };
