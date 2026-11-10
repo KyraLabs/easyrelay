@@ -104,6 +104,9 @@ pub const Session = struct {
                 // with `CLOSED` naming it. Anything else has nothing to name,
                 // and NIP-01 leaves only `NOTICE`.
                 if (diagnostics.subject) |subscription_id| {
+                    self.subscriber.mutex.lockUncancelable(self.shared.io);
+                    defer self.subscriber.mutex.unlock(self.shared.io);
+                    _ = self.subscriber.registry.close(subscription_id);
                     return self.sendClosed(subscription_id, .invalid, diagnostics.message());
                 }
                 return self.sendNotice(diagnostics.message());
@@ -211,11 +214,14 @@ pub const Session = struct {
                 .blocked,
                 "this connection already holds as many subscriptions as it may",
             ),
-            error.OutOfMemory => return self.sendClosed(
-                req.subscription_id,
-                .internal,
-                "the relay ran out of memory opening this subscription",
-            ),
+            error.OutOfMemory => {
+                _ = self.subscriber.registry.close(req.subscription_id);
+                return self.sendClosed(
+                    req.subscription_id,
+                    .internal,
+                    "the relay ran out of memory opening this subscription",
+                );
+            },
         };
 
         var sink: EventSink = .{
@@ -634,6 +640,38 @@ test "a REQ refused by the codec is answered with CLOSED naming the subscription
     const answer = harness.recorder.only();
     try testing.expect(std.mem.startsWith(u8, answer, "[\"CLOSED\",\"sub-1\",\"invalid:"));
     try testing.expect(std.mem.indexOf(u8, answer, "over the limit of 1") != null);
+}
+
+test "an invalid REQ replacing an open subscription closes it" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{}]");
+    harness.recorder.clear();
+    try harness.handle("[\"REQ\",\"sub-1\",{\"kinds\":[-1]}]");
+    try testing.expect(std.mem.startsWith(u8, harness.recorder.only(), "[\"CLOSED\",\"sub-1\",\"invalid:"));
+    try testing.expectEqual(@as(usize, 0), harness.subscriber.registry.count());
+
+    try harness.handle(try harness.eventMessage(try harness.signedEvent("after CLOSED")));
+    try testing.expectEqual(@as(usize, 0), harness.delivered.items.len);
+}
+
+test "a replacement that runs out of memory closes the subscription it announces closed" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+
+    try harness.handle("[\"REQ\",\"sub-1\",{}]");
+    harness.recorder.clear();
+
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    harness.subscriber.registry.gpa = failing.allocator();
+    try harness.handle("[\"REQ\",\"sub-1\",{\"kinds\":[7]}]");
+    harness.subscriber.registry.gpa = testing.allocator;
+
+    try testing.expect(std.mem.startsWith(u8, harness.recorder.only(), "[\"CLOSED\",\"sub-1\",\"error:"));
+    try testing.expectEqual(@as(usize, 0), harness.subscriber.registry.count());
 }
 
 test "a filter in a REQ decides what the subscription is answered with" {

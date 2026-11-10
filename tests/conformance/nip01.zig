@@ -242,6 +242,30 @@ test "a closed subscription receives nothing further" {
     try subscriber.expectSilence(300);
 }
 
+test "a subscription the relay answers with CLOSED receives nothing further" {
+    const relay = try Relay.start(testing.allocator, .{});
+    defer relay.stop();
+
+    var author = try harness.Author.init(10);
+    defer author.deinit();
+
+    var publisher = try Client.connect(relay);
+    defer publisher.close();
+    var subscriber = try Client.connect(relay);
+    defer subscriber.close();
+
+    try subscriber.send("[\"REQ\",\"s\",{}]");
+    try expectEose(&subscriber, "s");
+    try subscriber.send("[\"REQ\",\"s\",{\"kinds\":[-1]}]");
+    const closed = try subscriber.receiveJson();
+    try testing.expectEqualStrings("CLOSED", closed.array.items[0].string);
+
+    try publisher.sendEvent(try author.event(publisher.allocator(), harness.event_time, 1, &.{}, "after CLOSED"));
+    try expectOk(&publisher, true, "");
+
+    try subscriber.expectSilence(300);
+}
+
 test "an event with control bytes in its content reaches clients as valid JSON" {
     const relay = try Relay.start(testing.allocator, .{});
     defer relay.stop();
