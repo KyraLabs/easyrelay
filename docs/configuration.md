@@ -1,9 +1,8 @@
 # Configuration
 
-> **Provisional.** The concrete file syntax is not settled — see
-> [ADR-0007](adr/0007-configuration-format.md), which is decided in Phase 2. The **settings**
-> below are stable; only their spelling may change. Examples use ZON, the current
-> recommendation.
+The file format is ZON ([ADR-0007](adr/0007-configuration-format.md)). Settings marked with a
+phase are documented ahead of their implementation; until that phase lands they are not read, and
+naming one in the file is an unknown-key error.
 
 **A configuration file is optional.** Every setting has a default that is correct for a real
 deployment, so `easyrelay` with no file and no arguments starts a working relay. Read this
@@ -11,12 +10,14 @@ document when you want to change something, not to get started — see the quick
 [README](../README.md).
 
 easyrelay reads one configuration file, given by `--config <path>` or defaulting to
-`./easyrelay.zon` if it exists. `easyrelay init` writes a fully commented file with every
-default filled in, which is the easier way to start editing than transcribing from here.
+`./easyrelay.zon` if it exists. `easyrelay init` prints a fully commented file with every
+default filled in (`easyrelay init > easyrelay.zon`), which is the easier way to start editing
+than transcribing from here.
 
 Any setting may be overridden by an environment variable named `EASYRELAY_` followed by the
 path in upper snake case: `limits.max_event_size` becomes `EASYRELAY_LIMITS_MAX_EVENT_SIZE`.
-Environment variables win over the file, which is what containerised deployments need.
+Environment variables win over the file, which is what containerised deployments need. A list
+is comma-separated, and `null` clears an optional setting.
 
 The configuration is validated fully at startup. An unknown key, an out-of-range value or a
 contradictory combination is a startup failure with a message naming the key — never a silently
@@ -44,19 +45,19 @@ ignored line.
 | `port` | u16 | `7777` | Bind port. |
 | `max_connections` | usize | `1024` | Connections accepted before new ones are refused. |
 | `handshake_timeout_ms` | u32 | `5000` | Time allowed to complete the WebSocket handshake. |
-| `ping_interval_s` | u32 | `30` | Interval between pings on idle connections. `0` disables. |
-| `idle_timeout_s` | u32 | `300` | Close a connection after this long with no traffic. `0` disables. |
-| `write_buffer_limit` | usize | `1048576` | Per-connection pending write bytes before the connection is dropped. Backpressure, not buffering. |
+| `ping_interval_s` | u32 | `30` | Interval between pings on idle connections. `0` disables. Phase 3. |
+| `idle_timeout_s` | u32 | `300` | Close a connection after this long with no traffic. `0` disables. Phase 3. |
+| `write_buffer_limit` | usize | `1048576` | Per-connection pending write bytes before the connection is dropped. Backpressure, not buffering. Phase 3. |
 
 ## `storage`
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `path` | string | `./data` | Data directory. |
+| `path` | string | `./data` | Data directory. One relay at a time: a second one on the same directory refuses to start. |
 | `map_size` | usize | `10737418240` | LMDB map size in bytes (10 GiB). Address space, not a disk reservation, but a hard ceiling. |
 | `durable` | bool | `true` | Sync metadata on commit. Setting this to `false` trades durability for throughput and invalidates any benchmark comparison. |
 | `max_scan` | usize | `100000` | Index entries a single query may examine before returning early. Bounds worst-case query cost. |
-| `reaper_interval_s` | u32 | `60` | How often NIP-40 expiration and retention run. |
+| `reaper_interval_s` | u32 | `60` | How often NIP-40 expiration and retention run. Phase 3. |
 
 ## `limits`
 
@@ -83,13 +84,15 @@ Token buckets. `null` on any bucket disables it.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `events_per_second` | ?f64 | `10` | Sustained accepted-event rate per connection. |
-| `events_burst` | usize | `50` | Burst allowance. |
-| `messages_per_second` | ?f64 | `50` | Sustained inbound message rate per connection, of any type. |
-| `subscriptions_per_minute` | ?f64 | `60` | `REQ` rate per connection. |
+| `events_per_second` | ?f64 | `10` | Sustained accepted-event rate per connection. Phase 3. |
+| `events_burst` | usize | `50` | Burst allowance. Phase 3. |
+| `messages_per_second` | ?f64 | `50` | Sustained inbound message rate per connection, of any type. Phase 3. |
+| `subscriptions_per_minute` | ?f64 | `60` | `REQ` rate per connection. Phase 3. |
 | `write_queue_depth` | usize | `4096` | Pending writes before events are refused with `rate-limited:`. |
 
 ## `policy`
+
+Phase 3; `plugin` is Phase 4.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
@@ -106,6 +109,8 @@ An allow list and a deny list containing the same entry is a configuration error
 precedence puzzle.
 
 ## `retention`
+
+Phase 3.
 
 Off by default. See [storage.md](storage.md#retention).
 
@@ -136,12 +141,16 @@ Feeds the NIP-11 document directly. `supported_nips` is not configurable: it is 
 
 ## `logging`
 
+Phase 3.
+
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
 | `level` | enum | `info` | `error`, `warn`, `info`, `debug`. |
 | `format` | enum | `json` | `json` or `text`. |
 
 ## `metrics`
+
+Phase 3.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |

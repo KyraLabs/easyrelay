@@ -202,7 +202,10 @@ modes exist and may be exposed as configuration, but they are never the default 
 basis of a published benchmark. See [testing.md](testing.md#benchmarks).
 
 **The store is a subdirectory of the data directory.** The environment lives at
-`<storage.path>/events`, holding LMDB's `data.mdb` and its lock file. The data directory itself
+`<storage.path>/events`, holding LMDB's `data.mdb` and its lock file, and `easyrelay.lock`. The
+relay holds an exclusive lock on `easyrelay.lock` while the store is open, and a second relay on
+the same directory refuses to start: the two would share the events but not their subscriptions,
+and each would miss live events the other accepted. The data directory itself
 stays free for the search index and any future sibling data, which is the property this rule
 exists to protect.
 

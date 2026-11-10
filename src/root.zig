@@ -32,6 +32,8 @@ pub const diagnostics = @import("relay/diagnostics.zig");
 
 pub const server = @import("server/server.zig");
 
+pub const config = @import("config.zig");
+
 test {
     _ = store;
     _ = memory;
@@ -45,6 +47,10 @@ test {
     _ = hub;
     _ = diagnostics;
     _ = server;
+    _ = kind;
+    _ = index;
+    _ = writer;
+    _ = config;
 }
 
 test "version is a non-empty semantic version" {

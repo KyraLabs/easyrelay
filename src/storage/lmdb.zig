@@ -19,6 +19,8 @@ const StoreQueryError = store.QueryError;
 pub const Error = error{
     OutOfMemory,
     DataDirectory,
+    /// Another process holds the data directory.
+    InUse,
     Backend,
     Corrupt,
 };
@@ -31,6 +33,8 @@ pub const Options = struct {
 };
 
 pub const subdirectory = "events";
+
+const lock_file = "easyrelay.lock";
 
 const max_databases = 16;
 
@@ -260,6 +264,10 @@ const Choice = union(enum) {
 
 pub const Lmdb = struct {
     gpa: std.mem.Allocator,
+    io: std.Io,
+    /// Held for the store's lifetime: two relays on one directory would share the events but not
+    /// their subscriptions, and each would miss live events the other accepts.
+    lock: std.Io.File,
     env: lmdb.Environment,
     max_scan: usize,
 
@@ -273,6 +281,17 @@ pub const Lmdb = struct {
         defer gpa.free(path);
 
         std.Io.Dir.cwd().createDirPath(io, path) catch return error.DataDirectory;
+        const lock_path = try std.fs.path.join(gpa, &.{ path, lock_file });
+        defer gpa.free(lock_path);
+        const lock = std.Io.Dir.cwd().createFile(io, lock_path, .{
+            .truncate = false,
+            .lock = .exclusive,
+            .lock_nonblocking = true,
+        }) catch |err| return switch (err) {
+            error.WouldBlock => error.InUse,
+            else => error.DataDirectory,
+        };
+        errdefer lock.close(io);
 
         const env = lmdb.Environment.init(path, .{
             .map_size = options.map_size,
@@ -283,7 +302,7 @@ pub const Lmdb = struct {
         if (!options.durable and lmdb_c.mdb_env_set_flags(env.ptr, lmdb_c.MDB_NOSYNC, 1) != 0) return error.Backend;
 
         createTables(env) catch return error.Backend;
-        return .{ .gpa = gpa, .env = env, .max_scan = options.max_scan };
+        return .{ .gpa = gpa, .io = io, .lock = lock, .env = env, .max_scan = options.max_scan };
     }
 
     pub fn store(self: *Lmdb) Store {
@@ -292,6 +311,7 @@ pub const Lmdb = struct {
 
     pub fn close(self: *Lmdb) void {
         self.env.deinit();
+        self.lock.close(self.io);
         self.* = undefined;
     }
 
@@ -748,7 +768,7 @@ test "the local id counter survives a reopen and does not restart" {
     try testing.expectEqual(last + 1, try appendOne(&backend, &buffer, &event));
 }
 
-test "an aborted transaction assigns no id that a later append reuses" {
+test "an aborted transaction leaves the counter where it was" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -766,10 +786,7 @@ test "an aborted transaction assigns no id that a later append reuses" {
         txn.abort();
     }
 
-    var backend_after = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
-    defer backend_after.close();
-
-    try testing.expectEqual(first_local_id, try appendOne(&backend_after, &buffer, &event));
+    try testing.expectEqual(first_local_id, try appendOne(&backend, &buffer, &event));
 }
 
 const Collector = struct {
@@ -1339,28 +1356,18 @@ test "a non-durable store still stores and reads back" {
     try testing.expectEqual(PutResult.stored, try backend.store().put(&event));
 }
 
-test "two handles on one environment never reuse a local id" {
+test "a second store on a directory in use is refused until the first closes" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const data_dir = try tmpPath(&tmp, &path_buffer);
 
     var first = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
-    defer first.close();
+    try testing.expectError(error.InUse, Lmdb.open(testing.allocator, testing.io, data_dir, .{}));
+    first.close();
+
     var second = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
-    defer second.close();
-
-    for (0..3) |round| {
-        const base: u8 = @intCast(round * 2 + 1);
-        const at: i64 = 1700000000 + @as(i64, base);
-        try testing.expectEqual(PutResult.stored, try first.store().put(&kindEvent(base, at, 1)));
-        try testing.expectEqual(PutResult.stored, try second.store().put(&kindEvent(base + 1, at + 1, 1)));
-    }
-
-    var collector: Collector = .{};
-    try first.store().query(&.{.{}}, collector.sink());
-    try testing.expectEqual(@as(usize, 6), collector.len);
-    for (0..6) |position| try testing.expectEqual(@as(u8, @intCast(6 - position)), collector.idAt(position));
+    second.close();
 }
 
 test "an ids query reads each event once, however often its id repeats" {
