@@ -40,6 +40,10 @@ pub const frame = @import("transport/frame.zig");
 
 pub const handshake = @import("transport/handshake.zig");
 
+pub const socket = @import("transport/socket.zig");
+
+pub const client = @import("transport/client.zig");
+
 test {
     _ = store;
     _ = memory;
@@ -60,6 +64,8 @@ test {
     _ = nip11;
     _ = frame;
     _ = handshake;
+    _ = socket;
+    _ = client;
 }
 
 test "version is a non-empty semantic version" {
