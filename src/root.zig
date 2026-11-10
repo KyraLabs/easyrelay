@@ -34,6 +34,8 @@ pub const server = @import("server/server.zig");
 
 pub const config = @import("config.zig");
 
+pub const nip11 = @import("relay/nip11.zig");
+
 test {
     _ = store;
     _ = memory;
@@ -51,6 +53,7 @@ test {
     _ = index;
     _ = writer;
     _ = config;
+    _ = nip11;
 }
 
 test "version is a non-empty semantic version" {

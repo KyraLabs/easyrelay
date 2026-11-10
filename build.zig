@@ -26,6 +26,8 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    mod.addAnonymousImport("nips.md", .{ .root_source_file = b.path("docs/nips.md") });
+
     const exe = b.addExecutable(.{
         .name = "easyrelay",
         .root_module = b.createModule(.{
