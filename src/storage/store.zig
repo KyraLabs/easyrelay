@@ -16,6 +16,8 @@ pub const PutResult = enum {
     duplicate,
     /// A replaceable or addressable event lost the tie-break to the one already stored.
     outdated,
+    /// Its author deleted it, or deleted its address at or after its `created_at` (NIP-09).
+    deleted,
 };
 
 /// The emitted event borrows the store's memory and is valid only until `emit` returns.

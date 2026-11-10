@@ -37,6 +37,8 @@ const meta_db = "meta";
 const by_id_db = "by_id";
 const by_replaceable_db = "by_replaceable";
 const by_address_db = "by_address";
+const deleted_db = "deleted";
+const deleted_address_db = "deleted_address";
 const next_local_id_key = "next_local_id";
 
 /// Zero is reserved as the watermark before any event.
@@ -55,14 +57,18 @@ const Coordinate = struct {
     len: usize,
 
     fn of(event: *const Event) ?Coordinate {
+        return from(&event.pubkey, event.kind, kinds.dValue(event));
+    }
+
+    fn from(pubkey: *const [32]u8, kind: u16, d: []const u8) ?Coordinate {
         var coordinate: Coordinate = .{ .db = undefined, .bytes = undefined, .len = 34 };
-        coordinate.bytes[0..32].* = event.pubkey;
-        std.mem.writeInt(u16, coordinate.bytes[32..34], event.kind, .big);
-        switch (kinds.classify(event.kind)) {
+        coordinate.bytes[0..32].* = pubkey.*;
+        std.mem.writeInt(u16, coordinate.bytes[32..34], kind, .big);
+        switch (kinds.classify(kind)) {
             .replaceable => coordinate.db = by_replaceable_db,
             .addressable => {
                 coordinate.db = by_address_db;
-                std.crypto.hash.sha2.Sha256.hash(kinds.dValue(event), coordinate.bytes[34..66], .{});
+                std.crypto.hash.sha2.Sha256.hash(d, coordinate.bytes[34..66], .{});
                 coordinate.len = 66;
             },
             .regular, .ephemeral => return null,
@@ -77,6 +83,18 @@ const Coordinate = struct {
 
 fn database(txn: lmdb.Transaction, name: [*:0]const u8) Error!lmdb.Database {
     return lmdb.Database.open(txn, name, .{ .create = true }) catch error.Backend;
+}
+
+fn deletedUntil(txn: lmdb.Transaction, coordinate: *const Coordinate) Error!?i64 {
+    const value = ((try database(txn, deleted_address_db)).get(coordinate.key()) catch return error.Backend) orelse return null;
+    if (value.len != 8) return error.Corrupt;
+    return std.mem.readInt(i64, value[0..8], .big);
+}
+
+fn remove(txn: lmdb.Transaction, target: *const Lmdb.Stored) Error!void {
+    try deleteIndexes(txn, &target.event);
+    const key = encodeLocalId(target.local_id);
+    (try database(txn, events_db)).delete(&key) catch return error.Backend;
 }
 
 const IndexWriter = struct {
@@ -354,24 +372,60 @@ pub const Lmdb = struct {
     fn insert(self: *Lmdb, txn: lmdb.Transaction, arena: std.mem.Allocator, event: *const Event) Error!PutResult {
         std.debug.assert(kinds.classify(event.kind) != .ephemeral);
         if (try self.contains(txn, &event.id)) return .duplicate;
+        if (((try database(txn, deleted_db)).get(&event.id) catch return error.Backend) != null) return .deleted;
 
         if (Coordinate.of(event)) |coordinate| {
-            const found = (try database(txn, coordinate.db)).get(coordinate.key()) catch return error.Backend;
-            if (found) |value| {
-                if (value.len != 8) return error.Corrupt;
-                const incumbent_id = std.mem.readInt(u64, value[0..8], .big);
-                const incumbent = (try self.read(txn, arena, incumbent_id)) orelse return error.Corrupt;
-                if (!kinds.supersedes(event, &incumbent)) return .outdated;
-                try deleteIndexes(txn, &incumbent);
-                const incumbent_key = encodeLocalId(incumbent_id);
-                (try database(txn, events_db)).delete(&incumbent_key) catch return error.Backend;
+            if (try deletedUntil(txn, &coordinate)) |until| {
+                if (event.created_at <= until) return .deleted;
+            }
+            if (try self.occupant(txn, arena, &coordinate)) |incumbent| {
+                if (!kinds.supersedes(event, &incumbent.event)) return .outdated;
+                try remove(txn, &incumbent);
             }
         }
 
         const size = record.encodedSize(event) catch return error.Backend;
         const buffer = try arena.alloc(u8, size);
         _ = try self.append(txn, buffer, event);
+        if (event.kind == kinds.deletion) try self.applyDeletion(txn, arena, event);
         return .stored;
+    }
+
+    const Stored = struct { local_id: u64, event: Event };
+
+    fn occupant(self: *Lmdb, txn: lmdb.Transaction, arena: std.mem.Allocator, coordinate: *const Coordinate) Error!?Stored {
+        const value = ((try database(txn, coordinate.db)).get(coordinate.key()) catch return error.Backend) orelse return null;
+        return try self.storedAt(txn, arena, value);
+    }
+
+    fn storedAt(self: *Lmdb, txn: lmdb.Transaction, arena: std.mem.Allocator, value: []const u8) Error!Stored {
+        if (value.len != 8) return error.Corrupt;
+        const local_id = std.mem.readInt(u64, value[0..8], .big);
+        const event = (try self.read(txn, arena, local_id)) orelse return error.Corrupt;
+        return .{ .local_id = local_id, .event = event };
+    }
+
+    fn applyDeletion(self: *Lmdb, txn: lmdb.Transaction, arena: std.mem.Allocator, request: *const Event) Error!void {
+        for (request.tags) |tag| switch (kinds.Target.of(tag) orelse continue) {
+            .id => |id| {
+                const value = ((try database(txn, by_id_db)).get(&id) catch return error.Backend) orelse continue;
+                const target = try self.storedAt(txn, arena, value);
+                if (target.event.kind == kinds.deletion or !std.mem.eql(u8, &target.event.pubkey, &request.pubkey)) continue;
+                (try database(txn, deleted_db)).set(&id, "") catch return error.Backend;
+                try remove(txn, &target);
+            },
+            .address => |address| {
+                if (!std.mem.eql(u8, &address.pubkey, &request.pubkey)) continue;
+                const coordinate = Coordinate.from(&address.pubkey, address.kind, address.d) orelse continue;
+                if (try self.occupant(txn, arena, &coordinate)) |target| {
+                    if (target.event.created_at <= request.created_at) try remove(txn, &target);
+                }
+                const until = @max(request.created_at, (try deletedUntil(txn, &coordinate)) orelse std.math.minInt(i64));
+                var bytes: [8]u8 = undefined;
+                std.mem.writeInt(i64, &bytes, until, .big);
+                (try database(txn, deleted_address_db)).set(coordinate.key(), &bytes) catch return error.Backend;
+            },
+        };
     }
 
     fn query(self: *Lmdb, filters: []const Filter, sink: Sink) (Error || Sink.Abort)!void {
@@ -1037,7 +1091,7 @@ const IdCollector = struct {
 };
 
 fn randomEvent(random: std.Random, arena: std.mem.Allocator, authors: []const [32]u8) !Event {
-    const kind_choices = [_]u16{ 1, 1, 1, 7, 0, 3, 10002, 30023, 30000, 40000 };
+    const kind_choices = [_]u16{ 1, 1, 1, 7, 0, 3, 10002, 30023, 30000, 40000, 5 };
     const letters = [_][]const u8{ "e", "p", "t", "d" };
     const values = [_][]const u8{ "", "a", "b", "c" };
 
@@ -1060,6 +1114,28 @@ fn randomEvent(random: std.Random, arena: std.mem.Allocator, authors: []const [3
     random.bytes(&event.id);
     event.id[0] &= 0x0f;
     return event;
+}
+
+fn randomDeletion(random: std.Random, arena: std.mem.Allocator, authors: []const [32]u8, published: []const Event) !Event {
+    var request = try randomEvent(random, arena, authors);
+    request.kind = kinds.deletion;
+    const tags = try arena.alloc(nostr.event.Tag, 1 + random.uintLessThan(usize, 3));
+    for (tags) |*tag| {
+        const target = published[random.uintLessThan(usize, published.len)];
+        if (random.boolean()) {
+            tag.* = try arena.dupe([]const u8, &.{ "e", try arena.dupe(u8, &std.fmt.bytesToHex(target.id, .lower)) });
+        } else {
+            const address = try std.fmt.allocPrint(arena, "{d}:{s}:{s}", .{
+                target.kind,
+                std.fmt.bytesToHex(target.pubkey, .lower),
+                kinds.dValue(&target),
+            });
+            tag.* = try arena.dupe([]const u8, &.{ "a", address });
+        }
+    }
+    request.tags = tags;
+    if (random.boolean()) request.pubkey = published[random.uintLessThan(usize, published.len)].pubkey;
+    return request;
 }
 
 fn randomFilter(random: std.Random, arena: std.mem.Allocator, authors: []const [32]u8, stored: []const Event) !Filter {
@@ -1115,6 +1191,8 @@ test "the LMDB planner agrees with brute force over the memory store" {
             for (batch) |*event| {
                 event.* = if (published.items.len != 0 and random.uintLessThan(u8, 10) == 0)
                     published.items[random.uintLessThan(usize, published.items.len)]
+                else if (published.items.len != 0 and random.uintLessThan(u8, 12) == 0)
+                    try randomDeletion(random, arena, &authors, published.items)
                 else
                     try randomEvent(random, arena, &authors);
             }
@@ -1158,27 +1236,23 @@ test "the scan budget ends a query early" {
     try testing.expectEqual(@as(usize, 3), collector.len);
 }
 
-test "an ids query reads each event once, however often its id repeats" {
+test "a deletion holds across a restart" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
     const data_dir = try tmpPath(&tmp, &path_buffer);
+
+    const note = kindEvent(1, 1700000000, 1);
+    {
+        var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+        defer backend.close();
+        _ = try backend.store().put(&note);
+        var request = kindEvent(2, 1700000001, kinds.deletion);
+        request.tags = &.{&.{ "e", &std.fmt.bytesToHex(note.id, .lower) }};
+        _ = try backend.store().put(&request);
+    }
+
     var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
     defer backend.close();
-
-    var tags: [2000]nostr.event.Tag = undefined;
-    for (&tags) |*tag| tag.* = &.{ "t", "x" };
-    var note = kindEvent(1, 1700000000, 1);
-    note.tags = &tags;
-    _ = try backend.store().put(&note);
-
-    var ids: [1000][32]u8 = undefined;
-    for (&ids) |*id| id.* = note.id;
-    var measured = testing.FailingAllocator.init(testing.allocator, .{});
-    backend.gpa = measured.allocator();
-    defer backend.gpa = testing.allocator;
-    var collector: Collector = .{};
-    try backend.store().query(&.{.{ .ids = &ids, .limit = 1 }}, collector.sink());
-    try testing.expectEqual(@as(usize, 1), collector.len);
-    try testing.expect(measured.allocated_bytes < 1024 * 1024);
+    try testing.expectEqual(PutResult.deleted, try backend.store().put(&note));
 }

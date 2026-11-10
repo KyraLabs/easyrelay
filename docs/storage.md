@@ -85,6 +85,7 @@ available, because nothing bounds how many events may share one `created_at`.
 | `by_replaceable` | `pubkey`, `kind` | replaceable replacement |
 | `by_expiration` | `expires_at`, `event_id` | NIP-40 reaper |
 | `deleted` | `event_id` (32 B) | NIP-09 tombstones |
+| `deleted_address` | `pubkey`, `kind`, [`sha256(d_value)`] → `created_at` | NIP-09 address tombstones |
 
 The `event_id` in the key costs 32 bytes an entry where the `local_id` would have cost 8. That
 is the price of the tie-break being a property of the key order rather than of a sort, and it is
@@ -149,7 +150,9 @@ A kind-5 event lists `e` and `a` tags identifying what its author wants removed.
    different author are ignored silently — a deletion request is not authorisation.
 2. Removes the target event and its index entries.
 3. Records the target id in `deleted`, so a later re-submission of the same event is rejected
-   with `blocked:` rather than silently reinstated.
+   with `blocked:` rather than silently reinstated. An `a` target records its coordinate in
+   `deleted_address` with the request's `created_at`, keyed like `by_replaceable` or
+   `by_address`, and refuses any event at that coordinate up to that time.
 4. Stores the kind-5 event itself as a regular event, so that other relays syncing from this one
    learn about the deletion.
 

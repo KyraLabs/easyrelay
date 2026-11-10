@@ -19,6 +19,10 @@ pub const Memory = struct {
     lock: std.Io.RwLock = .init,
     order: std.ArrayList(Event),
     ids: std.AutoHashMapUnmanaged([32]u8, void),
+    deleted_ids: std.AutoHashMapUnmanaged([32]u8, void) = .empty,
+    deleted_addresses: std.ArrayList(DeletedAddress) = .empty,
+
+    const DeletedAddress = struct { address: kinds.Address, until: i64 };
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io) Memory {
         return .{ .gpa = gpa, .io = io, .order = .empty, .ids = .empty };
@@ -28,6 +32,9 @@ pub const Memory = struct {
         for (self.order.items) |event| freeEvent(self.gpa, event);
         self.order.deinit(self.gpa);
         self.ids.deinit(self.gpa);
+        self.deleted_ids.deinit(self.gpa);
+        for (self.deleted_addresses.items) |deleted| self.gpa.free(deleted.address.d);
+        self.deleted_addresses.deinit(self.gpa);
         self.* = undefined;
     }
 
@@ -69,6 +76,10 @@ pub const Memory = struct {
     fn insert(self: *Memory, event: *const Event) Error!PutResult {
         std.debug.assert(kinds.classify(event.kind) != .ephemeral);
         if (self.ids.contains(event.id)) return .duplicate;
+        if (self.deleted_ids.contains(event.id)) return .deleted;
+        for (self.deleted_addresses.items) |deleted| {
+            if (deleted.address.holds(event) and event.created_at <= deleted.until) return .deleted;
+        }
 
         const incumbent = self.incumbentIndex(event);
         if (incumbent) |index| {
@@ -88,7 +99,61 @@ pub const Memory = struct {
         self.ids.putAssumeCapacityNoClobber(owned.id, {});
 
         std.debug.assert(self.order.items.len == self.ids.count());
+        if (event.kind == kinds.deletion) try self.applyDeletion(event);
         return .stored;
+    }
+
+    fn applyDeletion(self: *Memory, request: *const Event) Error!void {
+        for (request.tags) |tag| switch (kinds.Target.of(tag) orelse continue) {
+            .id => |id| {
+                const position = self.indexOfId(&id) orelse continue;
+                const target = &self.order.items[position];
+                if (target.kind == kinds.deletion or !std.mem.eql(u8, &target.pubkey, &request.pubkey)) continue;
+                try self.deleted_ids.put(self.gpa, id, {});
+                self.remove(position);
+            },
+            .address => |address| {
+                if (!std.mem.eql(u8, &address.pubkey, &request.pubkey)) continue;
+                var position: usize = 0;
+                while (position < self.order.items.len) {
+                    const target = &self.order.items[position];
+                    if (address.holds(target) and target.created_at <= request.created_at) {
+                        self.remove(position);
+                    } else position += 1;
+                }
+                try self.recordDeletedAddress(address, request.created_at);
+            },
+        };
+    }
+
+    fn recordDeletedAddress(self: *Memory, address: kinds.Address, until: i64) Error!void {
+        for (self.deleted_addresses.items) |*deleted| {
+            if (deleted.address.kind == address.kind and
+                std.mem.eql(u8, &deleted.address.pubkey, &address.pubkey) and
+                std.mem.eql(u8, deleted.address.d, address.d))
+            {
+                deleted.until = @max(deleted.until, until);
+                return;
+            }
+        }
+        var owned = address;
+        owned.d = try self.gpa.dupe(u8, address.d);
+        errdefer self.gpa.free(owned.d);
+        try self.deleted_addresses.append(self.gpa, .{ .address = owned, .until = until });
+    }
+
+    fn indexOfId(self: Memory, id: *const [32]u8) ?usize {
+        if (!self.ids.contains(id.*)) return null;
+        for (self.order.items, 0..) |*stored, position| {
+            if (std.mem.eql(u8, &stored.id, id)) return position;
+        }
+        unreachable;
+    }
+
+    fn remove(self: *Memory, position: usize) void {
+        const removed = self.order.orderedRemove(position);
+        std.debug.assert(self.ids.remove(removed.id));
+        freeEvent(self.gpa, removed);
     }
 
     fn query(self: *Memory, filters: []const Filter, sink: Sink) QueryError!void {

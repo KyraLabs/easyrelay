@@ -23,6 +23,7 @@ pub fn ok(event_id: [32]u8, result: PutResult) codec.Ok {
         .stored => .{ .event_id = event_id, .accepted = true },
         .duplicate => .{ .event_id = event_id, .accepted = true, .prefix = .duplicate, .reason = "already stored" },
         .outdated => .{ .event_id = event_id, .accepted = true, .prefix = .duplicate, .reason = "a newer version is stored" },
+        .deleted => .{ .event_id = event_id, .accepted = false, .prefix = .blocked, .reason = "its author deleted it" },
     };
 }
 

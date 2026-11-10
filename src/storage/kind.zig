@@ -39,6 +39,58 @@ pub fn sameCoordinate(a: *const Event, b: *const Event) bool {
     };
 }
 
+pub const deletion: u16 = 5;
+
+/// A NIP-09 `a` tag target: `<kind>:<pubkey hex>:<d>`.
+pub const Address = struct {
+    kind: u16,
+    pubkey: [32]u8,
+    d: []const u8,
+
+    pub fn parse(value: []const u8) ?Address {
+        const first = std.mem.indexOfScalar(u8, value, ':') orelse return null;
+        const rest = value[first + 1 ..];
+        const second = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+        const kind = std.fmt.parseInt(u16, value[0..first], 10) catch return null;
+        const pubkey = parseHex32(rest[0..second]) orelse return null;
+        return .{ .kind = kind, .pubkey = pubkey, .d = rest[second + 1 ..] };
+    }
+
+    pub fn holds(self: Address, event: *const Event) bool {
+        if (event.kind != self.kind or !std.mem.eql(u8, &event.pubkey, &self.pubkey)) return false;
+        return switch (classify(event.kind)) {
+            .replaceable => true,
+            .addressable => std.mem.eql(u8, dValue(event), self.d),
+            .regular, .ephemeral => false,
+        };
+    }
+};
+
+/// Lowercase only, as everywhere else on the wire.
+pub fn parseHex32(text: []const u8) ?[32]u8 {
+    if (text.len != 64) return null;
+    for (text) |char| switch (char) {
+        '0'...'9', 'a'...'f' => {},
+        else => return null,
+    };
+    var bytes: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&bytes, text) catch return null;
+    return bytes;
+}
+
+/// The `e` and `a` targets of a deletion request; other tags are ignored.
+pub const Target = union(enum) {
+    id: [32]u8,
+    address: Address,
+
+    pub fn of(tag: nostr.event.Tag) ?Target {
+        if (tag.len < 2) return null;
+        if (std.mem.eql(u8, tag[0], "e")) return .{ .id = parseHex32(tag[1]) orelse return null };
+        if (std.mem.eql(u8, tag[0], "a")) return .{ .address = Address.parse(tag[1]) orelse return null };
+        return null;
+    }
+};
+
 const testing = std.testing;
 
 test "kinds classify by the NIP-01 ranges" {
@@ -89,4 +141,22 @@ test "the later created_at wins, and a tie goes to the lexically smaller id" {
     try testing.expect(supersedes(&smaller, &older));
     try testing.expect(!supersedes(&older, &smaller));
     try testing.expect(!supersedes(&older, &older));
+}
+
+test "deletion targets parse from e and a tags and nothing else" {
+    const hex = "ab" ** 32;
+    const id = Target.of(&.{ "e", hex }).?;
+    try testing.expectEqual([_]u8{0xab} ** 32, id.id);
+
+    const address = Target.of(&.{ "a", "30023:" ++ hex ++ ":my:slug" }).?.address;
+    try testing.expectEqual(@as(u16, 30023), address.kind);
+    try testing.expectEqualStrings("my:slug", address.d);
+    try testing.expectEqualStrings("", Target.of(&.{ "a", "10002:" ++ hex ++ ":" }).?.address.d);
+
+    try testing.expect(Target.of(&.{ "e", "AB" ** 32 }) == null);
+    try testing.expect(Target.of(&.{ "e", "ab" }) == null);
+    try testing.expect(Target.of(&.{ "a", "30023:" ++ hex }) == null);
+    try testing.expect(Target.of(&.{ "a", "70000:" ++ hex ++ ":x" }) == null);
+    try testing.expect(Target.of(&.{ "p", hex }) == null);
+    try testing.expect(Target.of(&.{"e"}) == null);
 }
