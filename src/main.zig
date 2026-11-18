@@ -189,7 +189,6 @@ const Report = struct {
     }
 };
 
-/// Above these fractions of storage.map_size, doctor warns and then fails.
 const map_warn_ratio = 0.8;
 const map_fail_ratio = 0.95;
 
@@ -380,8 +379,7 @@ fn isLoopback(address: []const u8) bool {
     return std.mem.startsWith(u8, address, "127.") or std.mem.eql(u8, address, "::1") or std.mem.eql(u8, address, "localhost");
 }
 
-/// SIGTERM and SIGINT are blocked in every thread and taken by one thread with `sigwait`, so the
-/// shutdown runs as ordinary code rather than inside a signal handler.
+/// Signals are taken by a `sigwait` thread, so shutdown runs outside a signal handler.
 const Shutdown = struct {
     signals: std.posix.sigset_t,
     thread: ?std.Thread = null,
@@ -407,8 +405,7 @@ const Shutdown = struct {
         relay.stop();
     }
 
-    /// Releases the watcher if the relay stopped for another reason, so it is never left holding a
-    /// pointer to a relay that is gone.
+    /// Wakes the watcher if the relay stopped on its own, so it never outlives the relay.
     fn finish(self: *Shutdown) void {
         const thread = self.thread orelse return;
         _ = std.c.kill(std.c.getpid(), .TERM);

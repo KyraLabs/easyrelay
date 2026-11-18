@@ -36,7 +36,6 @@ pub const Outcome = enum {
     }
 };
 
-/// A Prometheus histogram over seconds with fixed buckets, safe to observe from any thread.
 pub const Histogram = struct {
     counts: [bounds.len + 1]std.atomic.Value(u64) = @splat(.init(0)),
     sum_ns: std.atomic.Value(u64) = .init(0),
@@ -66,7 +65,6 @@ pub const Histogram = struct {
     }
 };
 
-/// What is measured at scrape time rather than counted as it happens.
 pub const Gauges = struct {
     connections: usize,
     subscriptions: usize,
@@ -89,7 +87,6 @@ pub const Metrics = struct {
         _ = self.scan_budget_exhausted.fetchAdd(1, .monotonic);
     }
 
-    /// Prometheus text exposition format 0.0.4.
     pub fn write(self: *const Metrics, writer: *std.Io.Writer, gauges: Gauges) std.Io.Writer.Error!void {
         try gauge(writer, "easyrelay_connections_active", "Open WebSocket connections.", gauges.connections);
         try gauge(writer, "easyrelay_subscriptions_active", "Open subscriptions across every connection.", gauges.subscriptions);

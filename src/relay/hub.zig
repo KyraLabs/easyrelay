@@ -21,7 +21,7 @@ pub const Subscriber = struct {
     mutex: std.Io.Mutex = .init,
     registry: subscriptions.Registry,
     delivery: Delivery,
-    /// Assigned by `join`; tells a reply for a closed connection from one for a new one at the same address.
+    /// Tells a reply for a closed connection from one for a new connection at the same address.
     generation: u64 = 0,
 };
 
@@ -49,7 +49,6 @@ pub const Hub = struct {
         self.next_generation += 1;
     }
 
-    /// Sends `message` to `subscriber` if it is still the connection that `generation` names.
     pub fn reply(self: *Hub, subscriber: *Subscriber, generation: u64, message: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -90,7 +89,6 @@ pub const Hub = struct {
         return self.members.items.len;
     }
 
-    /// `local_id` is null for an ephemeral event, which no stored phase can have seen.
     pub fn broadcast(self: *Hub, arena: std.mem.Allocator, event: *const Event, local_id: ?u64) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

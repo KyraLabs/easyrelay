@@ -57,7 +57,6 @@ pub const ClientMessage = union(enum) {
     event: Event,
     req: Req,
     close: Close,
-    /// NIP-42: the signed kind-22242 event answering a challenge.
     auth: Event,
 
     pub const Req = struct {

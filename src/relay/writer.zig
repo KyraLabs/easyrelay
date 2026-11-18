@@ -46,8 +46,6 @@ const Job = struct {
     reply: Reply,
 };
 
-/// The only thread that writes to the store. Events arrive through a bounded queue and are
-/// committed in batches; the `OK` and the fan-out follow the commit.
 pub const Writer = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -105,7 +103,7 @@ pub const Writer = struct {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
-    /// Commits everything already queued, then joins the thread.
+    /// Commits everything already queued before the thread exits.
     pub fn stop(self: *Writer) void {
         const thread = self.thread orelse return;
         {

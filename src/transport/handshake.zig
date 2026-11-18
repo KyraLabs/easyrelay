@@ -6,8 +6,7 @@ const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 pub const ReadError = error{ RequestTooLarge, EndOfStream, ReadFailed };
 
-/// Reads up to the end of the request headers. The result aliases the reader's buffer,
-/// which must hold `max_request` bytes.
+/// The result aliases the reader's buffer, which must hold `max_request` bytes.
 pub fn readRequest(reader: *std.Io.Reader) ReadError![]const u8 {
     std.debug.assert(reader.buffer.len >= max_request);
     var scanned: usize = 0;
@@ -32,7 +31,6 @@ pub const Kind = union(enum) {
     malformed,
 };
 
-/// Decides what a complete request asks for.
 pub fn classify(request: []const u8) Kind {
     const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return .malformed;
     const request_line = request[0..line_end];
@@ -71,7 +69,6 @@ pub fn classify(request: []const u8) Kind {
     return .{ .upgrade = text[0..24].* };
 }
 
-/// The value of the first header named `name`, ignoring case, in a complete request.
 pub fn headerValue(request: []const u8, name: []const u8) ?[]const u8 {
     const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return null;
     var headers = std.mem.splitSequence(u8, request[line_end + 2 ..], "\r\n");

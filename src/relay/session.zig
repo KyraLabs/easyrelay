@@ -36,7 +36,6 @@ pub const Responder = struct {
 
 pub const Error = Responder.Error || error{
     OutOfMemory,
-    /// The connection sent messages faster than `rate.Limits.messages` allows; close it.
     RateLimited,
 };
 
@@ -50,10 +49,9 @@ pub const Shared = struct {
     io: std.Io,
     store: store.Store,
     hub: *hub.Hub,
-    /// When set, events are committed on the writer thread, which sends their `OK`.
     writer: ?*write_queue.Writer = null,
     limits: Limits = .{},
-    /// Per-author publishing budgets, charged only once a signature has verified.
+    /// Charged only after the signature verifies.
     authors: ?*rate.Authors = null,
     policy: policy.Policy = .{},
     metrics: ?*metrics.Metrics = null,
@@ -62,22 +60,15 @@ pub const Shared = struct {
 pub const Context = struct {
     arena: std.mem.Allocator,
     signer: nostr.keys.Signer,
-    /// Wall-clock seconds, for `created_at` checks.
     now: i64,
-    /// Monotonic nanoseconds, for rate limits.
     clock_ns: i96 = 0,
 };
 
-/// NIP-42.
 pub const auth_kind: u16 = 22242;
-/// How far an AUTH event's `created_at` may be from now.
 pub const auth_window_s: i64 = 600;
 
-/// What a session remembers about its connection between messages.
 pub const Peer = struct {
-    /// Null means unlimited.
     rates: ?rate.Connection = null,
-    /// Hex of 16 random bytes.
     challenge: [32]u8,
     challenged: bool = false,
     host_buffer: [256]u8 = undefined,
@@ -87,7 +78,6 @@ pub const Peer = struct {
 
     pub const max_authenticated = 8;
 
-    /// `host_header` is the client's Host header; one too long to keep is treated as absent.
     pub fn init(io: std.Io, rates: ?rate.Limits, host_header: ?[]const u8) Peer {
         var nonce: [16]u8 = undefined;
         io.randomSecure(&nonce) catch io.random(&nonce);
@@ -117,7 +107,6 @@ pub const Peer = struct {
         return false;
     }
 
-    /// Past the bound, the oldest authentication is forgotten.
     fn remember(self: *Peer, pubkey: *const [32]u8) void {
         if (self.isAuthenticatedAs(pubkey)) return;
         if (self.authenticated_len == max_authenticated) {
@@ -133,10 +122,8 @@ pub const Session = struct {
     shared: *const Shared,
     responder: Responder,
     subscriber: *hub.Subscriber,
-    /// Null for a session with no connection behind it: unlimited, and unable to authenticate.
     peer: ?*Peer = null,
 
-    /// Sent once, when the connection opens.
     pub fn greet(self: *Session) Error!void {
         const policy_requires = self.shared.policy.auth_required_for_read or self.shared.policy.auth_required_for_write;
         if (policy_requires) try self.challenge();
@@ -283,7 +270,6 @@ pub const Session = struct {
         return self.answer(write_queue.ok(event.id, result));
     }
 
-    /// An answer to `EVENT`, counted by outcome.
     fn answer(self: *Session, ok: codec.Ok) Error!void {
         if (self.shared.metrics) |counters| counters.received(ok);
         return self.sendOk(ok);
@@ -295,15 +281,12 @@ pub const Session = struct {
         _ = self.subscriber.registry.close(subscription_id);
     }
 
-    /// The stored phase runs without the subscriber's lock, which the writer thread takes to fan
-    /// out; holding it while a slow client drains a large result would stall every write. Live
-    /// events arriving meanwhile are held and sent after `EOSE`.
     fn isAuthenticated(self: *const Session) bool {
         const peer = self.peer orelse return false;
         return peer.isAuthenticated();
     }
 
-    /// NIP-42 asks for the challenge to precede the first `auth-required:` a client sees.
+    /// NIP-42 asks for the challenge before the first `auth-required:`.
     fn challenge(self: *Session) Error!void {
         const peer = self.peer orelse return;
         if (peer.challenged) return;
@@ -356,6 +339,7 @@ pub const Session = struct {
         return self.sendOk(.{ .event_id = event_id, .accepted = false, .prefix = .invalid, .reason = reason });
     }
 
+    /// Runs without the subscriber's lock, which fan-out needs; live events arriving meanwhile are held.
     fn subscribe(self: *Session, context: Context, req: codec.ClientMessage.Req) Error!void {
         if (self.peer) |peer| if (peer.rates) |*rates| if (!rates.subscription(context.clock_ns)) {
             self.closeSubscription(req.subscription_id);
@@ -434,7 +418,6 @@ pub const Session = struct {
         try self.sendHeld(req.subscription_id, watermark);
     }
 
-    /// Bounded by the hold limit: every pass either sends what was held or ends the phase.
     fn sendHeld(self: *Session, subscription_id: []const u8, watermark: u64) Error!void {
         while (true) {
             var released = released: {
@@ -504,7 +487,6 @@ fn elapsed(io: std.Io, since: std.Io.Timestamp) u64 {
     return @intCast(@max(0, since.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds));
 }
 
-/// NIP-70: a `["-"]` tag.
 fn isProtected(event: *const Event) bool {
     for (event.tags) |tag| {
         if (tag.len != 0 and std.mem.eql(u8, tag[0], "-")) return true;
@@ -519,8 +501,7 @@ fn tagValue(event: *const Event, name: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Compares the authority of a `relay` tag's URL with the Host header the client connected with.
-/// Scheme, path, trailing slash and a default port are ignored, and so is case.
+/// Compares authorities only: scheme, path, case and a default port are ignored.
 fn sameRelay(url: []const u8, host: []const u8) bool {
     var rest = url;
     for ([_][]const u8{ "wss://", "ws://" }) |scheme| {
@@ -567,7 +548,6 @@ const Recorder = struct {
     gpa: std.mem.Allocator,
     current: std.Io.Writer.Allocating,
     messages: std.ArrayList([]u8),
-    /// Stands in for a slow client.
     send_delay_ms: u32 = 0,
 
     fn init(gpa: std.mem.Allocator) Recorder {
@@ -1091,8 +1071,7 @@ test "an event the stored phase already sent is not delivered live as well" {
     try testing.expect(std.mem.startsWith(u8, harness.delivered.items[0], "[\"EVENT\",\"before\","));
 }
 
-/// Answers a query from the backing store, then publishes live events before the caller sees the
-/// query end — as if the writer committed them while the stored phase was being sent.
+/// Publishes live events after the query has read, as if they were committed during it.
 const RacingStore = struct {
     inner: store.Store,
     connections: *hub.Hub,

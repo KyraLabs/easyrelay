@@ -1,6 +1,5 @@
 const std = @import("std");
 
-/// A token bucket. Time is passed in, in nanoseconds on a monotonic clock, so tests control it.
 pub const Bucket = struct {
     per_second: f64,
     capacity: f64,
@@ -13,8 +12,7 @@ pub const Bucket = struct {
         return .{ .per_second = per_second, .capacity = capacity, .tokens = capacity };
     }
 
-    /// Callers read the clock before taking a shared bucket's lock, so times can arrive out of
-    /// order; an earlier one refills nothing and does not move the bucket's clock back.
+    /// Times can arrive out of order across threads; an earlier one must not rewind the clock.
     pub fn take(self: *Bucket, now_ns: i96) bool {
         if (self.last_ns) |last| {
             const elapsed: f64 = @floatFromInt(@max(0, now_ns - last));
@@ -45,7 +43,6 @@ pub const Limits = struct {
     author_events: ?Rule = .{ .per_second = 10, .burst = 50 },
 };
 
-/// One connection's buckets. Owned by the connection's thread; not shared.
 pub const Connection = struct {
     events: ?Bucket,
     messages: ?Bucket,
@@ -77,10 +74,7 @@ pub const Connection = struct {
     }
 };
 
-/// Per-author buckets shared by every connection, in a fixed table so memory does not grow with
-/// the number of authors. Authors are hashed into slots with a key chosen at startup; two authors
-/// sharing a slot share a budget, which errs strict, and the key stops anyone from choosing a
-/// pubkey that lands on someone else's slot.
+/// Fixed keyed slots: memory stays bounded, and nobody can aim at another author's slot.
 pub const Authors = struct {
     io: std.Io,
     mutex: std.Io.Mutex = .init,

@@ -85,8 +85,7 @@ pub const Memory = struct {
         return self.putBatch(events, results, local_ids);
     }
 
-    /// Everything a batch can allocate is allocated before the first change, so an error leaves
-    /// the store as it was.
+    /// Allocates everything before the first change, so an error leaves the store unchanged.
     fn putBatch(self: *Memory, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
@@ -103,9 +102,7 @@ pub const Memory = struct {
 
     const Reserved = struct {
         copies: []?Event = &.{},
-        /// One owned `d` per address target, in tag order, across the whole batch.
         d_values: []?[]u8 = &.{},
-        /// Index of each event's first entry in `d_values`.
         d_start: []usize = &.{},
 
         fn reserve(self: *Reserved, memory: *Memory, events: []const Event) Error!void {

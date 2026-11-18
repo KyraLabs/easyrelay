@@ -20,14 +20,11 @@ pub const App = struct {
     shared: *const session.Shared,
     live: std.atomic.Value(usize) = .init(0),
     information: ?*const nip11.Responses = null,
-    /// Per-connection budgets; null leaves connections unlimited.
     rates: ?rate.Limits = null,
     metrics: ?*metrics.Metrics = null,
-    /// Where `GET` serves the metrics; null serves none.
     metrics_path: ?[]const u8 = null,
 };
 
-/// Above this the store is reported unhealthy: a write may no longer fit.
 const healthy_map_ratio = 0.95;
 
 pub const Options = struct {
@@ -38,16 +35,13 @@ pub const Options = struct {
     max_message_size: usize = 131072,
     write_buffer_limit: usize = 1024 * 1024,
     write_timeout_ms: u32 = 30_000,
-    /// Ping a connection after this long without hearing from it; zero never pings.
     ping_interval_ms: u32 = 30_000,
-    /// Close a connection after this long without hearing from it; zero never does.
     idle_timeout_ms: u32 = 300_000,
 };
 
 const thread_stack_size = 4 * 1024 * 1024;
 /// glibc carves static TLS out of each thread's stack, and std's per-thread signal stack alone is 256 KiB.
 const sender_stack_size = 1024 * 1024;
-/// A sender batch that grew past this is freed after writing, so an idle connection holds little.
 const retained_batch_capacity = 64 * 1024;
 const service_unavailable = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
@@ -61,7 +55,6 @@ pub const Server = struct {
     mutex: std.Io.Mutex = .init,
     open: std.ArrayList(*Connection) = .empty,
     drained: std.Io.Condition = .init,
-    /// Numbers connections for the logs, so one connection's lines can be followed.
     next_connection: std.atomic.Value(u64) = .init(1),
 
     pub fn deinit(self: *Server) void {
@@ -71,7 +64,6 @@ pub const Server = struct {
         self.* = undefined;
     }
 
-    /// Accepts until `stop`.
     pub fn listen(self: *Server) !void {
         while (!self.stopping.load(.acquire)) {
             const stream = self.listener.accept(self.io) catch |err| switch (err) {
@@ -98,7 +90,6 @@ pub const Server = struct {
         self.listen() catch |err| log.err("the listener stopped: {t}", .{err});
     }
 
-    /// Stops accepting, closes every connection and waits until each has finished.
     pub fn stop(self: *Server) void {
         if (self.stopping.swap(true, .acq_rel)) return;
         if (self.address.connect(self.io, .{ .mode = .stream })) |wake| wake.close(self.io) else |_| {}
@@ -134,7 +125,7 @@ pub const Server = struct {
         return connection;
     }
 
-    /// Removes `connection` under the lock before closing it, so `stop` never shuts down a closed socket.
+    /// Removed under the lock before closing, so `stop` never shuts down a closed socket.
     fn untrack(self: *Server, connection: *Connection) void {
         {
             self.mutex.lockUncancelable(self.io);
@@ -165,7 +156,6 @@ pub fn init(gpa: std.mem.Allocator, app: *App, options: Options) !Server {
 const health_ok = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n";
 const health_unavailable = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunavailable\n";
 
-/// The path of a `GET`, without its query string.
 fn requestPath(request: []const u8) ?[]const u8 {
     if (!std.mem.startsWith(u8, request, "GET ")) return null;
     const rest = request[4..];
@@ -180,8 +170,7 @@ fn writeAll(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8) void {
     writer.interface.flush() catch {};
 }
 
-/// Writes after the handshake go through `outbox` to a sender thread of the connection's own, so
-/// no other thread ever blocks on this client's socket.
+/// After the handshake only the sender thread writes to the socket, so no other thread blocks on it.
 const Connection = struct {
     server: *Server,
     id: u64,
@@ -356,7 +345,6 @@ const Connection = struct {
         }
     }
 
-    /// `GET /health` and the metrics path. False leaves the request to the information document.
     fn respondPlain(self: *Connection, request: []const u8) !bool {
         const app = self.server.app;
         const path = requestPath(request) orelse return false;
@@ -393,12 +381,10 @@ const Connection = struct {
         return ratio < healthy_map_ratio;
     }
 
-    /// Before the handshake completes; there is no sender thread yet.
     fn writeRaw(self: *Connection, bytes: []const u8) void {
         socket.writeAll(self.stream.socket.handle, bytes) catch {};
     }
 
-    /// From the connection's own thread: waits for room in the outbox.
     fn sendFrame(self: *Connection, opcode: frame.Opcode, payload: []const u8) std.Io.Writer.Error!void {
         self.outbox.send(opcode, payload) catch return error.WriteFailed;
     }
@@ -409,8 +395,6 @@ const Connection = struct {
         self.outbox.send(.close, &payload) catch {};
     }
 
-    /// From other threads: never waits. A client too slow to take what it subscribed to is
-    /// disconnected rather than buffered for.
     fn deliver(ptr: *anyopaque, message: []const u8) void {
         const self: *Connection = @ptrCast(@alignCast(ptr));
         self.outbox.queue(.text, message) catch |err| switch (err) {

@@ -168,7 +168,6 @@ const descriptions = .{
 
 pub const Error = error{ InvalidConfig, OutOfMemory };
 
-/// Holds the reason for the last `error.InvalidConfig`, naming the offending key.
 pub const Diagnostics = struct {
     buffer: [1024]u8 = undefined,
     len: usize = 0,
@@ -188,7 +187,6 @@ pub const Diagnostics = struct {
     }
 };
 
-/// Parses a configuration file. Everything returned is allocated in `arena`.
 pub fn parse(arena: std.mem.Allocator, source: [:0]const u8, path: []const u8, diagnostics: *Diagnostics) Error!Config {
     var zon: std.zon.parse.Diagnostics = .{};
     defer zon.deinit(arena);
@@ -206,7 +204,6 @@ pub fn parse(arena: std.mem.Allocator, source: [:0]const u8, path: []const u8, d
     };
 }
 
-/// Applies `EASYRELAY_<SECTION>_<KEY>` variables. A list is comma-separated; `null` clears an optional.
 pub fn applyEnvironment(arena: std.mem.Allocator, config: *Config, environment: *const std.process.Environ.Map, diagnostics: *Diagnostics) Error!void {
     inline for (@typeInfo(Config).@"struct".fields) |section| {
         const values = &@field(config, section.name);
@@ -273,7 +270,6 @@ fn describeType(comptime T: type) []const u8 {
     };
 }
 
-/// Rejects values that are in range for their type but cannot work, or that contradict each other.
 pub fn validate(config: Config, diagnostics: *Diagnostics) error{InvalidConfig}!void {
     const limits = config.limits;
     if (config.network.address.len == 0) return diagnostics.fail("network.address must not be empty", .{});
@@ -353,7 +349,6 @@ fn isPubkey(text: []const u8) bool {
     } else true;
 }
 
-/// Writes a configuration file holding every setting at its default, each with its description.
 pub fn writeTemplate(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     const defaults: Config = .{};
     try writer.writeAll(

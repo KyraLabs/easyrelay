@@ -24,12 +24,10 @@ pub const PutResult = enum {
 pub const Sink = struct {
     ptr: *anyopaque,
     emitFn: *const fn (ptr: *anyopaque, event: *const Event) Abort!void,
-    /// Receives the newest local id the query's snapshot could see; a live event at or below it was already visible.
+    /// Newest local id the snapshot saw; live events at or below it were already visible.
     watermark: ?*u64 = null,
-    /// When set, an event whose NIP-40 expiration is at or before it is skipped and does not
-    /// count toward any filter's `limit`.
+    /// Expired events are skipped and do not count toward `limit`.
     now: ?i64 = null,
-    /// Set to true when the query was answered early because it reached its scan budget.
     exhausted: ?*bool = null,
 
     pub const Abort = error{Abort};
@@ -41,8 +39,7 @@ pub const Sink = struct {
 
 pub const Stats = struct {
     events: u64,
-    /// Fraction of a fixed-size store in use, not counting space freed for reuse; null for a store
-    /// with no fixed size.
+    /// Excludes space freed for reuse; null for a store without a fixed size.
     used_ratio: ?f64 = null,
 };
 
@@ -64,7 +61,6 @@ pub const Store = struct {
     }
 
     /// Stores `events` in one transaction; on error none of them is stored.
-    /// `local_ids`, when given, receives the local id of each stored event.
     pub fn putBatch(self: Store, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void {
         std.debug.assert(events.len == results.len);
         if (local_ids) |ids| std.debug.assert(ids.len == events.len);
@@ -76,8 +72,6 @@ pub const Store = struct {
         return self.vtable.query(self.ptr, filters, sink);
     }
 
-    /// Removes up to `max` events whose NIP-40 expiration is at or before `now` and returns how
-    /// many it removed.
     pub fn reap(self: Store, now: i64, max: usize) Error!usize {
         return self.vtable.reap(self.ptr, now, max);
     }

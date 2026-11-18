@@ -21,7 +21,6 @@ pub const Format = enum(u8) { json, text };
 var current_level: std.atomic.Value(Level) = .init(.info);
 var current_format: std.atomic.Value(Format) = .init(.json);
 
-/// Takes effect for every thread from the next message on.
 pub fn configure(level: Level, format: Format) void {
     current_level.store(level, .release);
     current_format.store(format, .release);
@@ -31,8 +30,7 @@ pub fn enabled(level: std.log.Level) bool {
     return @intFromEnum(Level.of(level)) <= @intFromEnum(current_level.load(.acquire));
 }
 
-/// For `std_options.logFn`. One line per message on stderr, written under the stderr lock so
-/// lines from different threads never interleave. A message longer than the line buffer is cut.
+/// Writes under the stderr lock so lines from different threads never interleave.
 pub fn logFn(
     comptime level: std.log.Level,
     comptime scope: @EnumLiteral(),
@@ -94,7 +92,6 @@ fn utf8Prefix(text: []const u8, max: usize) []const u8 {
     return text[0..end];
 }
 
-/// RFC 3339 in UTC, to the second.
 fn writeTime(writer: *std.Io.Writer, seconds: i64) std.Io.Writer.Error!void {
     const epoch: std.time.epoch.EpochSeconds = .{ .secs = @intCast(@max(seconds, 0)) };
     const day = epoch.getEpochDay().calculateYearDay();

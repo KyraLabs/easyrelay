@@ -29,12 +29,8 @@ pub const CloseCode = enum(u16) {
 };
 
 pub const Error = error{
-    /// RSV bits set, an unknown opcode, an unmasked client frame, a fragmented or oversized
-    /// control frame, a continuation with nothing to continue, or a malformed close payload.
     ProtocolViolation,
-    /// A text message that is not valid UTF-8.
     InvalidUtf8,
-    /// A frame or an assembled message over the configured bound.
     TooBig,
     OutOfMemory,
 };
@@ -63,7 +59,7 @@ pub const Close = struct {
 
 pub const Role = enum { server, client };
 
-/// Reads frames and returns whole messages. A returned slice is valid until the next call.
+/// A returned slice is valid until the next call.
 pub const Decoder = struct {
     gpa: std.mem.Allocator,
     max_message: usize,
@@ -83,8 +79,6 @@ pub const Decoder = struct {
         self.* = undefined;
     }
 
-    /// A read error at a frame boundary leaves the decoder able to continue once the reader can;
-    /// one in the middle of a frame sets `interrupted`.
     pub fn next(self: *Decoder, reader: *std.Io.Reader) (Error || std.Io.Reader.Error)!Message {
         std.debug.assert(!self.interrupted);
         if (self.fragmented == null) self.assembled.clearRetainingCapacity();
@@ -289,7 +283,6 @@ test "frames written by writeFrame decode, at every length encoding" {
     }
 }
 
-/// Fills as much of the buffer as it can per call, the way a socket read does.
 const Chunked = struct {
     remaining: []const u8,
     reader: std.Io.Reader,

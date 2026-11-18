@@ -4,7 +4,6 @@ const frame = @import("frame.zig");
 const handshake = @import("handshake.zig");
 const socket = @import("socket.zig");
 
-/// A minimal WebSocket client for tests: text messages, masked as RFC 6455 requires.
 pub const Client = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -81,7 +80,7 @@ pub const Client = struct {
         try self.sendFrame(.text, text);
     }
 
-    /// The next message; a ping is answered on the way. The slice is valid until the next call.
+    /// Answers pings on the way; the slice is valid until the next call.
     pub fn receiveMessage(self: *Client) !frame.Message {
         while (true) {
             const message = self.decoder.next(&self.reader.interface) catch |err| switch (err) {
@@ -115,7 +114,6 @@ fn timedOut(err: ?socket.ReadError) bool {
     return if (err) |present| present == error.Timeout else false;
 }
 
-/// Sends `request` as it is over a fresh connection and returns everything the server writes back.
 pub fn exchange(gpa: std.mem.Allocator, io: std.Io, port: u16, request: []const u8) ![]u8 {
     const address = try std.Io.net.IpAddress.parseIp4("127.0.0.1", port);
     const stream = try address.connect(io, .{ .mode = .stream });

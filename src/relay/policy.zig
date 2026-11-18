@@ -3,7 +3,6 @@ const nostr = @import("nostr");
 
 const Event = nostr.event.Event;
 
-/// Admission rules by author and by kind, with lists sorted for binary search.
 pub const Policy = struct {
     allowed_pubkeys: ?[]const [32]u8 = null,
     blocked_pubkeys: []const [32]u8 = &.{},
@@ -21,7 +20,6 @@ pub const Policy = struct {
         auth_required_for_read: bool = false,
     };
 
-    /// Pubkeys are hex, already validated by the configuration. Everything is allocated in `arena`.
     pub fn init(arena: std.mem.Allocator, lists: Lists) error{ OutOfMemory, InvalidPubkey }!Policy {
         return .{
             .allowed_pubkeys = if (lists.allowed_pubkeys) |hex| try decodeSorted(arena, hex) else null,
@@ -33,7 +31,6 @@ pub const Policy = struct {
         };
     }
 
-    /// Null admits the event; otherwise the reason it is refused, to follow `blocked:`.
     pub fn refusal(self: Policy, event: *const Event) ?[]const u8 {
         if (containsPubkey(self.blocked_pubkeys, &event.pubkey)) return "this author may not publish here";
         if (self.allowed_pubkeys) |allowed| if (!containsPubkey(allowed, &event.pubkey)) return "this relay accepts events only from listed authors";

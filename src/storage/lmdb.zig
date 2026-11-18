@@ -20,7 +20,6 @@ const StoreQueryError = store.QueryError;
 pub const Error = error{
     OutOfMemory,
     DataDirectory,
-    /// Another process holds the data directory.
     InUse,
     Backend,
     Corrupt,
@@ -50,7 +49,6 @@ const deleted_db = "deleted";
 const deleted_address_db = "deleted_address";
 const by_expiration_db = "by_expiration";
 const next_local_id_key = "next_local_id";
-/// Present once every stored event with an expiration has its `by_expiration` entry.
 const expirations_indexed_key = "expirations_indexed";
 
 /// Zero is reserved as the watermark before any event.
@@ -143,7 +141,6 @@ const IndexWriter = struct {
     }
 };
 
-/// Ascending time, then id, so a forward walk meets the earliest expiration first.
 fn expirationKey(at: i64, id: *const [32]u8) [40]u8 {
     var key: [40]u8 = undefined;
     std.mem.writeInt(u64, key[0..8], @as(u64, @bitCast(at)) ^ (@as(u64, 1) << 63), .big);
@@ -303,11 +300,8 @@ const Choice = union(enum) {
 
 pub const CopyError = error{
     OutOfMemory,
-    /// The store directory or its data file does not exist.
     NoStore,
-    /// The output exists, or cannot be created or written.
     Output,
-    /// Another process holds the data directory.
     InUse,
     Backend,
 };
@@ -315,9 +309,7 @@ pub const CopyError = error{
 const data_file = "data.mdb";
 const compacting_file = "data.mdb.compacting";
 
-/// Writes a compacted, consistent copy of the store to `out_path`, which must not exist. Takes no
-/// lock of its own, so it runs beside a serving relay; the copy is the store as of one read
-/// snapshot.
+/// Takes no lock, so it runs beside a serving relay; the copy is one read snapshot.
 pub fn backup(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, map_size: usize, out_path: []const u8) CopyError!void {
     const path = try std.fs.path.joinZ(gpa, &.{ data_dir, subdirectory });
     defer gpa.free(path);
@@ -337,7 +329,6 @@ pub fn backup(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, map_size
     out.sync(io) catch return error.Output;
 }
 
-/// Reads the store's statistics without its lock, beside a serving relay if there is one.
 pub fn inspect(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, map_size: usize) CopyError!Stats {
     const path = try std.fs.path.joinZ(gpa, &.{ data_dir, subdirectory });
     defer gpa.free(path);
@@ -352,8 +343,7 @@ pub fn inspect(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, map_siz
     return environmentStats(env) catch error.Backend;
 }
 
-/// The file only grows, so the pages it reaches overstate what is in use: pages freed by a
-/// deletion are reused by later writes, once no snapshot can still read them.
+/// Freed pages count as unused only once reusable; the file itself never shrinks.
 fn environmentStats(env: lmdb.Environment) Error!Stats {
     var info: lmdb_c.MDB_envinfo = undefined;
     if (lmdb_c.mdb_env_info(env.ptr, &info) != 0) return error.Backend;
@@ -368,16 +358,14 @@ fn environmentStats(env: lmdb.Environment) Error!Stats {
     return .{ .events = events.entries, .used_ratio = used / @as(f64, @floatFromInt(info.me_mapsize)) };
 }
 
-/// The oldest transaction id a snapshot may still read: the last commit, or an older open reader,
-/// in this process or another. Read before the caller's own transaction begins, so that
-/// transaction does not hold back the answer.
+/// Read before the caller's own transaction begins, so it does not count itself.
 fn oldestSnapshot(env: lmdb.Environment, last_txnid: usize) Error!usize {
     var oldest = last_txnid;
     if (lmdb_c.mdb_reader_list(env.ptr, lowerToReader, &oldest) < 0) return error.Backend;
     return oldest;
 }
 
-/// One line per reader slot, `pid thread txnid`, plus a header; idle slots show `-` for txnid.
+/// Lines are `pid thread txnid`; the header and idle slots (`-`) do not parse.
 fn lowerToReader(message: [*c]const u8, context: ?*anyopaque) callconv(.c) c_int {
     const oldest: *usize = @ptrCast(@alignCast(context.?));
     var fields = std.mem.tokenizeAny(u8, std.mem.span(message), " \n");
@@ -388,9 +376,7 @@ fn lowerToReader(message: [*c]const u8, context: ?*anyopaque) callconv(.c) c_int
     return 0;
 }
 
-/// LMDB's freelist (database 0) is keyed by the transaction that freed each page list, and a
-/// list is reusable only once that transaction is older than every snapshot. Each value is a
-/// page-number list led by its length.
+/// Freelist values lead with their page count; a list is reusable once older than every snapshot.
 fn reusablePages(txn: lmdb.Transaction, oldest: usize) Error!u64 {
     const native = @import("builtin").cpu.arch.endian();
     const freelist: lmdb.Database = .{ .txn = txn, .dbi = 0 };
@@ -410,7 +396,6 @@ fn reusablePages(txn: lmdb.Transaction, oldest: usize) Error!u64 {
 
 pub const Compacted = struct { before: u64, after: u64 };
 
-/// Rewrites the store without its free pages. Needs the relay stopped: it takes the same lock.
 pub fn compact(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, options: Options) CopyError!Compacted {
     const path = try std.fs.path.join(gpa, &.{ data_dir, subdirectory });
     defer gpa.free(path);
@@ -447,13 +432,11 @@ fn expectStore(gpa: std.mem.Allocator, io: std.Io, store_path: []const u8) CopyE
 pub const Lmdb = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// Held for the store's lifetime: two relays on one directory would share the events but not
-    /// their subscriptions, and each would miss live events the other accepts.
+    /// Two relays on one directory would share the events but not the subscriptions.
     lock: std.Io.File,
     env: lmdb.Environment,
     max_scan: usize,
-    /// One permit per reader slot. Queries beyond `max_readers` wait for a slot rather than fail
-    /// with MDB_READERS_FULL.
+    /// One permit per reader slot, so queries past `max_readers` wait instead of failing.
     readers: std.Io.Semaphore,
 
     pub fn open(
@@ -482,8 +465,7 @@ pub const Lmdb = struct {
             .map_size = options.map_size,
             .max_readers = options.max_readers,
             .max_dbs = max_databases,
-            // Without it a reader slot belongs to a thread until the thread exits, and every
-            // connection is a thread.
+            // Otherwise a slot belongs to its thread until the thread exits.
             .no_tls = true,
         }) catch return error.Backend;
         errdefer env.deinit();
@@ -579,7 +561,7 @@ pub const Lmdb = struct {
         };
     }
 
-    /// Collects the due entries before removing any, because removing moves the cursor's ground.
+    /// Collects before removing, because removal moves the cursor.
     fn reap(self: *Lmdb, now: i64, max: usize) Error!usize {
         var arena_state = std.heap.ArenaAllocator.init(self.gpa);
         defer arena_state.deinit();
@@ -834,9 +816,7 @@ fn createTables(gpa: std.mem.Allocator, env: lmdb.Environment) !void {
     try commit(txn);
 }
 
-/// A store written before NIP-40 holds expiring events with no `by_expiration` entry: the reaper
-/// would never see them, and removing one would fail on the missing entry. They are indexed once,
-/// in the transaction that opens the store, so no reader ever sees the index half built.
+/// Stores from before NIP-40 lack these entries; built once, in the transaction that opens the store.
 fn indexExpirations(gpa: std.mem.Allocator, txn: lmdb.Transaction) !void {
     const meta = try lmdb.Database.open(txn, meta_db, .{});
     if ((try meta.get(expirations_indexed_key)) != null) return;

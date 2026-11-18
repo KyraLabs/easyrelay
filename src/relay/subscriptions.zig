@@ -8,13 +8,10 @@ pub const Limits = struct {
     max_subscriptions: usize = 20,
     max_limit: usize = 5000,
     default_limit: usize = 500,
-    /// Live-event bytes one subscription may hold back while its stored phase is sent.
     max_held_bytes: usize = 1024 * 1024,
 };
 
-/// A live event held back until the stored phase it arrived during has been sent.
 pub const Held = struct {
-    /// Null for an ephemeral event, which no stored phase can have seen.
     local_id: ?u64,
     message: []u8,
 };
@@ -22,7 +19,6 @@ pub const Held = struct {
 pub const Holding = struct {
     messages: std.ArrayList(Held) = .empty,
     bytes: usize = 0,
-    /// More arrived than `max_held_bytes`; the subscription cannot be completed in order.
     overflowed: bool = false,
 
     pub fn deinit(self: *Holding, gpa: std.mem.Allocator) void {
@@ -37,7 +33,6 @@ pub const Subscription = struct {
     filters: []const Filter,
     /// Live events at or below this local id were visible to the stored phase.
     watermark: u64 = 0,
-    /// Set from `hold` until `release` drains it: live events wait here so they follow `EOSE`.
     holding: ?Holding = null,
     arena: std.heap.ArenaAllocator,
 };
@@ -70,14 +65,12 @@ pub const Registry = struct {
         return self.entries.items;
     }
 
-    /// Holds live events for `id` until `release`.
     pub fn hold(self: *Registry, id: []const u8) void {
         const index = self.indexOf(id) orelse return;
         std.debug.assert(self.entries.items[index].holding == null);
         self.entries.items[index].holding = .{};
     }
 
-    /// Keeps a copy of `message` for a subscription in its stored phase.
     pub fn keep(self: *Registry, subscription: *Subscription, local_id: ?u64, message: []const u8) void {
         std.debug.assert(subscription.holding != null);
         const holding = &subscription.holding.?;
@@ -99,16 +92,13 @@ pub const Registry = struct {
     }
 
     pub const Released = union(enum) {
-        /// Nothing was held; the subscription is live.
         live,
-        /// Send these, then call `release` again.
         held: Holding,
         overflowed,
         gone,
     };
 
-    /// Takes what `id` has held so far. Once nothing is left the subscription goes live in the same
-    /// step, so no live event can slip between the last held one and the first delivered directly.
+    /// Goes live in the same step that finds nothing held, so no live event slips in between.
     pub fn release(self: *Registry, id: []const u8) Released {
         const index = self.indexOf(id) orelse return .gone;
         const subscription = &self.entries.items[index];

@@ -23,7 +23,6 @@ pub fn dValue(event: *const Event) []const u8 {
     return "";
 }
 
-/// NIP-40: the first `expiration` tag's timestamp, or null without one.
 pub fn expiration(event: *const Event) error{Malformed}!?i64 {
     for (event.tags) |tag| {
         if (tag.len < 2 or !std.mem.eql(u8, tag[0], "expiration")) continue;
@@ -38,13 +37,11 @@ pub fn hasExpired(event: *const Event, now: i64) bool {
     return at <= now;
 }
 
-/// Whether `candidate` beats `incumbent` for the same coordinate.
 pub fn supersedes(candidate: *const Event, incumbent: *const Event) bool {
     if (candidate.created_at != incumbent.created_at) return candidate.created_at > incumbent.created_at;
     return std.mem.order(u8, &candidate.id, &incumbent.id) == .lt;
 }
 
-/// Whether `a` and `b` occupy the same replaceable or addressable slot.
 pub fn sameCoordinate(a: *const Event, b: *const Event) bool {
     if (a.kind != b.kind or !std.mem.eql(u8, &a.pubkey, &b.pubkey)) return false;
     return switch (classify(a.kind)) {
@@ -56,7 +53,6 @@ pub fn sameCoordinate(a: *const Event, b: *const Event) bool {
 
 pub const deletion: u16 = 5;
 
-/// A NIP-09 `a` tag target: `<kind>:<pubkey hex>:<d>`.
 pub const Address = struct {
     kind: u16,
     pubkey: [32]u8,
@@ -81,7 +77,6 @@ pub const Address = struct {
     }
 };
 
-/// Lowercase only, as everywhere else on the wire.
 pub fn parseHex32(text: []const u8) ?[32]u8 {
     if (text.len != 64) return null;
     for (text) |char| switch (char) {
@@ -93,7 +88,6 @@ pub fn parseHex32(text: []const u8) ?[32]u8 {
     return bytes;
 }
 
-/// The `e` and `a` targets of a deletion request; other tags are ignored.
 pub const Target = union(enum) {
     id: [32]u8,
     address: Address,

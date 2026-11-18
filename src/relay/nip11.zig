@@ -8,7 +8,7 @@ const nips_table = @embedFile("nips.md");
 pub const software = "https://github.com/KyraLabs/easyrelay";
 pub const media_type = "application/nostr+json";
 
-/// The NIPs docs/nips.md marks `supported`, so the document cannot advertise more than the table.
+/// Read from docs/nips.md, so the document cannot advertise a NIP whose tests do not pass.
 pub const supported_nips: []const u16 = parseSupported(nips_table);
 
 fn parseSupported(comptime table: []const u8) []const u16 {
@@ -30,7 +30,6 @@ fn parseSupported(comptime table: []const u8) []const u16 {
     return &result;
 }
 
-/// The full HTTP responses, rendered once at startup and served as they are.
 pub const Responses = struct {
     document: []const u8,
     preflight: []const u8,
@@ -45,7 +44,6 @@ pub const Responses = struct {
         };
     }
 
-    /// The reply to a plain HTTP request, or null to leave it to the WebSocket handshake.
     pub fn respond(self: *const Responses, request: []const u8) ?[]const u8 {
         const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return null;
         const request_line = request[0..line_end];

@@ -2,13 +2,7 @@ const std = @import("std");
 
 const frame = @import("../transport/frame.zig");
 
-/// Frames waiting for a connection's sender thread, bounded by `limit` bytes.
-///
-/// Producers that must not wait on a client — the writer thread's fan-out and replies — use
-/// `queue`, which breaks the connection when the frame does not fit. The connection's own thread
-/// uses `send`, which waits for room: its client is the one being slow, and waiting stalls nobody
-/// else. `send` stops at half the limit, so a large `REQ` streaming to a slow reader leaves the
-/// other half for live events instead of turning the next one into a disconnect.
+/// `queue` never waits and breaks the connection on overflow; `send` waits, up to half the limit.
 pub const Outbox = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -16,16 +10,14 @@ pub const Outbox = struct {
     mutex: std.Io.Mutex = .init,
     changed: std.Io.Condition = .init,
     pending: std.ArrayList(u8) = .empty,
-    /// Bytes taken by the sender and not yet written; they still count against `limit`.
+    /// Taken by the sender but not yet written; still counted against `limit`.
     in_flight: usize = 0,
     state: State = .open,
 
     pub const State = enum { open, finishing, broken };
 
     pub const Error = error{
-        /// The connection is closing or has failed; nothing more will be written.
         Closed,
-        /// The frame did not fit and the connection is now broken.
         Overflow,
     };
 
@@ -38,8 +30,7 @@ pub const Outbox = struct {
         self.* = undefined;
     }
 
-    /// Waits for room. A frame larger than `limit` is still accepted once nothing else is queued,
-    /// so a limit below the largest message cannot wedge a connection.
+    /// An oversized frame is accepted when nothing is queued, so a small limit cannot wedge a connection.
     pub fn send(self: *Outbox, opcode: frame.Opcode, payload: []const u8) Error!void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -50,7 +41,6 @@ pub const Outbox = struct {
         try self.append(opcode, payload);
     }
 
-    /// Never waits.
     pub fn queue(self: *Outbox, opcode: frame.Opcode, payload: []const u8) Error!void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -61,8 +51,7 @@ pub const Outbox = struct {
         try self.append(opcode, payload);
     }
 
-    /// For the sender thread: marks the previous batch written, then swaps the pending bytes into
-    /// `batch`. False means there is nothing more to write, ever.
+    /// False once nothing more will ever be written.
     pub fn take(self: *Outbox, batch: *std.ArrayList(u8)) bool {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -78,7 +67,6 @@ pub const Outbox = struct {
         return true;
     }
 
-    /// No more frames will be added; the sender writes what is queued and stops.
     pub fn finish(self: *Outbox) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -86,7 +74,6 @@ pub const Outbox = struct {
         self.changed.broadcast(self.io);
     }
 
-    /// The socket failed; wakes anyone waiting for room.
     pub fn fail(self: *Outbox) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

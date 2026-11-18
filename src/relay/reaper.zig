@@ -4,12 +4,11 @@ const store = @import("../storage/store.zig");
 
 const log = std.log.scoped(.reaper);
 
-/// Removes expired events (NIP-40) on an interval. Queries already hide them; this reclaims them.
 pub const Reaper = struct {
     io: std.Io,
     store: store.Store,
     interval_s: u32,
-    /// Events removed per write transaction, so one sweep never holds the write lock for long.
+    /// Per write transaction, so a sweep never holds the write lock for long.
     batch: usize = 1000,
     stopping: std.Io.Event = .unset,
     thread: ?std.Thread = null,
@@ -26,7 +25,6 @@ pub const Reaper = struct {
         self.thread = null;
     }
 
-    /// One sweep: removes every event expired by `now`, a batch at a time.
     pub fn sweep(self: *Reaper, now: i64) store.Error!usize {
         var total: usize = 0;
         while (!self.stopping.isSet()) {

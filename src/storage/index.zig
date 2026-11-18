@@ -38,7 +38,6 @@ pub fn suffix(created_at: i64, id: *const [32]u8) Suffix {
     return key;
 }
 
-/// A key prefix for one index, at most 34 bytes.
 pub const Prefix = struct {
     bytes: [34]u8 = undefined,
     len: usize = 0,
@@ -105,7 +104,6 @@ pub const Key = struct {
     }
 };
 
-/// Calls `visitor.entry(index, key)` once per query index entry `event` owns.
 pub fn forEachEntry(event: *const Event, visitor: anytype) !void {
     const tail = suffix(event.created_at, &event.id);
     try visitor.entry(.by_created_at, Key.init(.none(), &tail));

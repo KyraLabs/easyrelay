@@ -89,7 +89,6 @@ pub const Client = struct {
     arena: std.heap.ArenaAllocator,
     socket: *easyrelay.client.Client,
 
-    /// The URL a client connected through the harness names in its `relay` tag.
     pub const relay_url = "ws://127.0.0.1";
 
     pub fn connect(relay: *Relay) !Client {
@@ -122,14 +121,12 @@ pub const Client = struct {
         return std.json.parseFromSliceLeaky(std.json.Value, self.allocator(), try self.receive(), .{});
     }
 
-    /// Sends `["AUTH", event]`.
     pub fn sendAuth(self: *Client, event: nostr.event.Event) !void {
         const encoded = try nostr.message.encodeEvent(self.allocator(), event);
         std.debug.assert(std.mem.startsWith(u8, encoded, "[\"EVENT\","));
         try self.send(try std.mem.concat(self.allocator(), u8, &.{ "[\"AUTH\",", encoded["[\"EVENT\",".len..] }));
     }
 
-    /// Fails if anything arrives within `window_ms`.
     pub fn expectSilence(self: *Client, window_ms: u32) !void {
         try self.socket.setTimeout(window_ms);
         defer self.socket.setTimeout(2000) catch {};
@@ -166,7 +163,6 @@ pub const Author = struct {
         return nostr.event.create(arena, self.signer, self.keypair, created_at, kind, tags, content, null);
     }
 
-    /// A NIP-42 authentication event answering `challenge`, created now.
     pub fn authEvent(self: Author, arena: std.mem.Allocator, io: std.Io, challenge: []const u8, relay_url: []const u8) !nostr.event.Event {
         const now = std.Io.Timestamp.now(io, .real).toSeconds();
         const tags = try arena.alloc(nostr.event.Tag, 2);
