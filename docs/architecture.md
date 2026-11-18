@@ -148,9 +148,13 @@ flowchart LR
 
 Consequences that shape the rest of the design:
 
-- **Reads do not block.** A `REQ` opens a read-only transaction on the calling I/O thread and
-  streams results directly to the socket. Read transactions are cheap and never wait on the
-  writer.
+- **Reads do not wait on the writer.** A `REQ` opens a read-only transaction on the calling
+  connection thread. Read transactions are cheap and never wait on the writer. They do wait on
+  each other past `max_readers` concurrent queries: the store holds one permit per LMDB reader
+  slot, so a query beyond the ceiling queues for a slot rather than failing with
+  `MDB_READERS_FULL`. The environment is opened with `MDB_NOTLS`, which ties a slot to the
+  transaction rather than to the thread; without it every connection thread that had ever
+  queried would keep a slot until it exited.
 - **The write queue is bounded.** When it fills, new events are rejected with a `rate-limited:`
   `OK` rather than queued. Backpressure is visible to the client, not absorbed silently.
 - **Fan-out happens after the write commits**, on the writer thread, so a subscriber never

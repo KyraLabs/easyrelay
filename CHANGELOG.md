@@ -9,6 +9,11 @@ versions may contain breaking changes; they will always be listed under `Changed
 
 ## [Unreleased]
 
+### Fixed
+
+- Queries no longer fail once more than 126 connections have each queried: LMDB reader slots
+  were bound to connection threads for their whole life.
+
 ### Added
 
 - A working relay: `easyrelay` with no arguments and no configuration file serves NIP-01 over

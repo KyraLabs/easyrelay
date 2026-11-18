@@ -270,6 +270,9 @@ pub const Lmdb = struct {
     lock: std.Io.File,
     env: lmdb.Environment,
     max_scan: usize,
+    /// One permit per reader slot. Queries beyond `max_readers` wait for a slot rather than fail
+    /// with MDB_READERS_FULL.
+    readers: std.Io.Semaphore,
 
     pub fn open(
         gpa: std.mem.Allocator,
@@ -297,12 +300,23 @@ pub const Lmdb = struct {
             .map_size = options.map_size,
             .max_readers = options.max_readers,
             .max_dbs = max_databases,
+            // Without it a reader slot belongs to a thread until the thread exits, and every
+            // connection is a thread.
+            .no_tls = true,
         }) catch return error.Backend;
         errdefer env.deinit();
         if (!options.durable and lmdb_c.mdb_env_set_flags(env.ptr, lmdb_c.MDB_NOSYNC, 1) != 0) return error.Backend;
 
         createTables(env) catch return error.Backend;
-        return .{ .gpa = gpa, .io = io, .lock = lock, .env = env, .max_scan = options.max_scan };
+        std.debug.assert(options.max_readers > 0);
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .lock = lock,
+            .env = env,
+            .max_scan = options.max_scan,
+            .readers = .{ .permits = options.max_readers },
+        };
     }
 
     pub fn store(self: *Lmdb) Store {
@@ -483,6 +497,8 @@ pub const Lmdb = struct {
             left.* = filter.limit orelse std.math.maxInt(u64);
             if (left.* != 0) pending += 1;
         }
+        self.readers.waitUncancelable(self.io);
+        defer self.readers.post(self.io);
         const txn = lmdb.Transaction.init(self.env, .{ .mode = .ReadOnly }) catch
             return error.Backend;
         defer txn.abort();
@@ -1436,4 +1452,96 @@ test "a commit the disk refuses leaves the store answering, not crashing" {
     var collector: Collector = .{ .stop_after = 1 };
     try testing.expectError(error.Abort, backend.store().query(&.{.{}}, collector.sink()));
     try testing.expectEqual(id - 1, collector.idAt(0));
+}
+
+const ReaderThread = struct {
+    backend: *Lmdb,
+    queried: *std.atomic.Value(usize),
+    threads: usize,
+    result: StoreQueryError!void = {},
+
+    fn run(self: *ReaderThread) void {
+        var collector: Collector = .{};
+        self.result = self.backend.store().query(&.{.{}}, collector.sink());
+        _ = self.queried.fetchAdd(1, .acq_rel);
+        while (self.queried.load(.acquire) < self.threads) std.Thread.yield() catch {};
+    }
+};
+
+test "more live threads than reader slots still query, one after another" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{ .max_readers = 2 });
+    defer backend.close();
+    _ = try backend.store().put(&kindEvent(1, 1700000000, 1));
+
+    var queried: std.atomic.Value(usize) = .init(0);
+    var readers: [3]ReaderThread = undefined;
+    var threads: [3]std.Thread = undefined;
+    for (&readers, &threads) |*reader, *thread| {
+        reader.* = .{ .backend = &backend, .queried = &queried, .threads = readers.len };
+        thread.* = try std.Thread.spawn(.{}, ReaderThread.run, .{reader});
+    }
+    for (threads) |thread| thread.join();
+    for (readers) |reader| try reader.result;
+}
+
+const SlotHolder = struct {
+    backend: *Lmdb,
+    inside: *std.atomic.Value(usize),
+    release: *std.atomic.Value(bool),
+    result: StoreQueryError!void = {},
+
+    fn run(self: *SlotHolder) void {
+        self.result = self.backend.store().query(&.{.{}}, .{ .ptr = self, .emitFn = hold });
+    }
+
+    fn hold(ptr: *anyopaque, _: *const Event) Sink.Abort!void {
+        const self: *SlotHolder = @ptrCast(@alignCast(ptr));
+        _ = self.inside.fetchAdd(1, .acq_rel);
+        while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+    }
+};
+
+const Releaser = struct {
+    release: *std.atomic.Value(bool),
+
+    fn run(self: *Releaser) void {
+        std.Io.sleep(testing.io, .fromMilliseconds(100), .awake) catch {};
+        self.release.store(true, .release);
+    }
+};
+
+test "a query arriving while every reader slot is held waits for one instead of failing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{ .max_readers = 2 });
+    defer backend.close();
+    _ = try backend.store().put(&kindEvent(1, 1700000000, 1));
+
+    var inside: std.atomic.Value(usize) = .init(0);
+    var release: std.atomic.Value(bool) = .init(false);
+    var holders: [2]SlotHolder = undefined;
+    var threads: [2]std.Thread = undefined;
+    for (&holders, &threads) |*holder, *thread| {
+        holder.* = .{ .backend = &backend, .inside = &inside, .release = &release };
+        thread.* = try std.Thread.spawn(.{}, SlotHolder.run, .{holder});
+    }
+    while (inside.load(.acquire) < holders.len) std.Thread.yield() catch {};
+
+    var releaser: Releaser = .{ .release = &release };
+    const releaser_thread = try std.Thread.spawn(.{}, Releaser.run, .{&releaser});
+    var collector: Collector = .{};
+    const result = backend.store().query(&.{.{}}, collector.sink());
+    releaser_thread.join();
+    for (threads) |thread| thread.join();
+
+    try result;
+    try testing.expect(release.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    for (holders) |holder| try holder.result;
 }

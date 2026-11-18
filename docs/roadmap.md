@@ -356,11 +356,12 @@ implementation exists; this is a port of the C++ reference.
   [ADR-0005](adr/0005-concurrency-model.md).
 - Connection sharding across cores.
 
-Phase 0 surfaced a constraint this phase has to solve rather than discover: the storage
-environment is opened without `MDB_NOTLS`, so LMDB reader slots are bound to threads. A
-coroutine runtime that migrates a task between threads mid-transaction is not safe against that
-API, and no option exposes it. Either upstream gains the flag, or the writer and reader
-transactions stay pinned to their threads under the evented runtime.
+Phase 0 surfaced a constraint this phase had to plan for: without `MDB_NOTLS`, LMDB reader
+slots are bound to threads, and a coroutine runtime that migrates a task between threads
+mid-transaction is not safe against that. The first-party store
+([ADR-0010](adr/0010-first-party-lmdb-store.md)) opens the environment with `MDB_NOTLS` since
+Phase 3, so a read transaction may move between threads. The write transaction may not — LMDB
+binds it to the thread that began it — so the writer stays pinned to its own thread.
 
 Write batching is no longer part of this phase — it moved to Phase 2, where the measurements
 showed it belongs.
