@@ -45,7 +45,10 @@ const by_replaceable_db = "by_replaceable";
 const by_address_db = "by_address";
 const deleted_db = "deleted";
 const deleted_address_db = "deleted_address";
+const by_expiration_db = "by_expiration";
 const next_local_id_key = "next_local_id";
+/// Present once every stored event with an expiration has its `by_expiration` entry.
+const expirations_indexed_key = "expirations_indexed";
 
 /// Zero is reserved as the watermark before any event.
 pub const first_local_id: u64 = 1;
@@ -137,8 +140,23 @@ const IndexWriter = struct {
     }
 };
 
+/// Ascending time, then id, so a forward walk meets the earliest expiration first.
+fn expirationKey(at: i64, id: *const [32]u8) [40]u8 {
+    var key: [40]u8 = undefined;
+    std.mem.writeInt(u64, key[0..8], @as(u64, @bitCast(at)) ^ (@as(u64, 1) << 63), .big);
+    key[8..40].* = id.*;
+    return key;
+}
+
+fn expirationOf(event: *const Event) ?i64 {
+    return kinds.expiration(event) catch null;
+}
+
 fn writeIndexes(txn: lmdb.Transaction, event: *const Event, local_key: *const [8]u8) Error!void {
     (try database(txn, by_id_db)).set(&event.id, local_key) catch return error.Backend;
+    if (expirationOf(event)) |at| {
+        (try database(txn, by_expiration_db)).set(&expirationKey(at, &event.id), local_key) catch return error.Backend;
+    }
     try index.forEachEntry(event, IndexWriter{ .txn = txn, .local_key = local_key, .delete = false });
     if (Coordinate.of(event)) |coordinate| {
         (try database(txn, coordinate.db)).set(coordinate.key(), local_key) catch return error.Backend;
@@ -148,10 +166,28 @@ fn writeIndexes(txn: lmdb.Transaction, event: *const Event, local_key: *const [8
 fn deleteIndexes(txn: lmdb.Transaction, event: *const Event) Error!void {
     const unused = [_]u8{0} ** 8;
     (try database(txn, by_id_db)).delete(&event.id) catch return error.Backend;
+    if (expirationOf(event)) |at| {
+        (try database(txn, by_expiration_db)).delete(&expirationKey(at, &event.id)) catch return error.Backend;
+    }
     try index.forEachEntry(event, IndexWriter{ .txn = txn, .local_key = &unused, .delete = true });
     if (Coordinate.of(event)) |coordinate| {
         (try database(txn, coordinate.db)).delete(coordinate.key()) catch return error.Backend;
     }
+}
+
+fn dueExpirations(txn: lmdb.Transaction, arena: std.mem.Allocator, now: i64, max: usize) Error![]const [8]u8 {
+    var due: std.ArrayList([8]u8) = .empty;
+    const cursor = (try database(txn, by_expiration_db)).cursor() catch return error.Backend;
+    defer cursor.deinit();
+    const limit = expirationKey(now, &([_]u8{0xff} ** 32));
+    var key = cursor.goToFirst() catch return error.Backend;
+    while (key) |found| : (key = cursor.goToNext() catch return error.Backend) {
+        if (due.items.len == max or std.mem.order(u8, found, &limit) == .gt) break;
+        const value = cursor.getCurrentValue() catch return error.Backend;
+        if (value.len != 8) return error.Corrupt;
+        try due.append(arena, value[0..8].*);
+    }
+    return due.items;
 }
 
 const max_prefixes_per_filter = 64;
@@ -307,7 +343,7 @@ pub const Lmdb = struct {
         errdefer env.deinit();
         if (!options.durable and lmdb_c.mdb_env_set_flags(env.ptr, lmdb_c.MDB_NOSYNC, 1) != 0) return error.Backend;
 
-        createTables(env) catch return error.Backend;
+        createTables(gpa, env) catch return error.Backend;
         std.debug.assert(options.max_readers > 0);
         return .{
             .gpa = gpa,
@@ -376,7 +412,36 @@ pub const Lmdb = struct {
         };
     }
 
-    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased };
+    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased, .reap = reapErased };
+
+    fn reapErased(ptr: *anyopaque, now: i64, max: usize) StoreError!usize {
+        const self: *Lmdb = @ptrCast(@alignCast(ptr));
+        return self.reap(now, max) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Backend,
+        };
+    }
+
+    /// Collects the due entries before removing any, because removing moves the cursor's ground.
+    fn reap(self: *Lmdb, now: i64, max: usize) Error!usize {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const txn = lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite }) catch return error.Backend;
+        var removed: usize = 0;
+        {
+            errdefer txn.abort();
+            const due = try dueExpirations(txn, arena, now, max);
+            for (due) |local_key| {
+                const stored = try self.storedAt(txn, arena, &local_key);
+                try remove(txn, &stored);
+                removed += 1;
+            }
+        }
+        try commit(txn);
+        return removed;
+    }
 
     fn putErased(ptr: *anyopaque, event: *const Event) StoreError!PutResult {
         const self: *Lmdb = @ptrCast(@alignCast(ptr));
@@ -535,6 +600,7 @@ pub const Lmdb = struct {
             _ = event_arena.reset(.retain_capacity);
             const event = (try self.read(txn, event_arena.allocator(), chosen.local_id)) orelse
                 return error.Corrupt;
+            if (sink.now) |now| if (kinds.hasExpired(&event, now)) continue;
             var wanted = false;
             for (filters, remaining) |filter, *left| {
                 if (left.* == 0 or !filter.matches(event)) continue;
@@ -594,17 +660,42 @@ pub const Lmdb = struct {
 };
 
 /// Creates every table, because a read-only transaction cannot.
-fn createTables(env: lmdb.Environment) !void {
+fn createTables(gpa: std.mem.Allocator, env: lmdb.Environment) !void {
     const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
     {
         errdefer txn.abort();
-        for ([_][*:0]const u8{ meta_db, events_db, by_id_db, by_replaceable_db, by_address_db, deleted_db, deleted_address_db }) |name| {
+        for ([_][*:0]const u8{ meta_db, events_db, by_id_db, by_replaceable_db, by_address_db, deleted_db, deleted_address_db, by_expiration_db }) |name| {
             _ = try lmdb.Database.open(txn, name, .{ .create = true });
         }
         for (std.enums.values(index.Index)) |which| _ = try lmdb.Database.open(txn, which.name(), .{ .create = true });
         _ = try nextLocalId(txn);
+        try indexExpirations(gpa, txn);
     }
     try commit(txn);
+}
+
+/// A store written before NIP-40 holds expiring events with no `by_expiration` entry: the reaper
+/// would never see them, and removing one would fail on the missing entry. They are indexed once,
+/// in the transaction that opens the store, so no reader ever sees the index half built.
+fn indexExpirations(gpa: std.mem.Allocator, txn: lmdb.Transaction) !void {
+    const meta = try lmdb.Database.open(txn, meta_db, .{});
+    if ((try meta.get(expirations_indexed_key)) != null) return;
+    const expirations = try lmdb.Database.open(txn, by_expiration_db, .{});
+    const cursor = try (try lmdb.Database.open(txn, events_db, .{})).cursor();
+    defer cursor.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var key = try cursor.goToFirst();
+    while (key) |local_key| : (key = try cursor.goToNext()) {
+        _ = arena_state.reset(.retain_capacity);
+        const event = record.decode(arena_state.allocator(), try cursor.getCurrentValue()) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Malformed => return error.Corrupt,
+        };
+        if (expirationOf(&event)) |at| try expirations.set(&expirationKey(at, &event.id), local_key);
+    }
+    try meta.set(expirations_indexed_key, "");
 }
 
 const testing = std.testing;
@@ -1544,4 +1635,105 @@ test "a query arriving while every reader slot is held waits for one instead of 
     try testing.expect(release.load(.acquire));
     try testing.expectEqual(@as(usize, 1), collector.len);
     for (holders) |holder| try holder.result;
+}
+
+fn expiringEvent(tags: *[1]nostr.event.Tag, fields: *[2][]const u8, id_byte: u8, kind: u16, at: []const u8) Event {
+    fields.* = .{ "expiration", at };
+    tags.* = .{fields};
+    var event = kindEvent(id_byte, 1700000000 + @as(i64, id_byte), kind);
+    event.tags = tags;
+    return event;
+}
+
+test "an expired event is skipped by a query and does not use up its limit" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var tags: [2][1]nostr.event.Tag = undefined;
+    var fields: [2][2][]const u8 = undefined;
+    _ = try fixture.backend.store().put(&expiringEvent(&tags[0], &fields[0], 1, 1, "300"));
+    _ = try fixture.backend.store().put(&expiringEvent(&tags[1], &fields[1], 2, 1, "100"));
+
+    var collector: Collector = .{};
+    var sink = collector.sink();
+    sink.now = 200;
+    try fixture.backend.store().query(&.{.{ .limit = 1 }}, sink);
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    try testing.expectEqual(@as(u8, 1), collector.idAt(0));
+}
+
+test "reaping removes expired events from every table, once" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var tags: [3][1]nostr.event.Tag = undefined;
+    var fields: [3][2][]const u8 = undefined;
+    const gone = expiringEvent(&tags[0], &fields[0], 1, 1, "100");
+    const also_gone = expiringEvent(&tags[1], &fields[1], 2, 1, "150");
+    const kept = expiringEvent(&tags[2], &fields[2], 3, 1, "300");
+    for ([_]Event{ gone, also_gone, kept }) |event| _ = try fixture.backend.store().put(&event);
+
+    try testing.expectEqual(@as(usize, 1), try fixture.backend.store().reap(200, 1));
+    try testing.expectEqual(@as(usize, 1), try fixture.backend.store().reap(200, 10));
+    try testing.expectEqual(@as(usize, 0), try fixture.backend.store().reap(200, 10));
+
+    var collector: Collector = .{};
+    try fixture.backend.store().query(&.{.{}}, collector.sink());
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    try testing.expectEqual(@as(u8, 3), collector.idAt(0));
+    try testing.expectEqual(PutResult.stored, try fixture.backend.store().put(&gone));
+}
+
+test "a replaced event leaves no expiration entry behind" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var tags: [1]nostr.event.Tag = undefined;
+    var fields: [2][]const u8 = undefined;
+    const old = expiringEvent(&tags, &fields, 1, 10002, "100");
+    const newer = kindEvent(2, 1700000100, 10002);
+    _ = try fixture.backend.store().put(&old);
+    try testing.expectEqual(PutResult.stored, try fixture.backend.store().put(&newer));
+
+    try testing.expectEqual(@as(usize, 0), try fixture.backend.store().reap(200, 10));
+    var collector: Collector = .{};
+    try fixture.backend.store().query(&.{.{}}, collector.sink());
+    try testing.expectEqual(@as(u8, 2), collector.idAt(0));
+}
+
+test "a store from before NIP-40 indexes its expiring events when it is opened" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    var tags: [2][1]nostr.event.Tag = undefined;
+    var fields: [2][2][]const u8 = undefined;
+    const note = expiringEvent(&tags[0], &fields[0], 1, 1, "100");
+    const relays = expiringEvent(&tags[1], &fields[1], 2, 10002, "100");
+    {
+        var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+        defer backend.close();
+        for ([_]Event{ note, relays }) |event| _ = try backend.store().put(&event);
+    }
+    {
+        const path = try std.fs.path.joinZ(testing.allocator, &.{ data_dir, subdirectory });
+        defer testing.allocator.free(path);
+        const env = try lmdb.Environment.init(path, .{ .max_dbs = max_databases });
+        defer env.deinit();
+        const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
+        errdefer txn.abort();
+        const expirations = try lmdb.Database.open(txn, by_expiration_db, .{});
+        try testing.expectEqual(@as(c_int, 0), lmdb_c.mdb_drop(txn.ptr, expirations.dbi, 1));
+        try (try lmdb.Database.open(txn, meta_db, .{})).delete(expirations_indexed_key);
+        try txn.commit();
+    }
+
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+    defer backend.close();
+    try testing.expectEqual(PutResult.stored, try backend.store().put(&kindEvent(3, 1700000100, 10002)));
+    try testing.expectEqual(@as(usize, 1), try backend.store().reap(200, 10));
+    var collector: Collector = .{};
+    try backend.store().query(&.{.{}}, collector.sink());
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    try testing.expectEqual(@as(u8, 3), collector.idAt(0));
 }

@@ -58,7 +58,7 @@ ignored line.
 | `map_size` | usize | `10737418240` | LMDB map size in bytes (10 GiB). Address space, not a disk reservation, but a hard ceiling. |
 | `durable` | bool | `true` | Sync metadata on commit. Setting this to `false` trades durability for throughput and invalidates any benchmark comparison. |
 | `max_scan` | usize | `100000` | Index entries a single query may examine before returning early. Bounds worst-case query cost. |
-| `reaper_interval_s` | u32 | `60` | How often NIP-40 expiration and retention run. Phase 3. |
+| `reaper_interval_s` | u32 | `60` | How often expired events (NIP-40) are removed. Queries hide them from the moment they expire. |
 
 ## `limits`
 

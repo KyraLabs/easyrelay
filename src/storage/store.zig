@@ -26,6 +26,9 @@ pub const Sink = struct {
     emitFn: *const fn (ptr: *anyopaque, event: *const Event) Abort!void,
     /// Receives the newest local id the query's snapshot could see; a live event at or below it was already visible.
     watermark: ?*u64 = null,
+    /// When set, an event whose NIP-40 expiration is at or before it is skipped and does not
+    /// count toward any filter's `limit`.
+    now: ?i64 = null,
 
     pub const Abort = error{Abort};
 
@@ -42,6 +45,7 @@ pub const Store = struct {
         put: *const fn (ptr: *anyopaque, event: *const Event) Error!PutResult,
         putBatch: *const fn (ptr: *anyopaque, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void,
         query: *const fn (ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void,
+        reap: *const fn (ptr: *anyopaque, now: i64, max: usize) Error!usize,
     };
 
     /// Ephemeral events must not be passed; they are never stored.
@@ -61,6 +65,12 @@ pub const Store = struct {
     pub fn query(self: Store, filters: []const Filter, sink: Sink) QueryError!void {
         return self.vtable.query(self.ptr, filters, sink);
     }
+
+    /// Removes up to `max` events whose NIP-40 expiration is at or before `now` and returns how
+    /// many it removed.
+    pub fn reap(self: Store, now: i64, max: usize) Error!usize {
+        return self.vtable.reap(self.ptr, now, max);
+    }
 };
 
 const testing = std.testing;
@@ -71,7 +81,12 @@ const StubStore = struct {
     events: []const Event = &.{},
     last_filters: []const Filter = &.{},
 
-    const vtable: Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query };
+    const vtable: Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query, .reap = reap };
+
+    fn reap(ptr: *anyopaque, now: i64, max: usize) Error!usize {
+        _ = .{ ptr, now, max };
+        return 0;
+    }
 
     fn store(self: *StubStore) Store {
         return .{ .ptr = self, .vtable = &vtable };

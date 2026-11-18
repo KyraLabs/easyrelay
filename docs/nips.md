@@ -14,7 +14,7 @@ Status values: `supported`, `in progress`, `planned`, `out of scope`.
 | [09](https://github.com/nostr-protocol/nips/blob/master/09.md) | Event deletion | supported | 2 | Author-scoped only; tombstones prevent reinstatement. Written first-party with the store ([ADR-0010](adr/0010-first-party-lmdb-store.md)); conformance tests in `tests/conformance/nip09.zig`. |
 | [11](https://github.com/nostr-protocol/nips/blob/master/11.md) | Relay information document | supported | 2 | Served on `Accept: application/nostr+json`, with CORS. Generated from configuration and from this table. |
 | [13](https://github.com/nostr-protocol/nips/blob/master/13.md) | Proof of work | planned | 4 | Configurable minimum difficulty; validates the committed `nonce` tag, not just leading zeroes. |
-| [40](https://github.com/nostr-protocol/nips/blob/master/40.md) | Expiration timestamp | planned | 3 | Reaper plus query-time filtering. |
+| [40](https://github.com/nostr-protocol/nips/blob/master/40.md) | Expiration timestamp | supported | 3 | Reaper plus query-time filtering; an already-expired event is refused. Conformance tests in `tests/conformance/nip40.zig`. |
 | [42](https://github.com/nostr-protocol/nips/blob/master/42.md) | Authentication of clients | supported | 3 | Kind 22242 challenge/response; gates writes, reads, or both (`policy.auth_required_for_*`). Conformance tests in `tests/conformance/nip42.zig`. |
 | [45](https://github.com/nostr-protocol/nips/blob/master/45.md) | Event counts | planned | 4 | Exact counts from index cursors, subject to the same scan budget as queries. |
 | [50](https://github.com/nostr-protocol/nips/blob/master/50.md) | Search capability | planned | 4 | Needs its own full-text index; the largest single item in Phase 4. |

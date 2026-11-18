@@ -23,6 +23,21 @@ pub fn dValue(event: *const Event) []const u8 {
     return "";
 }
 
+/// NIP-40: the first `expiration` tag's timestamp, or null without one.
+pub fn expiration(event: *const Event) error{Malformed}!?i64 {
+    for (event.tags) |tag| {
+        if (tag.len < 2 or !std.mem.eql(u8, tag[0], "expiration")) continue;
+        return std.fmt.parseInt(i64, tag[1], 10) catch error.Malformed;
+    }
+    return null;
+}
+
+/// A malformed `expiration` tag never expires; admission refuses those before they are stored.
+pub fn hasExpired(event: *const Event, now: i64) bool {
+    const at = (expiration(event) catch return false) orelse return false;
+    return at <= now;
+}
+
 /// Whether `candidate` beats `incumbent` for the same coordinate.
 pub fn supersedes(candidate: *const Event, incumbent: *const Event) bool {
     if (candidate.created_at != incumbent.created_at) return candidate.created_at > incumbent.created_at;

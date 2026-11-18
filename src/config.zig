@@ -27,6 +27,7 @@ pub const Storage = struct {
     map_size: usize = 10 * 1024 * 1024 * 1024,
     durable: bool = true,
     max_scan: usize = 100_000,
+    reaper_interval_s: u32 = 60,
 };
 
 pub const Limits = struct {
@@ -94,6 +95,7 @@ const descriptions = .{
         .map_size = "LMDB map size in bytes. Address space, not a disk reservation, but a hard ceiling.",
         .durable = "Sync on commit. `false` trades durability for throughput.",
         .max_scan = "Index entries one query may examine before it is answered early.",
+        .reaper_interval_s = "Seconds between sweeps removing expired events (NIP-40).",
     },
     .limits = .{
         .max_event_size = "Serialized event bytes.",
@@ -265,6 +267,7 @@ pub fn validate(config: Config, diagnostics: *Diagnostics) error{InvalidConfig}!
     if (config.storage.path.len == 0) return diagnostics.fail("storage.path must not be empty", .{});
     if (config.storage.map_size < 1024 * 1024) return diagnostics.fail("storage.map_size is {d} bytes; it must be at least 1048576 (1 MiB)", .{config.storage.map_size});
     if (config.storage.max_scan == 0) return diagnostics.fail("storage.max_scan must be at least 1", .{});
+    if (config.storage.reaper_interval_s == 0) return diagnostics.fail("storage.reaper_interval_s must be at least 1", .{});
     if (config.rate_limit.write_queue_depth == 0) return diagnostics.fail("rate_limit.write_queue_depth must be at least 1", .{});
     inline for (.{ "events_per_second", "messages_per_second", "subscriptions_per_minute", "author_events_per_second" }) |name| {
         if (@field(config.rate_limit, name)) |value| if (!(value > 0) or std.math.isInf(value)) {
@@ -460,6 +463,7 @@ test "every validation error names the setting it is about" {
         .{ .config = .{ .storage = .{ .path = "" } }, .key = "storage.path" },
         .{ .config = .{ .storage = .{ .map_size = 4096 } }, .key = "storage.map_size" },
         .{ .config = .{ .storage = .{ .max_scan = 0 } }, .key = "storage.max_scan" },
+        .{ .config = .{ .storage = .{ .reaper_interval_s = 0 } }, .key = "storage.reaper_interval_s" },
         .{ .config = .{ .network = .{ .write_timeout_ms = 0 } }, .key = "network.write_timeout_ms" },
         .{ .config = .{ .network = .{ .ping_interval_s = 300, .idle_timeout_s = 300 } }, .key = "network.ping_interval_s" },
         .{ .config = .{ .network = .{ .idle_timeout_s = 5_000_000 } }, .key = "network.idle_timeout_s" },

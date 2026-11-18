@@ -52,7 +52,22 @@ pub const Memory = struct {
         return self.order.items.len;
     }
 
-    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased };
+    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased, .reap = reapErased };
+
+    fn reapErased(ptr: *anyopaque, now: i64, max: usize) Error!usize {
+        const self: *Memory = @ptrCast(@alignCast(ptr));
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        var removed: usize = 0;
+        var position: usize = 0;
+        while (position < self.order.items.len and removed < max) {
+            if (kinds.hasExpired(&self.order.items[position], now)) {
+                self.remove(position);
+                removed += 1;
+            } else position += 1;
+        }
+        return removed;
+    }
 
     fn putErased(ptr: *anyopaque, event: *const Event) Error!PutResult {
         const self: *Memory = @ptrCast(@alignCast(ptr));
@@ -248,6 +263,7 @@ pub const Memory = struct {
 
             for (self.order.items) |event| {
                 if (open == 0) break;
+                if (sink.now) |now| if (kinds.hasExpired(&event, now)) continue;
                 var wanted = false;
                 for (filters, remaining) |filter, *left| {
                     if (left.* == 0 or !filter.matches(event)) continue;

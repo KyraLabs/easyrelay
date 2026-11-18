@@ -225,6 +225,13 @@ An event carrying a `["-"]` tag is accepted only from a connection authenticated
 Unauthenticated, it is refused with `auth-required:`; authenticated as someone else, with
 `restricted:`.
 
+## Expiration (NIP-40)
+
+An event whose first `expiration` tag holds a unix timestamp at or before now is refused with
+`invalid:`, and so is one whose `expiration` value is not an integer. A stored event stops being
+served the moment it expires — it is skipped by queries and does not count toward a filter's
+`limit` — and is removed by a sweep every `storage.reaper_interval_s`.
+
 ## Structural limits
 
 Enforced before signature verification and advertised in NIP-11 `limitation`:

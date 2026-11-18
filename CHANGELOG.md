@@ -40,6 +40,8 @@ versions may contain breaking changes; they will always be listed under `Changed
 - Continuous integration: formatting gate, toolchain-pin consistency check, native tests on
   Linux and macOS, and cross-compilation of every published release target.
 - Release automation producing static Linux binaries and macOS binaries with checksums.
+- NIP-40 expiration: an expired event is refused, hidden from queries the moment it expires, and
+  removed by a sweep every `storage.reaper_interval_s`.
 - NIP-42 authentication, which `policy.auth_required_for_write` and `auth_required_for_read`
   can require, and NIP-70 protected events.
 - Rate limits per connection (events, messages, `REQ`s) and per author, all configurable.

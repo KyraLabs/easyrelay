@@ -287,6 +287,10 @@ fn serve(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, loaded: Loade
     try writer.start();
     defer writer.stop();
 
+    var reaper: easyrelay.reaper.Reaper = .{ .io = io, .store = events.store(), .interval_s = settings.storage.reaper_interval_s };
+    try reaper.start();
+    defer reaper.stop();
+
     const rates = rateLimits(settings);
     var authors: ?easyrelay.rate.Authors = if (rates.author_events) |author_rule| try .init(gpa, io, author_rule) else null;
     defer if (authors) |*present| present.deinit(gpa);

@@ -205,6 +205,18 @@ pub const Session = struct {
                 .reason = "the relay ran out of memory validating this event",
             }),
         };
+        const expires = kinds.expiration(&event) catch return self.sendOk(.{
+            .event_id = event.id,
+            .accepted = false,
+            .prefix = .invalid,
+            .reason = "the expiration tag is not a unix timestamp",
+        });
+        if (expires) |at| if (at <= context.now) return self.sendOk(.{
+            .event_id = event.id,
+            .accepted = false,
+            .prefix = .invalid,
+            .reason = "this event has already expired",
+        });
         if (event.kind == auth_kind) return self.sendOk(.{
             .event_id = event.id,
             .accepted = false,
@@ -382,6 +394,7 @@ pub const Session = struct {
         var watermark: u64 = 0;
         var store_sink = sink.sink();
         store_sink.watermark = &watermark;
+        store_sink.now = context.now;
         self.shared.store.query(bounded, store_sink) catch |err| switch (err) {
             error.Abort => return sink.failure orelse error.WriteFailed,
             error.OutOfMemory, error.Backend => {
@@ -945,7 +958,12 @@ const FailingStore = struct {
     put_error: ?store.Error = null,
     query_error: ?store.Error = null,
 
-    const vtable: store.Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query };
+    const vtable: store.Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query, .reap = reap };
+
+    fn reap(ptr: *anyopaque, now: i64, max: usize) store.Error!usize {
+        _ = .{ ptr, now, max };
+        return 0;
+    }
 
     fn interface(self: *FailingStore) store.Store {
         return .{ .ptr = self, .vtable = &vtable };
@@ -1051,7 +1069,12 @@ const RacingStore = struct {
     arena: std.mem.Allocator,
     live: []const struct { event: Event, local_id: ?u64 },
 
-    const vtable: store.Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query };
+    const vtable: store.Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query, .reap = reap };
+
+    fn reap(ptr: *anyopaque, now: i64, max: usize) store.Error!usize {
+        const self: *RacingStore = @ptrCast(@alignCast(ptr));
+        return self.inner.reap(now, max);
+    }
 
     fn interface(self: *RacingStore) store.Store {
         return .{ .ptr = self, .vtable = &vtable };
