@@ -57,6 +57,7 @@ pub const ClientMessage = union(enum) {
     event: Event,
     req: Req,
     close: Close,
+    auth: Event,
 
     pub const Req = struct {
         subscription_id: []const u8,
@@ -94,8 +95,12 @@ pub fn decode(
     if (std.mem.eql(u8, message_type, "EVENT")) return decodeEvent(arena, array, diagnostics);
     if (std.mem.eql(u8, message_type, "REQ")) return decodeReq(arena, array, limits, diagnostics);
     if (std.mem.eql(u8, message_type, "CLOSE")) return decodeClose(array, limits, diagnostics);
+    if (std.mem.eql(u8, message_type, "AUTH")) {
+        if (array.len != 2) return malformed(diagnostics, .wrong_shape, "AUTH carries exactly one event", .{});
+        return .{ .auth = (try decodeEvent(arena, array, diagnostics)).event };
+    }
 
-    for ([_][]const u8{ "AUTH", "COUNT", "NEG-OPEN", "NEG-MSG", "NEG-CLOSE" }) |known| {
+    for ([_][]const u8{ "COUNT", "NEG-OPEN", "NEG-MSG", "NEG-CLOSE" }) |known| {
         if (std.mem.eql(u8, message_type, known)) {
             return unsupported(diagnostics, "this relay does not support {s} yet", .{known});
         }
@@ -314,6 +319,12 @@ pub fn writeClosed(
     try writer.writeByte(']');
 }
 
+pub fn writeAuthChallenge(writer: *std.Io.Writer, challenge: []const u8) std.Io.Writer.Error!void {
+    try writer.writeAll("[\"AUTH\",");
+    try std.json.Stringify.encodeJsonString(challenge, .{}, writer);
+    try writer.writeByte(']');
+}
+
 pub fn writeNotice(writer: *std.Io.Writer, message: []const u8) std.Io.Writer.Error!void {
     try writer.writeAll("[\"NOTICE\",");
     try std.json.Stringify.encodeJsonString(message, .{}, writer);
@@ -477,7 +488,7 @@ test "a malformed filter names which filter it was" {
 }
 
 test "a message type the protocol defines and this relay lacks is refused as unsupported" {
-    for ([_][]const u8{ "AUTH", "COUNT", "NEG-OPEN", "NEG-MSG", "NEG-CLOSE" }) |message_type| {
+    for ([_][]const u8{ "COUNT", "NEG-OPEN", "NEG-MSG", "NEG-CLOSE" }) |message_type| {
         var harness = Harness.init(.{});
         defer harness.deinit();
 
@@ -646,4 +657,22 @@ test "a REQ refused before its id was read names nothing" {
 
     try testing.expectError(error.MalformedMessage, harness.read("[\"REQ\",\"\",{}]"));
     try testing.expectEqual(@as(?[]const u8, null), harness.diagnostics.subject);
+}
+
+test "AUTH carries one event, and anything else in it is malformed" {
+    var harness = Harness.init(.{});
+    defer harness.deinit();
+    const event_json = "{\"id\":\"" ++ "00" ** 32 ++ "\",\"pubkey\":\"" ++ "00" ** 32 ++
+        "\",\"created_at\":1,\"kind\":22242,\"tags\":[],\"content\":\"\",\"sig\":\"" ++ "00" ** 64 ++ "\"}";
+    const message = try harness.read("[\"AUTH\"," ++ event_json ++ "]");
+    try testing.expectEqual(@as(u16, 22242), message.auth.kind);
+    try testing.expectError(error.MalformedMessage, harness.read("[\"AUTH\",\"challenge\"]"));
+    try testing.expectError(error.MalformedMessage, harness.read("[\"AUTH\"]"));
+}
+
+test "an AUTH challenge is written as a two-element array" {
+    var out: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer out.deinit();
+    try writeAuthChallenge(&out.writer, "abc");
+    try testing.expectEqualStrings("[\"AUTH\",\"abc\"]", out.written());
 }

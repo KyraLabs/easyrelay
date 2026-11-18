@@ -6,8 +6,7 @@ const guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 pub const ReadError = error{ RequestTooLarge, EndOfStream, ReadFailed };
 
-/// Reads up to the end of the request headers. The result aliases the reader's buffer,
-/// which must hold `max_request` bytes.
+/// The result aliases the reader's buffer, which must hold `max_request` bytes.
 pub fn readRequest(reader: *std.Io.Reader) ReadError![]const u8 {
     std.debug.assert(reader.buffer.len >= max_request);
     var scanned: usize = 0;
@@ -32,7 +31,6 @@ pub const Kind = union(enum) {
     malformed,
 };
 
-/// Decides what a complete request asks for.
 pub fn classify(request: []const u8) Kind {
     const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return .malformed;
     const request_line = request[0..line_end];
@@ -69,6 +67,18 @@ pub fn classify(request: []const u8) Kind {
     var decoded: [16]u8 = undefined;
     decoder.decode(&decoded, text) catch return .malformed;
     return .{ .upgrade = text[0..24].* };
+}
+
+pub fn headerValue(request: []const u8, name: []const u8) ?[]const u8 {
+    const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return null;
+    var headers = std.mem.splitSequence(u8, request[line_end + 2 ..], "\r\n");
+    while (headers.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), name)) {
+            return std.mem.trim(u8, line[colon + 1 ..], " \t");
+        }
+    }
+    return null;
 }
 
 fn hasToken(value: []const u8, token: []const u8) bool {
@@ -167,4 +177,9 @@ test "any 24-character key is classified without crashing" {
             .plain, .bad_version => return error.TestUnexpectedResult,
         }
     }
+}
+
+test "a header is found by name regardless of case" {
+    try testing.expectEqualStrings("server.example.com", headerValue(upgrade_request, "host").?);
+    try testing.expectEqual(@as(?[]const u8, null), headerValue(upgrade_request, "origin"));
 }

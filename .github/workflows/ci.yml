@@ -87,6 +87,48 @@ jobs:
       - name: Publish and read back with nak
         run: ./scripts/interop-nak.sh
 
+      - name: No acknowledged event is lost to SIGTERM
+        run: ./scripts/shutdown-durability.sh
+
+      - name: Back up a running relay and restore it
+        run: ./scripts/backup-restore.sh
+
+  deploy:
+    name: Compose behind Caddy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - id: zig
+        run: echo "version=$(tr -d '[:space:]' < .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig.outputs.version }}
+          cache-key: deploy
+
+      # Tagged as the image the compose file names, so compose uses it instead of pulling.
+      - name: Build the image
+        run: |
+          zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe --prefix dist/linux-amd64
+          docker build -t ghcr.io/kyralabs/easyrelay:latest .
+
+      - name: Start the compose file with only RELAY_DOMAIN set
+        working-directory: deploy
+        env:
+          RELAY_DOMAIN: localhost
+        run: docker compose up -d
+
+      - name: Reach the relay over TLS through Caddy
+        run: ./scripts/check-compose.sh
+
+      - name: Show the logs
+        if: failure()
+        working-directory: deploy
+        env:
+          RELAY_DOMAIN: localhost
+        run: docker compose logs
+
   cross:
     name: Cross-compile ${{ matrix.target }}
     runs-on: ubuntu-latest

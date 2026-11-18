@@ -4,9 +4,7 @@ const Threaded = std.Io.Threaded;
 
 pub const Error = error{ AddressInUse, AddressUnavailable, AccessDenied, Unexpected };
 
-/// `IpAddress.listen` with `reuse_address` also sets SO_REUSEPORT, which lets a second relay bind
-/// the same port and take a share of the connections into a hub of its own. This sets only
-/// SO_REUSEADDR, so a restart still binds past connections in TIME_WAIT.
+/// Only SO_REUSEADDR: `IpAddress.listen` adds SO_REUSEPORT, which lets a second relay share the port.
 pub fn listen(address: std.Io.net.IpAddress, backlog: u31) Error!std.Io.net.Server {
     const family: u32 = switch (address) {
         .ip4 => posix.AF.INET,

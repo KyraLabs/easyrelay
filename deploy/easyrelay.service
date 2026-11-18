@@ -1,0 +1,43 @@
+# Install as /etc/systemd/system/easyrelay.service, with the binary at /usr/local/bin/easyrelay:
+#   useradd --system --home-dir /var/lib/easyrelay --shell /usr/sbin/nologin easyrelay
+#   systemctl daemon-reload && systemctl enable --now easyrelay
+# Settings go in /etc/easyrelay/easyrelay.zon; the relay starts without one.
+
+[Unit]
+Description=easyrelay Nostr relay
+Documentation=https://github.com/KyraLabs/easyrelay/blob/main/docs/operations.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=easyrelay
+Group=easyrelay
+WorkingDirectory=/etc/easyrelay
+Environment=EASYRELAY_STORAGE_PATH=/var/lib/easyrelay
+ExecStart=/usr/local/bin/easyrelay
+Restart=on-failure
+RestartSec=5s
+# SIGTERM drains the write queue and commits before exit.
+KillSignal=SIGTERM
+TimeoutStopSec=60s
+
+ConfigurationDirectory=easyrelay
+StateDirectory=easyrelay
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -1,7 +1,6 @@
 # Operations
 
-> Describes the target operational surface. Most of it lands in Phase 3; see the
-> [roadmap](roadmap.md).
+> Describes the operational surface Phase 3 delivers; see the [roadmap](roadmap.md).
 
 ## Deployment model
 
@@ -27,12 +26,17 @@ RELAY_DOMAIN=relay.example.com docker compose up -d
 ```
 
 That is a public relay on `wss://relay.example.com`. Caddy obtains the certificate and renews
-it; easyrelay runs on the internal network with its data on a named volume; metrics stay off the
-public interface.
+it; easyrelay runs on the internal network from the `ghcr.io/kyralabs/easyrelay` image, with its
+data on a named volume, a read-only root filesystem and every capability dropped; `/metrics`
+answers 404 through Caddy. `EASYRELAY_VERSION` pins an image tag; it defaults to `latest`.
 
-To change relay settings, drop an `easyrelay.zon` next to the compose file — it is mounted
-automatically if present. Generate a starting point with `docker compose run --rm easyrelay
-init > easyrelay.zon`.
+To change relay settings, drop an `easyrelay.zon` next to the compose file — the directory is
+mounted read-only as the relay's working directory, so the file is read when it exists.
+Generate a starting point with `docker compose run --rm easyrelay init > easyrelay.zon`, then
+`docker compose up -d` again. If `metrics.path` is changed, change the Caddy block in the compose
+file to match, or the new path is public.
+
+`docker compose stop` sends SIGTERM and allows 60 seconds for the write queue to drain.
 
 Everything below is for operators who want to run the binary directly instead.
 
@@ -48,37 +52,37 @@ easyrelay doctor --config ./easyrelay.zon    # validate config and environment b
 `easyrelay doctor` checks that the configuration parses and is internally consistent, that the
 data directory exists and is writable, how much map-size headroom remains, and whether the relay
 will be reachable from anywhere other than loopback. Run it after any configuration change and
-before restarting a relay people depend on.
+before restarting a relay people depend on. It reads the store without taking its lock, so it
+also runs beside a serving relay:
+
+```
+ok   configuration  /etc/easyrelay/easyrelay.zon
+ok   data directory /var/lib/easyrelay is writable
+ok   store          1204331 events, 41.7% of storage.map_size used
+ok   network        127.0.0.1:7777 is reachable from this machine only; a TLS reverse proxy in front makes it public
+warn port           7777 is in use; if that is not this relay already running, choose another network.port
+```
+
+A `fail` line exits with status 1; `warn` lines do not. The store fails past 95% of
+`storage.map_size` and warns past 80%.
 
 ## systemd unit
 
-```ini
-[Unit]
-Description=easyrelay
-After=network.target
+The unit ships as [`deploy/easyrelay.service`](../deploy/easyrelay.service), and is attached to
+every release. It runs the relay as an `easyrelay` system user with `/etc/easyrelay` as its
+working directory, so `/etc/easyrelay/easyrelay.zon` is read when it exists, and keeps the data in
+`/var/lib/easyrelay`:
 
-[Service]
-Type=simple
-User=easyrelay
-Group=easyrelay
-ExecStart=/usr/local/bin/easyrelay --config /etc/easyrelay/easyrelay.zon
-Restart=on-failure
-RestartSec=5s
-
-StateDirectory=easyrelay
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/easyrelay
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
+```bash
+install -m 0755 easyrelay /usr/local/bin/easyrelay
+install -m 0644 easyrelay.service /etc/systemd/system/easyrelay.service
+useradd --system --home-dir /var/lib/easyrelay --shell /usr/sbin/nologin easyrelay
+systemctl daemon-reload && systemctl enable --now easyrelay
 ```
 
 `LimitNOFILE` matters: every connection is a file descriptor, and the default limit will cap
-concurrency long before anything else does.
+concurrency long before anything else does. `TimeoutStopSec=60s` is the time SIGTERM has to
+drain the write queue.
 
 ## Reverse proxy
 
@@ -141,13 +145,24 @@ LMDB provides a consistent snapshot, so the data directory can be copied while t
 and while writes continue. The copy is crash-consistent as of the moment it started.
 
 ```bash
-# online backup
+# online backup, while the relay keeps serving
 easyrelay backup --config /etc/easyrelay/easyrelay.zon --out /backup/easyrelay-$(date -Iseconds).mdb
 ```
 
-To restore: stop the relay, replace the data directory contents with the backup, start it again.
+The backup is a single compacted file holding every event committed when it began. `--out` must
+not exist. The command reads the store without taking the relay's lock, so it runs beside it.
+
+To restore, with `storage.path` at `/var/lib/easyrelay`:
+
+```bash
+systemctl stop easyrelay
+cp /backup/easyrelay-<date>.mdb /var/lib/easyrelay/events/data.mdb
+chown easyrelay:easyrelay /var/lib/easyrelay/events/data.mdb
+systemctl start easyrelay
+```
 
 Test the restore path before needing it. A backup that has never been restored is a hypothesis.
+`scripts/backup-restore.sh` runs this sequence against a relay accepting writes, and CI runs it.
 
 ## Compaction
 
@@ -160,6 +175,9 @@ systemctl stop easyrelay
 easyrelay compact --config /etc/easyrelay/easyrelay.zon
 systemctl start easyrelay
 ```
+
+`compact` refuses to run while a relay holds the store, and prints the file size before and
+after.
 
 Only worth doing after a retention policy change or a large expiration sweep. Routine
 compaction is unnecessary; LMDB reuses free pages on its own.
@@ -183,12 +201,21 @@ Prometheus exposition on `GET /metrics`. The metrics that matter:
 Alert on `write_queue_depth` sustained above zero and on `store_map_used_ratio` above 0.8. The
 first means writes are backing up; the second means a hard failure is approaching.
 
-`GET /health` returns 200 when the relay is accepting connections and its store is writable.
+`GET /health` returns 200 `ok` when the relay is accepting connections and its store answers
+with under 95% of `storage.map_size` in use, and 503 otherwise.
 
 ## Logs
 
-Structured JSON by default, one object per line, to stdout for the journal to collect. Set
-`logging.format = .text` for a readable terminal during development.
+Structured JSON by default, one object per line, on stderr for the journal to collect:
+
+```json
+{"time":"2026-11-17T10:00:00Z","level":"info","scope":"server","message":"conn=42 closed: not reading what it subscribed to (network.write_buffer_limit)"}
+```
+
+Every line about a connection carries `conn=<n>`, a number assigned when it was accepted, so one
+connection's lines can be followed with `grep 'conn=42 '`. Set `logging.format = .text` for a
+readable terminal during development, and `logging.level = .debug` to see each connection open
+and close. The startup summary goes to stdout.
 
 Logs never contain event content or full pubkeys at `info` level.
 

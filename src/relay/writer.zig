@@ -3,6 +3,7 @@ const nostr = @import("nostr");
 
 const codec = @import("codec.zig");
 const hub = @import("hub.zig");
+const metrics = @import("metrics.zig");
 const store = @import("../storage/store.zig");
 
 const Event = nostr.event.Event;
@@ -45,8 +46,6 @@ const Job = struct {
     reply: Reply,
 };
 
-/// The only thread that writes to the store. Events arrive through a bounded queue and are
-/// committed in batches; the `OK` and the fan-out follow the commit.
 pub const Writer = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -59,6 +58,7 @@ pub const Writer = struct {
     len: usize = 0,
     stopping: bool = false,
     thread: ?std.Thread = null,
+    metrics: ?*metrics.Metrics = null,
     batch_jobs: []*Job,
     batch_events: []Event,
     batch_results: []PutResult,
@@ -103,7 +103,7 @@ pub const Writer = struct {
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
 
-    /// Commits everything already queued, then joins the thread.
+    /// Commits everything already queued before the thread exits.
     pub fn stop(self: *Writer) void {
         const thread = self.thread orelse return;
         {
@@ -178,7 +178,14 @@ pub const Writer = struct {
         }
     }
 
+    pub fn queued(self: *Writer) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.len;
+    }
+
     fn send(self: *Writer, arena: std.mem.Allocator, reply: Reply, answer: codec.Ok) void {
+        if (self.metrics) |counters| counters.received(answer);
         var message: std.Io.Writer.Allocating = .init(arena);
         codec.writeOk(&message.writer, answer) catch |err| {
             log.warn("dropping an OK: {t}", .{err});

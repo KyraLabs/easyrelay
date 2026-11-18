@@ -9,6 +9,11 @@ versions may contain breaking changes; they will always be listed under `Changed
 
 ## [Unreleased]
 
+### Fixed
+
+- Queries no longer fail once more than 126 connections have each queried: LMDB reader slots
+  were bound to connection threads for their whole life.
+
 ### Added
 
 - A working relay: `easyrelay` with no arguments and no configuration file serves NIP-01 over
@@ -35,6 +40,21 @@ versions may contain breaking changes; they will always be listed under `Changed
 - Continuous integration: formatting gate, toolchain-pin consistency check, native tests on
   Linux and macOS, and cross-compilation of every published release target.
 - Release automation producing static Linux binaries and macOS binaries with checksums.
+- NIP-40 expiration: an expired event is refused, hidden from queries the moment it expires, and
+  removed by a sweep every `storage.reaper_interval_s`.
+- NIP-65 relay lists, advertised now that conformance tests cover kind 10002 and its `r` tags.
+- NIP-42 authentication, which `policy.auth_required_for_write` and `auth_required_for_read`
+  can require, and NIP-70 protected events.
+- Rate limits per connection (events, messages, `REQ`s) and per author, all configurable.
+- Admission policy: allow and deny lists by author and by kind, answered with `blocked:`.
+- Backpressure: a client that does not read what it subscribed to is disconnected at
+  `network.write_buffer_limit` instead of stalling other clients; pings and an idle timeout.
+- Graceful shutdown on SIGTERM and SIGINT: connections close, queued events are committed.
+- Structured logs, JSON or text, with a number per connection; Prometheus metrics on
+  `GET /metrics` and `GET /health`.
+- `easyrelay doctor`, `easyrelay backup` (online) and `easyrelay compact`.
+- Distribution: a `FROM scratch` container image published to `ghcr.io/kyralabs/easyrelay`,
+  `deploy/docker-compose.yml` behind Caddy, and `deploy/easyrelay.service`, attached to releases.
 - Design documentation: architecture, protocol contract, storage model, NIP coverage,
   configuration reference, operations runbook, test strategy, and nine architecture decision
   records.

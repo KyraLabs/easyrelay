@@ -26,13 +26,25 @@ pub const subscriptions = @import("relay/subscriptions.zig");
 
 pub const hub = @import("relay/hub.zig");
 
+pub const rate = @import("relay/rate.zig");
+
+pub const policy = @import("relay/policy.zig");
+
+pub const reaper = @import("relay/reaper.zig");
+
+pub const metrics = @import("relay/metrics.zig");
+
 pub const writer = @import("relay/writer.zig");
 
 pub const diagnostics = @import("relay/diagnostics.zig");
 
 pub const server = @import("server/server.zig");
 
+pub const outbox = @import("server/outbox.zig");
+
 pub const config = @import("config.zig");
+
+pub const logging = @import("logging.zig");
 
 pub const nip11 = @import("relay/nip11.zig");
 
@@ -57,12 +69,18 @@ test {
     _ = session;
     _ = subscriptions;
     _ = hub;
+    _ = rate;
+    _ = policy;
+    _ = reaper;
+    _ = metrics;
     _ = diagnostics;
+    _ = outbox;
     _ = server;
     _ = kind;
     _ = index;
     _ = writer;
     _ = config;
+    _ = logging;
     _ = nip11;
     _ = frame;
     _ = handshake;

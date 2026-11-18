@@ -45,9 +45,10 @@ ignored line.
 | `port` | u16 | `7777` | Bind port. |
 | `max_connections` | usize | `1024` | Connections accepted before new ones are refused. |
 | `handshake_timeout_ms` | u32 | `5000` | Time allowed to complete the WebSocket handshake, from accept to the end of the request. |
-| `ping_interval_s` | u32 | `30` | Interval between pings on idle connections. `0` disables. Phase 3. |
-| `idle_timeout_s` | u32 | `300` | Close a connection after this long with no traffic. `0` disables. Phase 3. |
-| `write_buffer_limit` | usize | `1048576` | Per-connection pending write bytes before the connection is dropped. Backpressure, not buffering. Phase 3. |
+| `ping_interval_s` | u32 | `30` | Ping a connection after this long without hearing from it. `0` disables. Must be below `idle_timeout_s`. |
+| `idle_timeout_s` | u32 | `300` | Close a connection (code 1001) after this long without hearing from it, pongs included. `0` disables. A client that stops partway through a frame is closed at the next ping interval instead. |
+| `write_buffer_limit` | usize | `1048576` | Per-connection pending write bytes before the connection is dropped. Backpressure, not buffering. Also bounds the live events one subscription holds while its stored events are sent. At least twice `limits.max_message_size`. |
+| `write_timeout_ms` | u32 | `30000` | Time a write to a client may make no progress before the connection is dropped. |
 
 ## `storage`
 
@@ -57,7 +58,7 @@ ignored line.
 | `map_size` | usize | `10737418240` | LMDB map size in bytes (10 GiB). Address space, not a disk reservation, but a hard ceiling. |
 | `durable` | bool | `true` | Sync metadata on commit. Setting this to `false` trades durability for throughput and invalidates any benchmark comparison. |
 | `max_scan` | usize | `100000` | Index entries a single query may examine before returning early. Bounds worst-case query cost. |
-| `reaper_interval_s` | u32 | `60` | How often NIP-40 expiration and retention run. Phase 3. |
+| `reaper_interval_s` | u32 | `60` | How often expired events (NIP-40) are removed. Queries hide them from the moment they expire. |
 
 ## `limits`
 
@@ -80,33 +81,43 @@ Defaults match [protocol.md](protocol.md#structural-limits) and are published in
 
 ## `rate_limit`
 
-Token buckets. `null` on any bucket disables it.
+Token buckets: each `*_per_second` (or `*_per_minute`) is the sustained rate and each `*_burst`
+how many may arrive at once on top of it. `null` on a rate disables that bucket.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `events_per_second` | ?f64 | `10` | Sustained accepted-event rate per connection. Phase 3. |
-| `events_burst` | usize | `50` | Burst allowance. Phase 3. |
-| `messages_per_second` | ?f64 | `50` | Sustained inbound message rate per connection, of any type. Phase 3. |
-| `subscriptions_per_minute` | ?f64 | `60` | `REQ` rate per connection. Phase 3. |
+| `events_per_second` | ?f64 | `10` | Sustained events per connection. Over it, `OK` `false` with `rate-limited:`, before the signature is checked. |
+| `events_burst` | usize | `50` | Burst allowance for `events_per_second`. |
+| `messages_per_second` | ?f64 | `50` | Sustained inbound messages of any type per connection. Over it, the connection is closed with code 1008. |
+| `messages_burst` | usize | `100` | Burst allowance for `messages_per_second`. |
+| `subscriptions_per_minute` | ?f64 | `60` | Sustained `REQ` rate per connection. Over it, `CLOSED` with `rate-limited:`. |
+| `subscriptions_burst` | usize | `20` | Burst allowance for `subscriptions_per_minute`. |
+| `author_events_per_second` | ?f64 | `10` | Sustained events per author, across every connection. Charged only after the signature verifies, so nobody can spend another author's budget. |
+| `author_events_burst` | usize | `50` | Burst allowance for `author_events_per_second`. |
 | `write_queue_depth` | usize | `4096` | Pending writes before events are refused with `rate-limited:`. |
+
+Authors are tracked in a fixed table of 4096 slots, hashed with a key chosen at startup, so memory
+does not grow with the number of authors. Two authors sharing a slot share a budget; that errs
+strict, and the key keeps anyone from choosing a pubkey that lands on another's slot.
 
 ## `policy`
 
-Phase 3; `plugin` is Phase 4.
+`min_pow_difficulty` and `plugin` are Phase 4.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `allowed_pubkeys` | ?[]string | `null` | If set, only these authors may write. |
+| `allowed_pubkeys` | ?[]string | `null` | If set, only these authors may write. Hex pubkeys. |
 | `blocked_pubkeys` | []string | `[]` | These authors may never write. |
-| `allowed_kinds` | ?[]u32 | `null` | If set, only these kinds are accepted. |
-| `blocked_kinds` | []u32 | `[]` | These kinds are always rejected. |
-| `min_pow_difficulty` | u8 | `0` | NIP-13 minimum leading zero bits. `0` disables. |
+| `allowed_kinds` | ?[]u16 | `null` | If set, only these kinds are accepted. |
+| `blocked_kinds` | []u16 | `[]` | These kinds are always rejected. |
+| `min_pow_difficulty` | u8 | `0` | NIP-13 minimum leading zero bits. `0` disables. Phase 4. |
 | `auth_required_for_write` | bool | `false` | Require NIP-42 before accepting events. |
 | `auth_required_for_read` | bool | `false` | Require NIP-42 before serving subscriptions. |
-| `plugin` | ?string | `null` | Path to an external write-policy executable (Phase 4). |
+| `plugin` | ?string | `null` | Path to an external write-policy executable. Phase 4. |
 
 An allow list and a deny list containing the same entry is a configuration error, not a
-precedence puzzle.
+precedence puzzle. A refused event is answered with `OK` `false` and `blocked:`, after its
+signature has verified.
 
 ## `retention`
 
@@ -141,21 +152,17 @@ Feeds the NIP-11 document directly. `supported_nips` is not configurable: it is 
 
 ## `logging`
 
-Phase 3.
-
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `level` | enum | `info` | `error`, `warn`, `info`, `debug`. |
-| `format` | enum | `json` | `json` or `text`. |
+| `level` | enum | `info` | `.@"error"`, `.warn`, `.info`, `.debug` (`error`, `warn`, `info`, `debug` in the environment). |
+| `format` | enum | `json` | `.json`, one object per line, or `.text`. |
 
 ## `metrics`
 
-Phase 3.
-
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `enabled` | bool | `true` | Serve `GET /metrics`. |
-| `path` | string | `/metrics` | Exposition path. |
+| `enabled` | bool | `true` | Serve Prometheus metrics. |
+| `path` | string | `/metrics` | Exposition path. Must start with `/` and must not be `/health`. |
 
 Metrics are served on the same listener as the relay. Restrict access at the reverse proxy; see
 [operations.md](operations.md).

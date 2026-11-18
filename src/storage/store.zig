@@ -24,14 +24,23 @@ pub const PutResult = enum {
 pub const Sink = struct {
     ptr: *anyopaque,
     emitFn: *const fn (ptr: *anyopaque, event: *const Event) Abort!void,
-    /// Receives the newest local id the query's snapshot could see; a live event at or below it was already visible.
+    /// Newest local id the snapshot saw; live events at or below it were already visible.
     watermark: ?*u64 = null,
+    /// Expired events are skipped and do not count toward `limit`.
+    now: ?i64 = null,
+    exhausted: ?*bool = null,
 
     pub const Abort = error{Abort};
 
     pub fn emit(self: Sink, event: *const Event) Abort!void {
         return self.emitFn(self.ptr, event);
     }
+};
+
+pub const Stats = struct {
+    events: u64,
+    /// Excludes space freed for reuse; null for a store without a fixed size.
+    used_ratio: ?f64 = null,
 };
 
 pub const Store = struct {
@@ -42,6 +51,8 @@ pub const Store = struct {
         put: *const fn (ptr: *anyopaque, event: *const Event) Error!PutResult,
         putBatch: *const fn (ptr: *anyopaque, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void,
         query: *const fn (ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void,
+        reap: *const fn (ptr: *anyopaque, now: i64, max: usize) Error!usize,
+        stats: *const fn (ptr: *anyopaque) Error!Stats,
     };
 
     /// Ephemeral events must not be passed; they are never stored.
@@ -50,7 +61,6 @@ pub const Store = struct {
     }
 
     /// Stores `events` in one transaction; on error none of them is stored.
-    /// `local_ids`, when given, receives the local id of each stored event.
     pub fn putBatch(self: Store, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void {
         std.debug.assert(events.len == results.len);
         if (local_ids) |ids| std.debug.assert(ids.len == events.len);
@@ -60,6 +70,14 @@ pub const Store = struct {
     /// Union of each filter's `limit` newest matches, newest first; a null `limit` is unbounded.
     pub fn query(self: Store, filters: []const Filter, sink: Sink) QueryError!void {
         return self.vtable.query(self.ptr, filters, sink);
+    }
+
+    pub fn reap(self: Store, now: i64, max: usize) Error!usize {
+        return self.vtable.reap(self.ptr, now, max);
+    }
+
+    pub fn stats(self: Store) Error!Stats {
+        return self.vtable.stats(self.ptr);
     }
 };
 
@@ -71,7 +89,17 @@ const StubStore = struct {
     events: []const Event = &.{},
     last_filters: []const Filter = &.{},
 
-    const vtable: Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query };
+    const vtable: Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query, .reap = reap, .stats = stats };
+
+    fn stats(ptr: *anyopaque) Error!Stats {
+        _ = ptr;
+        return .{ .events = 0 };
+    }
+
+    fn reap(ptr: *anyopaque, now: i64, max: usize) Error!usize {
+        _ = .{ ptr, now, max };
+        return 0;
+    }
 
     fn store(self: *StubStore) Store {
         return .{ .ptr = self, .vtable = &vtable };

@@ -8,6 +8,7 @@ const PutResult = store.PutResult;
 const QueryError = store.QueryError;
 const Sink = store.Sink;
 const Store = store.Store;
+const Stats = store.Stats;
 
 const Event = nostr.event.Event;
 const Filter = nostr.filter.Filter;
@@ -52,7 +53,27 @@ pub const Memory = struct {
         return self.order.items.len;
     }
 
-    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased };
+    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased, .reap = reapErased, .stats = statsErased };
+
+    fn statsErased(ptr: *anyopaque) Error!Stats {
+        const self: *Memory = @ptrCast(@alignCast(ptr));
+        return .{ .events = self.count() };
+    }
+
+    fn reapErased(ptr: *anyopaque, now: i64, max: usize) Error!usize {
+        const self: *Memory = @ptrCast(@alignCast(ptr));
+        self.lock.lockUncancelable(self.io);
+        defer self.lock.unlock(self.io);
+        var removed: usize = 0;
+        var position: usize = 0;
+        while (position < self.order.items.len and removed < max) {
+            if (kinds.hasExpired(&self.order.items[position], now)) {
+                self.remove(position);
+                removed += 1;
+            } else position += 1;
+        }
+        return removed;
+    }
 
     fn putErased(ptr: *anyopaque, event: *const Event) Error!PutResult {
         const self: *Memory = @ptrCast(@alignCast(ptr));
@@ -64,8 +85,7 @@ pub const Memory = struct {
         return self.putBatch(events, results, local_ids);
     }
 
-    /// Everything a batch can allocate is allocated before the first change, so an error leaves
-    /// the store as it was.
+    /// Allocates everything before the first change, so an error leaves the store unchanged.
     fn putBatch(self: *Memory, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void {
         self.lock.lockUncancelable(self.io);
         defer self.lock.unlock(self.io);
@@ -82,9 +102,7 @@ pub const Memory = struct {
 
     const Reserved = struct {
         copies: []?Event = &.{},
-        /// One owned `d` per address target, in tag order, across the whole batch.
         d_values: []?[]u8 = &.{},
-        /// Index of each event's first entry in `d_values`.
         d_start: []usize = &.{},
 
         fn reserve(self: *Reserved, memory: *Memory, events: []const Event) Error!void {
@@ -248,6 +266,7 @@ pub const Memory = struct {
 
             for (self.order.items) |event| {
                 if (open == 0) break;
+                if (sink.now) |now| if (kinds.hasExpired(&event, now)) continue;
                 var wanted = false;
                 for (filters, remaining) |filter, *left| {
                     if (left.* == 0 or !filter.matches(event)) continue;

@@ -21,7 +21,7 @@ pub const Subscriber = struct {
     mutex: std.Io.Mutex = .init,
     registry: subscriptions.Registry,
     delivery: Delivery,
-    /// Assigned by `join`; tells a reply for a closed connection from one for a new one at the same address.
+    /// Tells a reply for a closed connection from one for a new connection at the same address.
     generation: u64 = 0,
 };
 
@@ -49,7 +49,6 @@ pub const Hub = struct {
         self.next_generation += 1;
     }
 
-    /// Sends `message` to `subscriber` if it is still the connection that `generation` names.
     pub fn reply(self: *Hub, subscriber: *Subscriber, generation: u64, message: []const u8) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -72,13 +71,24 @@ pub const Hub = struct {
         }
     }
 
+    pub fn subscriptionCount(self: *Hub) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var total: usize = 0;
+        for (self.members.items) |member| {
+            member.mutex.lockUncancelable(self.io);
+            defer member.mutex.unlock(self.io);
+            total += member.registry.count();
+        }
+        return total;
+    }
+
     pub fn count(self: *Hub) usize {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         return self.members.items.len;
     }
 
-    /// `local_id` is null for an ephemeral event, which no stored phase can have seen.
     pub fn broadcast(self: *Hub, arena: std.mem.Allocator, event: *const Event, local_id: ?u64) void {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -89,8 +99,10 @@ pub const Hub = struct {
             member.mutex.lockUncancelable(self.io);
             defer member.mutex.unlock(self.io);
 
-            for (member.registry.items()) |subscription| {
-                if (local_id) |id| if (id <= subscription.watermark) continue;
+            for (member.registry.items()) |*subscription| {
+                if (subscription.holding == null) {
+                    if (local_id) |id| if (id <= subscription.watermark) continue;
+                }
                 if (!matchesAny(subscription.filters, event)) continue;
 
                 const body = serialized orelse body: {
@@ -104,7 +116,7 @@ pub const Hub = struct {
                     serialized = rendered;
                     break :body rendered;
                 };
-                deliver(arena, member, subscription.id, body);
+                deliver(arena, member, subscription, body, local_id);
             }
         }
     }
@@ -126,17 +138,22 @@ fn matchesAny(filters: []const nostr.filter.Filter, event: *const Event) bool {
 fn deliver(
     arena: std.mem.Allocator,
     member: *Subscriber,
-    subscription_id: []const u8,
+    subscription: *subscriptions.Subscription,
     serialized_event: []const u8,
+    local_id: ?u64,
 ) void {
     var message: std.Io.Writer.Allocating = .init(arena);
     defer message.deinit();
 
-    codec.writeEventEnvelope(&message.writer, subscription_id, serialized_event) catch |err| {
-        log.warn("dropping a delivery to subscription {s}: {t}", .{ subscription_id, err });
+    codec.writeEventEnvelope(&message.writer, subscription.id, serialized_event) catch |err| {
+        log.warn("dropping a delivery to subscription {s}: {t}", .{ subscription.id, err });
         return;
     };
-    member.delivery.send(message.written());
+    if (subscription.holding != null) {
+        member.registry.keep(subscription, local_id, message.written());
+    } else {
+        member.delivery.send(message.written());
+    }
 }
 
 const testing = std.testing;
@@ -316,4 +333,31 @@ test "a live event at or below a subscription's watermark is not delivered again
     connections.broadcast(arena_state.allocator(), &event, 6);
     connections.broadcast(arena_state.allocator(), &event, null);
     try testing.expectEqual(@as(usize, 2), listener.received.items.len);
+}
+
+test "a subscription in its stored phase holds live events instead of receiving them" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var connections = Hub.init(testing.allocator, testing.io);
+    defer connections.deinit();
+
+    var listener = Listener{};
+    defer listener.deinit();
+    var member: Subscriber = .{
+        .registry = subscriptions.Registry.init(testing.allocator, .{}),
+        .delivery = listener.delivery(),
+    };
+    defer member.registry.deinit();
+    try member.registry.open("s", &[_]nostr.filter.Filter{.{}});
+    member.registry.hold("s");
+    try connections.join(&member);
+
+    const event = testEvent(1);
+    connections.broadcast(arena_state.allocator(), &event, 3);
+    try testing.expectEqual(@as(usize, 0), listener.received.items.len);
+
+    var released = member.registry.release("s");
+    defer released.held.deinit(testing.allocator);
+    try testing.expectEqual(@as(?u64, 3), released.held.messages.items[0].local_id);
+    try testing.expect(std.mem.startsWith(u8, released.held.messages.items[0].message, "[\"EVENT\",\"s\","));
 }

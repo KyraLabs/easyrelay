@@ -40,10 +40,13 @@ Owns sockets and nothing else. A first-party RFC 6455 implementation over `std.I
 
 One connection maps to one thread, which reads its frames and handles its messages one at a
 time, so the layers above need no per-connection locking for what a connection receives. Writes
-to a connection come from its own thread and from the hub's fan-out, and are serialised by a
-per-connection lock. This layer bounds the handshake request and its duration, the frame payload
-and the assembled message size, answers ping with pong, and refuses a protocol violation with a
-close frame naming it. Closing a connection whose write backlog grows without bound is Phase 3.
+to a connection come from its own thread and from the hub's fan-out; after the handshake both
+go into a per-connection outbox that a second, sending thread drains, so no other thread ever
+blocks on a client's socket. The outbox is bounded by `network.write_buffer_limit`: fan-out that
+does not fit closes the connection, while the connection's own replies wait for room. This
+layer bounds the handshake request and its duration, the frame payload and the assembled message
+size, and the time a write may make no progress; it answers ping with pong, and refuses a
+protocol violation with a close frame naming it.
 
 The same listener serves the plain HTTP surface: the NIP-11 relay information document when the
 request carries `Accept: application/nostr+json`, `GET /metrics`, and `GET /health`.
@@ -148,13 +151,22 @@ flowchart LR
 
 Consequences that shape the rest of the design:
 
-- **Reads do not block.** A `REQ` opens a read-only transaction on the calling I/O thread and
-  streams results directly to the socket. Read transactions are cheap and never wait on the
-  writer.
+- **Reads do not wait on the writer.** A `REQ` opens a read-only transaction on the calling
+  connection thread. Read transactions are cheap and never wait on the writer. They do wait on
+  each other past `max_readers` concurrent queries: the store holds one permit per LMDB reader
+  slot, so a query beyond the ceiling queues for a slot rather than failing with
+  `MDB_READERS_FULL`. The environment is opened with `MDB_NOTLS`, which ties a slot to the
+  transaction rather than to the thread; without it every connection thread that had ever
+  queried would keep a slot until it exited.
 - **The write queue is bounded.** When it fills, new events are rejected with a `rate-limited:`
   `OK` rather than queued. Backpressure is visible to the client, not absorbed silently.
 - **Fan-out happens after the write commits**, on the writer thread, so a subscriber never
-  receives an event that a subsequent read would fail to find.
+  receives an event that a subsequent read would fail to find. Fan-out only copies into each
+  connection's outbox and never waits on a socket.
+- **A `REQ`'s stored phase runs without the subscriber's lock.** Live events matching it that
+  arrive meanwhile are held, up to `network.write_buffer_limit` bytes, and sent after `EOSE`,
+  minus those the query's snapshot already contained. A subscription that would hold more is
+  closed with `CLOSED` `error:`.
 - **Long-lived read transactions pin old pages.** A slow subscriber draining a large `REQ` keeps
   a read transaction open and prevents LMDB from reclaiming pages, which grows the file. Query
   results are therefore bounded and streamed with a cap, never materialised in full.
@@ -181,22 +193,24 @@ build.zig
 build.zig.zon
 .zigversion
 src/
-  main.zig            entry point, startup, signal handling
+  main.zig            entry point, commands (serve, init, doctor, backup, compact), signals
   config.zig          configuration loading and validation
-  transport/          RFC 6455 frames and handshake, socket reads, a test client
-  server/             listener and connections: WebSocket sessions, plain HTTP answers
-  relay/              protocol codec, validation, session, subscription registry
-  policy/             rate limiting, PoW, auth, allow/deny lists
+  logging.zig         structured log lines, JSON or text
+  transport/          RFC 6455 frames and handshake, socket reads and writes, a test client
+  server/             listener and connections, the per-connection outbox, plain HTTP answers
+  relay/              codec, validation, session (NIP-42, NIP-70), subscriptions, hub, writer,
+                      rate limits, admission policy, NIP-40 reaper, metrics, NIP-11
   storage/
     store.zig         the Store interface
     memory.zig        in-memory backend
-    lmdb.zig          LMDB backend
-  nips/               nip11.zig, nip42.zig, nip45.zig, nip50.zig, nip77.zig, nip86.zig
-  metrics/            Prometheus registry and exposition
+    lmdb.zig          LMDB backend, backup and compaction
 tests/
   conformance/        protocol rules from docs/protocol.md
   vectors/            official test vectors
-bench/                benchmark harness
+deploy/               docker-compose.yml behind Caddy, the systemd unit
+scripts/              toolchain check, and checks that drive the built binary with nak
+Dockerfile            the container image: the static binary and nothing else
+bench/                benchmark harness (Phase 6)
 ```
 
 ## Decision index

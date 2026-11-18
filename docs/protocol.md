@@ -192,6 +192,46 @@ A kind-5 event is stored as a regular event and acts on its `e` and `a` tags:
 A target that is not stored when the request arrives is not remembered: without the event the
 relay cannot tell whether the request's author wrote it.
 
+## Authentication (NIP-42)
+
+Each connection gets its own challenge, 16 random bytes in hex. The relay sends
+`["AUTH", <challenge>]` when the connection opens if `policy.auth_required_for_write` or
+`policy.auth_required_for_read` is set, and otherwise just before the first `auth-required:` the
+connection would receive.
+
+A client answers with `["AUTH", <event>]`. The event is accepted, and its `pubkey` remembered for
+the rest of the connection, when all of these hold; otherwise it is answered with `OK` `false`
+and `invalid:`:
+
+- it passes the same validation as any event (id, signature, structural limits);
+- its kind is 22242;
+- its `created_at` is within ten minutes of now;
+- its `challenge` tag equals this connection's challenge;
+- its `relay` tag names the host the client connected to, compared with the request's `Host`
+  header ignoring scheme, path, case and a default port. A request without a `Host` header skips
+  this check; the per-connection challenge already prevents replay.
+
+A connection may authenticate as up to eight pubkeys; past that the oldest is forgotten. A kind
+22242 event sent with `EVENT` is refused with `invalid:` and never stored or broadcast.
+
+| Situation | Answer |
+| --- | --- |
+| `EVENT` while `auth_required_for_write` and unauthenticated | `OK` `false` with `auth-required:` |
+| `REQ` while `auth_required_for_read` and unauthenticated | `CLOSED` with `auth-required:` |
+
+## Protected events (NIP-70)
+
+An event carrying a `["-"]` tag is accepted only from a connection authenticated as its author.
+Unauthenticated, it is refused with `auth-required:`; authenticated as someone else, with
+`restricted:`.
+
+## Expiration (NIP-40)
+
+An event whose first `expiration` tag holds a unix timestamp at or before now is refused with
+`invalid:`, and so is one whose `expiration` value is not an integer. A stored event stops being
+served the moment it expires — it is skipped by queries and does not count toward a filter's
+`limit` — and is removed by a sweep every `storage.reaper_interval_s`.
+
 ## Structural limits
 
 Enforced before signature verification and advertised in NIP-11 `limitation`:
@@ -208,6 +248,26 @@ Enforced before signature verification and advertised in NIP-11 `limitation`:
 | `created_at` lower bound | unset | `invalid:` |
 
 All are configurable; see [configuration.md](configuration.md).
+
+## Rate limits and backpressure
+
+Per connection, token buckets bound events, `REQ`s and messages of any type; per author, a bucket
+shared by every connection bounds events. All are configurable in
+[configuration.md](configuration.md#rate_limit).
+
+| Exceeded | Answer |
+| --- | --- |
+| Events per connection | `OK` `false` with `rate-limited:`, before the signature is checked |
+| Events per author | `OK` `false` with `rate-limited:`, after the signature verifies |
+| `REQ`s per connection | `CLOSED` with `rate-limited:` |
+| Messages per connection | The connection is closed with WebSocket close code 1008 |
+| The write queue | `OK` `false` with `rate-limited:` |
+
+A connection that does not read what it subscribed to is closed once its pending outbound bytes
+pass `network.write_buffer_limit`, or once a write to it makes no progress for
+`network.write_timeout_ms`. Live events matching a subscription that arrive while its stored
+events are still being sent are held and follow its `EOSE`; if more arrive than
+`network.write_buffer_limit` allows, the subscription is closed with `CLOSED` and `error:`.
 
 ## References
 

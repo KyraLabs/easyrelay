@@ -13,26 +13,28 @@ const Filter = nostr.filter.Filter;
 const PutResult = store.PutResult;
 const Sink = store.Sink;
 const Store = store.Store;
+const Stats = store.Stats;
 const StoreError = store.Error;
 const StoreQueryError = store.QueryError;
 
 pub const Error = error{
     OutOfMemory,
     DataDirectory,
-    /// Another process holds the data directory.
     InUse,
     Backend,
     Corrupt,
 };
 
 pub const Options = struct {
-    map_size: usize = 10 * 1024 * 1024 * 1024,
+    map_size: usize = map_size_default,
     max_readers: u32 = 126,
     max_scan: usize = 100_000,
     durable: bool = true,
 };
 
 pub const subdirectory = "events";
+
+pub const map_size_default = 10 * 1024 * 1024 * 1024;
 
 const lock_file = "easyrelay.lock";
 
@@ -45,7 +47,9 @@ const by_replaceable_db = "by_replaceable";
 const by_address_db = "by_address";
 const deleted_db = "deleted";
 const deleted_address_db = "deleted_address";
+const by_expiration_db = "by_expiration";
 const next_local_id_key = "next_local_id";
+const expirations_indexed_key = "expirations_indexed";
 
 /// Zero is reserved as the watermark before any event.
 pub const first_local_id: u64 = 1;
@@ -137,8 +141,22 @@ const IndexWriter = struct {
     }
 };
 
+fn expirationKey(at: i64, id: *const [32]u8) [40]u8 {
+    var key: [40]u8 = undefined;
+    std.mem.writeInt(u64, key[0..8], @as(u64, @bitCast(at)) ^ (@as(u64, 1) << 63), .big);
+    key[8..40].* = id.*;
+    return key;
+}
+
+fn expirationOf(event: *const Event) ?i64 {
+    return kinds.expiration(event) catch null;
+}
+
 fn writeIndexes(txn: lmdb.Transaction, event: *const Event, local_key: *const [8]u8) Error!void {
     (try database(txn, by_id_db)).set(&event.id, local_key) catch return error.Backend;
+    if (expirationOf(event)) |at| {
+        (try database(txn, by_expiration_db)).set(&expirationKey(at, &event.id), local_key) catch return error.Backend;
+    }
     try index.forEachEntry(event, IndexWriter{ .txn = txn, .local_key = local_key, .delete = false });
     if (Coordinate.of(event)) |coordinate| {
         (try database(txn, coordinate.db)).set(coordinate.key(), local_key) catch return error.Backend;
@@ -148,10 +166,28 @@ fn writeIndexes(txn: lmdb.Transaction, event: *const Event, local_key: *const [8
 fn deleteIndexes(txn: lmdb.Transaction, event: *const Event) Error!void {
     const unused = [_]u8{0} ** 8;
     (try database(txn, by_id_db)).delete(&event.id) catch return error.Backend;
+    if (expirationOf(event)) |at| {
+        (try database(txn, by_expiration_db)).delete(&expirationKey(at, &event.id)) catch return error.Backend;
+    }
     try index.forEachEntry(event, IndexWriter{ .txn = txn, .local_key = &unused, .delete = true });
     if (Coordinate.of(event)) |coordinate| {
         (try database(txn, coordinate.db)).delete(coordinate.key()) catch return error.Backend;
     }
+}
+
+fn dueExpirations(txn: lmdb.Transaction, arena: std.mem.Allocator, now: i64, max: usize) Error![]const [8]u8 {
+    var due: std.ArrayList([8]u8) = .empty;
+    const cursor = (try database(txn, by_expiration_db)).cursor() catch return error.Backend;
+    defer cursor.deinit();
+    const limit = expirationKey(now, &([_]u8{0xff} ** 32));
+    var key = cursor.goToFirst() catch return error.Backend;
+    while (key) |found| : (key = cursor.goToNext() catch return error.Backend) {
+        if (due.items.len == max or std.mem.order(u8, found, &limit) == .gt) break;
+        const value = cursor.getCurrentValue() catch return error.Backend;
+        if (value.len != 8) return error.Corrupt;
+        try due.append(arena, value[0..8].*);
+    }
+    return due.items;
 }
 
 const max_prefixes_per_filter = 64;
@@ -262,14 +298,146 @@ const Choice = union(enum) {
     }
 };
 
+pub const CopyError = error{
+    OutOfMemory,
+    NoStore,
+    Output,
+    InUse,
+    Backend,
+};
+
+const data_file = "data.mdb";
+const compacting_file = "data.mdb.compacting";
+
+/// Takes no lock, so it runs beside a serving relay; the copy is one read snapshot.
+pub fn backup(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, map_size: usize, out_path: []const u8) CopyError!void {
+    const path = try std.fs.path.joinZ(gpa, &.{ data_dir, subdirectory });
+    defer gpa.free(path);
+    try expectStore(gpa, io, path);
+
+    const env = lmdb.Environment.init(path, .{
+        .map_size = map_size,
+        .max_dbs = max_databases,
+        .read_only = true,
+        .no_tls = true,
+    }) catch return error.Backend;
+    defer env.deinit();
+    const out = std.Io.Dir.cwd().createFile(io, out_path, .{ .exclusive = true }) catch return error.Output;
+    defer out.close(io);
+    errdefer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+    if (lmdb_c.mdb_env_copyfd2(env.ptr, out.handle, lmdb_c.MDB_CP_COMPACT) != 0) return error.Output;
+    out.sync(io) catch return error.Output;
+}
+
+pub fn inspect(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, map_size: usize) CopyError!Stats {
+    const path = try std.fs.path.joinZ(gpa, &.{ data_dir, subdirectory });
+    defer gpa.free(path);
+    try expectStore(gpa, io, path);
+    const env = lmdb.Environment.init(path, .{
+        .map_size = map_size,
+        .max_dbs = max_databases,
+        .read_only = true,
+        .no_tls = true,
+    }) catch return error.Backend;
+    defer env.deinit();
+    return environmentStats(env) catch error.Backend;
+}
+
+/// Freed pages count as unused only once reusable; the file itself never shrinks.
+fn environmentStats(env: lmdb.Environment) Error!Stats {
+    var info: lmdb_c.MDB_envinfo = undefined;
+    if (lmdb_c.mdb_env_info(env.ptr, &info) != 0) return error.Backend;
+    const page_size = (env.stat() catch return error.Backend).psize;
+    const oldest = try oldestSnapshot(env, info.me_last_txnid);
+    const txn = lmdb.Transaction.init(env, .{ .mode = .ReadOnly }) catch return error.Backend;
+    defer txn.abort();
+    const events = (lmdb.Database.open(txn, events_db, .{}) catch return error.Backend).stat() catch return error.Backend;
+    const reached = info.me_last_pgno + 1;
+    const in_use = reached - @min(reached, try reusablePages(txn, oldest));
+    const used: f64 = @floatFromInt(in_use * page_size);
+    return .{ .events = events.entries, .used_ratio = used / @as(f64, @floatFromInt(info.me_mapsize)) };
+}
+
+/// Read before the caller's own transaction begins, so it does not count itself.
+fn oldestSnapshot(env: lmdb.Environment, last_txnid: usize) Error!usize {
+    var oldest = last_txnid;
+    if (lmdb_c.mdb_reader_list(env.ptr, lowerToReader, &oldest) < 0) return error.Backend;
+    return oldest;
+}
+
+/// Lines are `pid thread txnid`; the header and idle slots (`-`) do not parse.
+fn lowerToReader(message: [*c]const u8, context: ?*anyopaque) callconv(.c) c_int {
+    const oldest: *usize = @ptrCast(@alignCast(context.?));
+    var fields = std.mem.tokenizeAny(u8, std.mem.span(message), " \n");
+    _ = fields.next();
+    _ = fields.next();
+    const txnid = std.fmt.parseInt(usize, fields.next() orelse return 0, 10) catch return 0;
+    oldest.* = @min(oldest.*, txnid);
+    return 0;
+}
+
+/// Freelist values lead with their page count; a list is reusable once older than every snapshot.
+fn reusablePages(txn: lmdb.Transaction, oldest: usize) Error!u64 {
+    const native = @import("builtin").cpu.arch.endian();
+    const freelist: lmdb.Database = .{ .txn = txn, .dbi = 0 };
+    const cursor = freelist.cursor() catch return error.Backend;
+    defer cursor.deinit();
+    var total: u64 = 0;
+    var key = cursor.goToFirst() catch return error.Backend;
+    while (key) |freed_by| : (key = cursor.goToNext() catch return error.Backend) {
+        if (freed_by.len != @sizeOf(usize)) return error.Corrupt;
+        if (std.mem.readInt(usize, freed_by[0..@sizeOf(usize)], native) >= oldest) break;
+        const value = cursor.getCurrentValue() catch return error.Backend;
+        if (value.len < @sizeOf(usize)) return error.Corrupt;
+        total += std.mem.readInt(usize, value[0..@sizeOf(usize)], native);
+    }
+    return total;
+}
+
+pub const Compacted = struct { before: u64, after: u64 };
+
+pub fn compact(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, options: Options) CopyError!Compacted {
+    const path = try std.fs.path.join(gpa, &.{ data_dir, subdirectory });
+    defer gpa.free(path);
+    try expectStore(gpa, io, path);
+    var store_dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return error.NoStore;
+    defer store_dir.close(io);
+    const before = (store_dir.statFile(io, data_file, .{}) catch return error.NoStore).size;
+
+    {
+        var opened = Lmdb.open(gpa, io, data_dir, options) catch |err| return switch (err) {
+            error.InUse => error.InUse,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Backend,
+        };
+        defer opened.close();
+        const out = store_dir.createFile(io, compacting_file, .{}) catch return error.Output;
+        defer out.close(io);
+        errdefer store_dir.deleteFile(io, compacting_file) catch {};
+        if (lmdb_c.mdb_env_copyfd2(opened.env.ptr, out.handle, lmdb_c.MDB_CP_COMPACT) != 0) return error.Output;
+        out.sync(io) catch return error.Output;
+        // Renamed while the lock is still held, so no relay can open the old file meanwhile.
+        store_dir.rename(compacting_file, store_dir, data_file, io) catch return error.Output;
+    }
+    const after = (store_dir.statFile(io, data_file, .{}) catch return error.Backend).size;
+    return .{ .before = before, .after = after };
+}
+
+fn expectStore(gpa: std.mem.Allocator, io: std.Io, store_path: []const u8) CopyError!void {
+    const file = try std.fs.path.join(gpa, &.{ store_path, data_file });
+    defer gpa.free(file);
+    _ = std.Io.Dir.cwd().statFile(io, file, .{}) catch return error.NoStore;
+}
+
 pub const Lmdb = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
-    /// Held for the store's lifetime: two relays on one directory would share the events but not
-    /// their subscriptions, and each would miss live events the other accepts.
+    /// Two relays on one directory would share the events but not the subscriptions.
     lock: std.Io.File,
     env: lmdb.Environment,
     max_scan: usize,
+    /// One permit per reader slot, so queries past `max_readers` wait instead of failing.
+    readers: std.Io.Semaphore,
 
     pub fn open(
         gpa: std.mem.Allocator,
@@ -297,12 +465,22 @@ pub const Lmdb = struct {
             .map_size = options.map_size,
             .max_readers = options.max_readers,
             .max_dbs = max_databases,
+            // Otherwise a slot belongs to its thread until the thread exits.
+            .no_tls = true,
         }) catch return error.Backend;
         errdefer env.deinit();
         if (!options.durable and lmdb_c.mdb_env_set_flags(env.ptr, lmdb_c.MDB_NOSYNC, 1) != 0) return error.Backend;
 
-        createTables(env) catch return error.Backend;
-        return .{ .gpa = gpa, .io = io, .lock = lock, .env = env, .max_scan = options.max_scan };
+        createTables(gpa, env) catch return error.Backend;
+        std.debug.assert(options.max_readers > 0);
+        return .{
+            .gpa = gpa,
+            .io = io,
+            .lock = lock,
+            .env = env,
+            .max_scan = options.max_scan,
+            .readers = .{ .permits = options.max_readers },
+        };
     }
 
     pub fn store(self: *Lmdb) Store {
@@ -362,7 +540,47 @@ pub const Lmdb = struct {
         };
     }
 
-    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased };
+    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased, .reap = reapErased, .stats = statsErased };
+
+    fn statsErased(ptr: *anyopaque) StoreError!Stats {
+        const self: *Lmdb = @ptrCast(@alignCast(ptr));
+        return self.stats() catch error.Backend;
+    }
+
+    fn stats(self: *Lmdb) Error!Stats {
+        self.readers.waitUncancelable(self.io);
+        defer self.readers.post(self.io);
+        return environmentStats(self.env);
+    }
+
+    fn reapErased(ptr: *anyopaque, now: i64, max: usize) StoreError!usize {
+        const self: *Lmdb = @ptrCast(@alignCast(ptr));
+        return self.reap(now, max) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Backend,
+        };
+    }
+
+    /// Collects before removing, because removal moves the cursor.
+    fn reap(self: *Lmdb, now: i64, max: usize) Error!usize {
+        var arena_state = std.heap.ArenaAllocator.init(self.gpa);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        const txn = lmdb.Transaction.init(self.env, .{ .mode = .ReadWrite }) catch return error.Backend;
+        var removed: usize = 0;
+        {
+            errdefer txn.abort();
+            const due = try dueExpirations(txn, arena, now, max);
+            for (due) |local_key| {
+                const stored = try self.storedAt(txn, arena, &local_key);
+                try remove(txn, &stored);
+                removed += 1;
+            }
+        }
+        try commit(txn);
+        return removed;
+    }
 
     fn putErased(ptr: *anyopaque, event: *const Event) StoreError!PutResult {
         const self: *Lmdb = @ptrCast(@alignCast(ptr));
@@ -483,6 +701,8 @@ pub const Lmdb = struct {
             left.* = filter.limit orelse std.math.maxInt(u64);
             if (left.* != 0) pending += 1;
         }
+        self.readers.waitUncancelable(self.io);
+        defer self.readers.post(self.io);
         const txn = lmdb.Transaction.init(self.env, .{ .mode = .ReadOnly }) catch
             return error.Backend;
         defer txn.abort();
@@ -501,6 +721,9 @@ pub const Lmdb = struct {
         var event_arena = std.heap.ArenaAllocator.init(self.gpa);
         defer event_arena.deinit();
         var scanned: usize = 0;
+        defer if (sink.exhausted) |exhausted| {
+            exhausted.* = pending != 0 and scanned >= self.max_scan;
+        };
         while (pending != 0 and scanned < self.max_scan) {
             var next: ?Head = null;
             for (sources.items) |source| {
@@ -519,6 +742,7 @@ pub const Lmdb = struct {
             _ = event_arena.reset(.retain_capacity);
             const event = (try self.read(txn, event_arena.allocator(), chosen.local_id)) orelse
                 return error.Corrupt;
+            if (sink.now) |now| if (kinds.hasExpired(&event, now)) continue;
             var wanted = false;
             for (filters, remaining) |filter, *left| {
                 if (left.* == 0 or !filter.matches(event)) continue;
@@ -578,17 +802,40 @@ pub const Lmdb = struct {
 };
 
 /// Creates every table, because a read-only transaction cannot.
-fn createTables(env: lmdb.Environment) !void {
+fn createTables(gpa: std.mem.Allocator, env: lmdb.Environment) !void {
     const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
     {
         errdefer txn.abort();
-        for ([_][*:0]const u8{ meta_db, events_db, by_id_db, by_replaceable_db, by_address_db, deleted_db, deleted_address_db }) |name| {
+        for ([_][*:0]const u8{ meta_db, events_db, by_id_db, by_replaceable_db, by_address_db, deleted_db, deleted_address_db, by_expiration_db }) |name| {
             _ = try lmdb.Database.open(txn, name, .{ .create = true });
         }
         for (std.enums.values(index.Index)) |which| _ = try lmdb.Database.open(txn, which.name(), .{ .create = true });
         _ = try nextLocalId(txn);
+        try indexExpirations(gpa, txn);
     }
     try commit(txn);
+}
+
+/// Stores from before NIP-40 lack these entries; built once, in the transaction that opens the store.
+fn indexExpirations(gpa: std.mem.Allocator, txn: lmdb.Transaction) !void {
+    const meta = try lmdb.Database.open(txn, meta_db, .{});
+    if ((try meta.get(expirations_indexed_key)) != null) return;
+    const expirations = try lmdb.Database.open(txn, by_expiration_db, .{});
+    const cursor = try (try lmdb.Database.open(txn, events_db, .{})).cursor();
+    defer cursor.deinit();
+
+    var arena_state = std.heap.ArenaAllocator.init(gpa);
+    defer arena_state.deinit();
+    var key = try cursor.goToFirst();
+    while (key) |local_key| : (key = try cursor.goToNext()) {
+        _ = arena_state.reset(.retain_capacity);
+        const event = record.decode(arena_state.allocator(), try cursor.getCurrentValue()) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Malformed => return error.Corrupt,
+        };
+        if (expirationOf(&event)) |at| try expirations.set(&expirationKey(at, &event.id), local_key);
+    }
+    try meta.set(expirations_indexed_key, "");
 }
 
 const testing = std.testing;
@@ -1287,6 +1534,26 @@ test "the scan budget ends a query early" {
     try testing.expectEqual(@as(usize, 0), collector.len);
     try backend.store().query(&.{.{}}, collector.sink());
     try testing.expectEqual(@as(usize, 3), collector.len);
+
+    var exhausted = false;
+    var sink = collector.sink();
+    sink.exhausted = &exhausted;
+    collector.len = 0;
+    try backend.store().query(&.{.{ .limit = 5 }}, sink);
+    try testing.expect(exhausted);
+    collector.len = 0;
+    try backend.store().query(&.{.{ .limit = 1 }}, sink);
+    try testing.expect(!exhausted);
+}
+
+test "stats count the stored events and how much of the map is in use" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    for (0..3) |position| _ = try fixture.backend.store().put(&kindEvent(@intCast(position + 1), 1700000000, 1));
+    const stats = try fixture.backend.store().stats();
+    try testing.expectEqual(@as(u64, 3), stats.events);
+    try testing.expect(stats.used_ratio.? > 0 and stats.used_ratio.? < 0.01);
 }
 
 test "a deletion holds across a restart" {
@@ -1436,4 +1703,306 @@ test "a commit the disk refuses leaves the store answering, not crashing" {
     var collector: Collector = .{ .stop_after = 1 };
     try testing.expectError(error.Abort, backend.store().query(&.{.{}}, collector.sink()));
     try testing.expectEqual(id - 1, collector.idAt(0));
+}
+
+const ReaderThread = struct {
+    backend: *Lmdb,
+    queried: *std.atomic.Value(usize),
+    threads: usize,
+    result: StoreQueryError!void = {},
+
+    fn run(self: *ReaderThread) void {
+        var collector: Collector = .{};
+        self.result = self.backend.store().query(&.{.{}}, collector.sink());
+        _ = self.queried.fetchAdd(1, .acq_rel);
+        while (self.queried.load(.acquire) < self.threads) std.Thread.yield() catch {};
+    }
+};
+
+test "more live threads than reader slots still query, one after another" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{ .max_readers = 2 });
+    defer backend.close();
+    _ = try backend.store().put(&kindEvent(1, 1700000000, 1));
+
+    var queried: std.atomic.Value(usize) = .init(0);
+    var readers: [3]ReaderThread = undefined;
+    var threads: [3]std.Thread = undefined;
+    for (&readers, &threads) |*reader, *thread| {
+        reader.* = .{ .backend = &backend, .queried = &queried, .threads = readers.len };
+        thread.* = try std.Thread.spawn(.{}, ReaderThread.run, .{reader});
+    }
+    for (threads) |thread| thread.join();
+    for (readers) |reader| try reader.result;
+}
+
+const SlotHolder = struct {
+    backend: *Lmdb,
+    inside: *std.atomic.Value(usize),
+    release: *std.atomic.Value(bool),
+    result: StoreQueryError!void = {},
+
+    fn run(self: *SlotHolder) void {
+        self.result = self.backend.store().query(&.{.{}}, .{ .ptr = self, .emitFn = hold });
+    }
+
+    fn hold(ptr: *anyopaque, _: *const Event) Sink.Abort!void {
+        const self: *SlotHolder = @ptrCast(@alignCast(ptr));
+        _ = self.inside.fetchAdd(1, .acq_rel);
+        while (!self.release.load(.acquire)) std.Thread.yield() catch {};
+    }
+};
+
+const Releaser = struct {
+    release: *std.atomic.Value(bool),
+
+    fn run(self: *Releaser) void {
+        std.Io.sleep(testing.io, .fromMilliseconds(100), .awake) catch {};
+        self.release.store(true, .release);
+    }
+};
+
+test "a query arriving while every reader slot is held waits for one instead of failing" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{ .max_readers = 2 });
+    defer backend.close();
+    _ = try backend.store().put(&kindEvent(1, 1700000000, 1));
+
+    var inside: std.atomic.Value(usize) = .init(0);
+    var release: std.atomic.Value(bool) = .init(false);
+    var holders: [2]SlotHolder = undefined;
+    var threads: [2]std.Thread = undefined;
+    for (&holders, &threads) |*holder, *thread| {
+        holder.* = .{ .backend = &backend, .inside = &inside, .release = &release };
+        thread.* = try std.Thread.spawn(.{}, SlotHolder.run, .{holder});
+    }
+    while (inside.load(.acquire) < holders.len) std.Thread.yield() catch {};
+
+    var releaser: Releaser = .{ .release = &release };
+    const releaser_thread = try std.Thread.spawn(.{}, Releaser.run, .{&releaser});
+    var collector: Collector = .{};
+    const result = backend.store().query(&.{.{}}, collector.sink());
+    releaser_thread.join();
+    for (threads) |thread| thread.join();
+
+    try result;
+    try testing.expect(release.load(.acquire));
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    for (holders) |holder| try holder.result;
+}
+
+fn expiringEvent(tags: *[1]nostr.event.Tag, fields: *[2][]const u8, id_byte: u8, kind: u16, at: []const u8) Event {
+    fields.* = .{ "expiration", at };
+    tags.* = .{fields};
+    var event = kindEvent(id_byte, 1700000000 + @as(i64, id_byte), kind);
+    event.tags = tags;
+    return event;
+}
+
+test "an expired event is skipped by a query and does not use up its limit" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var tags: [2][1]nostr.event.Tag = undefined;
+    var fields: [2][2][]const u8 = undefined;
+    _ = try fixture.backend.store().put(&expiringEvent(&tags[0], &fields[0], 1, 1, "300"));
+    _ = try fixture.backend.store().put(&expiringEvent(&tags[1], &fields[1], 2, 1, "100"));
+
+    var collector: Collector = .{};
+    var sink = collector.sink();
+    sink.now = 200;
+    try fixture.backend.store().query(&.{.{ .limit = 1 }}, sink);
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    try testing.expectEqual(@as(u8, 1), collector.idAt(0));
+}
+
+test "reaping removes expired events from every table, once" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var tags: [3][1]nostr.event.Tag = undefined;
+    var fields: [3][2][]const u8 = undefined;
+    const gone = expiringEvent(&tags[0], &fields[0], 1, 1, "100");
+    const also_gone = expiringEvent(&tags[1], &fields[1], 2, 1, "150");
+    const kept = expiringEvent(&tags[2], &fields[2], 3, 1, "300");
+    for ([_]Event{ gone, also_gone, kept }) |event| _ = try fixture.backend.store().put(&event);
+
+    try testing.expectEqual(@as(usize, 1), try fixture.backend.store().reap(200, 1));
+    try testing.expectEqual(@as(usize, 1), try fixture.backend.store().reap(200, 10));
+    try testing.expectEqual(@as(usize, 0), try fixture.backend.store().reap(200, 10));
+
+    var collector: Collector = .{};
+    try fixture.backend.store().query(&.{.{}}, collector.sink());
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    try testing.expectEqual(@as(u8, 3), collector.idAt(0));
+    try testing.expectEqual(PutResult.stored, try fixture.backend.store().put(&gone));
+}
+
+test "a replaced event leaves no expiration entry behind" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var tags: [1]nostr.event.Tag = undefined;
+    var fields: [2][]const u8 = undefined;
+    const old = expiringEvent(&tags, &fields, 1, 10002, "100");
+    const newer = kindEvent(2, 1700000100, 10002);
+    _ = try fixture.backend.store().put(&old);
+    try testing.expectEqual(PutResult.stored, try fixture.backend.store().put(&newer));
+
+    try testing.expectEqual(@as(usize, 0), try fixture.backend.store().reap(200, 10));
+    var collector: Collector = .{};
+    try fixture.backend.store().query(&.{.{}}, collector.sink());
+    try testing.expectEqual(@as(u8, 2), collector.idAt(0));
+}
+
+// LMDB forbids opening one environment twice in a process; scripts/backup-restore.sh covers a serving relay.
+test "a backup reopens as a store with the same events, and never overwrites a file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    {
+        var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+        defer backend.close();
+        for (0..5) |position| _ = try backend.store().put(&kindEvent(@intCast(position + 1), 1700000000, 1));
+    }
+
+    const out_path = try std.fs.path.join(testing.allocator, &.{ data_dir, "backup.mdb" });
+    defer testing.allocator.free(out_path);
+    try backup(testing.allocator, testing.io, data_dir, map_size_default, out_path);
+    try testing.expectError(error.Output, backup(testing.allocator, testing.io, data_dir, map_size_default, out_path));
+
+    const restored_dir = try std.fs.path.join(testing.allocator, &.{ data_dir, "restored" });
+    defer testing.allocator.free(restored_dir);
+    const restored_store = try std.fs.path.join(testing.allocator, &.{ restored_dir, subdirectory });
+    defer testing.allocator.free(restored_store);
+    try std.Io.Dir.cwd().createDirPath(testing.io, restored_store);
+    const restored_file = try std.fs.path.join(testing.allocator, &.{ restored_store, data_file });
+    defer testing.allocator.free(restored_file);
+    try std.Io.Dir.cwd().rename(out_path, std.Io.Dir.cwd(), restored_file, testing.io);
+
+    var restored = try Lmdb.open(testing.allocator, testing.io, restored_dir, .{});
+    defer restored.close();
+    try testing.expectEqual(@as(u64, 5), (try restored.store().stats()).events);
+    try testing.expectEqual(PutResult.stored, try restored.store().put(&kindEvent(9, 1700000000, 1)));
+}
+
+test "compaction keeps every event, and is refused while a relay holds the store" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    try testing.expectError(error.NoStore, compact(testing.allocator, testing.io, data_dir, .{}));
+    {
+        var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+        defer backend.close();
+        for (0..50) |position| _ = try backend.store().put(&kindEvent(@intCast(position + 1), 1700000000, 1));
+        try testing.expectError(error.InUse, compact(testing.allocator, testing.io, data_dir, .{}));
+    }
+    const sizes = try compact(testing.allocator, testing.io, data_dir, .{});
+    try testing.expect(sizes.after <= sizes.before);
+    var reopened = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+    defer reopened.close();
+    try testing.expectEqual(@as(u64, 50), (try reopened.store().stats()).events);
+}
+
+test "a store from before NIP-40 indexes its expiring events when it is opened" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    var tags: [2][1]nostr.event.Tag = undefined;
+    var fields: [2][2][]const u8 = undefined;
+    const note = expiringEvent(&tags[0], &fields[0], 1, 1, "100");
+    const relays = expiringEvent(&tags[1], &fields[1], 2, 10002, "100");
+    {
+        var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+        defer backend.close();
+        for ([_]Event{ note, relays }) |event| _ = try backend.store().put(&event);
+    }
+    {
+        const path = try std.fs.path.joinZ(testing.allocator, &.{ data_dir, subdirectory });
+        defer testing.allocator.free(path);
+        const env = try lmdb.Environment.init(path, .{ .max_dbs = max_databases });
+        defer env.deinit();
+        const txn = try lmdb.Transaction.init(env, .{ .mode = .ReadWrite });
+        errdefer txn.abort();
+        const expirations = try lmdb.Database.open(txn, by_expiration_db, .{});
+        try testing.expectEqual(@as(c_int, 0), lmdb_c.mdb_drop(txn.ptr, expirations.dbi, 1));
+        try (try lmdb.Database.open(txn, meta_db, .{})).delete(expirations_indexed_key);
+        try txn.commit();
+    }
+
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+    defer backend.close();
+    try testing.expectEqual(PutResult.stored, try backend.store().put(&kindEvent(3, 1700000100, 10002)));
+    try testing.expectEqual(@as(usize, 1), try backend.store().reap(200, 10));
+    var collector: Collector = .{};
+    try backend.store().query(&.{.{}}, collector.sink());
+    try testing.expectEqual(@as(usize, 1), collector.len);
+    try testing.expectEqual(@as(u8, 3), collector.idAt(0));
+}
+
+test "space freed by removing events no longer counts as used" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var tags: [300][1]nostr.event.Tag = undefined;
+    var fields: [300][2][]const u8 = undefined;
+    const content = "x" ** 4096;
+    for (&tags, &fields, 0..) |*event_tags, *event_fields, position| {
+        var event = expiringEvent(event_tags, event_fields, 0, 1, "100");
+        event.id = [_]u8{0} ** 32;
+        std.mem.writeInt(u16, event.id[0..2], @intCast(position), .big);
+        event.content = content;
+        _ = try fixture.backend.store().put(&event);
+    }
+    const full = (try fixture.backend.store().stats()).used_ratio.?;
+    try testing.expectEqual(@as(usize, 300), try fixture.backend.store().reap(200, 1000));
+    _ = try fixture.backend.store().put(&kindEvent(1, 1700000000, 1));
+    const emptied = (try fixture.backend.store().stats()).used_ratio.?;
+    try testing.expect(emptied < full / 4);
+}
+
+test "pages an open reader still holds are not counted as reusable" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    const map_size = 16 * 1024 * 1024;
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{ .map_size = map_size });
+    defer backend.close();
+    _ = try backend.store().put(&kindEvent(1, 1700000000, 1));
+    const content = "y" ** 16384;
+    var list = kindEvent(2, 1700000000, 10002);
+    list.content = content;
+    _ = try backend.store().put(&list);
+
+    var inside: std.atomic.Value(usize) = .init(0);
+    var release: std.atomic.Value(bool) = .init(false);
+    var holder: SlotHolder = .{ .backend = &backend, .inside = &inside, .release = &release };
+    const thread = try std.Thread.spawn(.{}, SlotHolder.run, .{&holder});
+    while (inside.load(.acquire) == 0) std.Thread.yield() catch {};
+
+    const before = (try backend.store().stats()).used_ratio.?;
+    for (3..43) |id| {
+        var newer = kindEvent(@intCast(id), 1700000000 + @as(i64, @intCast(id)), 10002);
+        newer.content = content;
+        try testing.expectEqual(PutResult.stored, try backend.store().put(&newer));
+    }
+    const held = (try backend.store().stats()).used_ratio.?;
+    release.store(true, .release);
+    thread.join();
+    try holder.result;
+    const released = (try backend.store().stats()).used_ratio.?;
+
+    const replaced: f64 = 40 * content.len;
+    try testing.expect((held - before) * map_size > replaced);
+    try testing.expect((held - released) * map_size > replaced);
 }

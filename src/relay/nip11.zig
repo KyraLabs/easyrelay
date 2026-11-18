@@ -8,7 +8,7 @@ const nips_table = @embedFile("nips.md");
 pub const software = "https://github.com/KyraLabs/easyrelay";
 pub const media_type = "application/nostr+json";
 
-/// The NIPs docs/nips.md marks `supported`, so the document cannot advertise more than the table.
+/// Read from docs/nips.md, so the document cannot advertise a NIP whose tests do not pass.
 pub const supported_nips: []const u16 = parseSupported(nips_table);
 
 fn parseSupported(comptime table: []const u8) []const u16 {
@@ -30,7 +30,6 @@ fn parseSupported(comptime table: []const u8) []const u16 {
     return &result;
 }
 
-/// The full HTTP responses, rendered once at startup and served as they are.
 pub const Responses = struct {
     document: []const u8,
     preflight: []const u8,
@@ -45,7 +44,6 @@ pub const Responses = struct {
         };
     }
 
-    /// The reply to a plain HTTP request, or null to leave it to the WebSocket handshake.
     pub fn respond(self: *const Responses, request: []const u8) ?[]const u8 {
         const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return null;
         const request_line = request[0..line_end];
@@ -89,9 +87,10 @@ fn renderDocument(arena: std.mem.Allocator, settings: config.Config) error{OutOf
             .created_at_lower_limit = limits.created_at_lower_limit_s,
             .created_at_upper_limit = limits.created_at_upper_limit_s,
             .min_pow_difficulty = 0,
-            .auth_required = false,
+            .auth_required = settings.policy.auth_required_for_read or settings.policy.auth_required_for_write,
             .payment_required = false,
-            .restricted_writes = false,
+            .restricted_writes = settings.policy.auth_required_for_write or settings.policy.allowed_pubkeys != null or
+                settings.policy.allowed_kinds != null,
         },
         .posting_policy = info.posting_policy,
         .privacy_policy = info.privacy_policy,
@@ -156,4 +155,20 @@ test "only a GET asking for nostr+json, or a preflight, is answered" {
     try testing.expect(responses.respond("GET / HTTP/1.1\r\nAccept: text/html\r\n\r\n") == null);
     try testing.expect(responses.respond("POST / HTTP/1.1\r\nAccept: application/nostr+json\r\n\r\n") == null);
     try testing.expect(responses.respond("garbage") == null);
+}
+
+test "authentication and allow lists are advertised in limitation" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const open = try std.json.parseFromSliceLeaky(std.json.Value, arena, try renderDocument(arena, .{}), .{});
+    try testing.expect(!open.object.get("limitation").?.object.get("auth_required").?.bool);
+    try testing.expect(!open.object.get("limitation").?.object.get("restricted_writes").?.bool);
+
+    const gated = try std.json.parseFromSliceLeaky(std.json.Value, arena, try renderDocument(arena, .{
+        .policy = .{ .auth_required_for_read = true, .allowed_kinds = &.{1} },
+    }), .{});
+    try testing.expect(gated.object.get("limitation").?.object.get("auth_required").?.bool);
+    try testing.expect(gated.object.get("limitation").?.object.get("restricted_writes").?.bool);
 }

@@ -3,19 +3,44 @@ const posix = std.posix;
 
 const Handle = std.Io.net.Socket.Handle;
 
-/// Bounds every blocking read on `handle`; zero removes the bound.
 pub fn setReceiveTimeout(handle: Handle, milliseconds: u32) error{Unexpected}!void {
+    try setTimeout(handle, posix.SO.RCVTIMEO, milliseconds);
+}
+
+pub fn setSendTimeout(handle: Handle, milliseconds: u32) error{Unexpected}!void {
+    try setTimeout(handle, posix.SO.SNDTIMEO, milliseconds);
+}
+
+fn setTimeout(handle: Handle, option: u32, milliseconds: u32) error{Unexpected}!void {
     const timeout: posix.timeval = .{
         .sec = @intCast(milliseconds / 1000),
         .usec = @intCast((milliseconds % 1000) * 1000),
     };
-    posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch return error.Unexpected;
+    posix.setsockopt(handle, posix.SOL.SOCKET, option, std.mem.asBytes(&timeout)) catch return error.Unexpected;
+}
+
+pub const WriteError = error{ Timeout, ConnectionReset, Unexpected };
+
+const send_flags: u32 = if (@hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0;
+
+pub fn writeAll(handle: Handle, bytes: []const u8) WriteError!void {
+    var sent: usize = 0;
+    while (sent < bytes.len) {
+        const rest = bytes[sent..];
+        const rc = std.c.send(handle, rest.ptr, rest.len, send_flags);
+        switch (posix.errno(rc)) {
+            .SUCCESS => sent += @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.Timeout,
+            .PIPE, .CONNRESET, .NOTCONN => return error.ConnectionReset,
+            else => return error.Unexpected,
+        }
+    }
 }
 
 pub const ReadError = error{ Timeout, ConnectionReset, Unexpected };
 
-/// A reader over the socket that reports a receive timeout as `error.Timeout`;
-/// `std.Io.net.Stream.Reader` treats one as a programming error.
+/// `std.Io.net.Stream.Reader` treats a receive timeout as a programming error; this reports it.
 pub const Reader = struct {
     handle: Handle,
     interface: std.Io.Reader,
@@ -36,8 +61,7 @@ pub const Reader = struct {
         };
     }
 
-    /// Bounds the total time of every read until cleared. A receive timeout alone restarts with
-    /// each byte, so a peer sending one byte at a time would never reach it.
+    /// A receive timeout restarts with each byte, so only a deadline bounds a byte-at-a-time peer.
     pub fn setDeadline(self: *Reader, io: std.Io, milliseconds: u32) void {
         const at = std.Io.Timestamp.now(io, .awake).addDuration(.fromMilliseconds(milliseconds));
         self.deadline = .{ .io = io, .at = at };
