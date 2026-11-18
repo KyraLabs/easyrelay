@@ -87,6 +87,12 @@ jobs:
       - name: Publish and read back with nak
         run: ./scripts/interop-nak.sh
 
+      - name: No acknowledged event is lost to SIGTERM
+        run: ./scripts/shutdown-durability.sh
+
+      - name: Back up a running relay and restore it
+        run: ./scripts/backup-restore.sh
+
   cross:
     name: Cross-compile ${{ matrix.target }}
     runs-on: ubuntu-latest

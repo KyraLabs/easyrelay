@@ -56,11 +56,14 @@ zig build check              # type-check without producing artifacts (fast edit
 zig fmt --check --exclude zig-pkg .   # formatting gate, identical to CI
 ./scripts/check-toolchain.sh # verify the Zig pin agrees across all three files
 ./scripts/interop-nak.sh     # publish and read back with nak, against the built binary
+./scripts/shutdown-durability.sh  # SIGTERM during writes loses no acknowledged event
+./scripts/backup-restore.sh  # back up a relay accepting writes, restore, compare
 ```
 
-The interop script needs [`nak`](https://github.com/fiatjaf/nak) on `PATH` and a relay binary in
-`zig-out/bin/`. It starts the relay on its default port, so nothing else may be listening on
-7777 while it runs; the script checks before starting rather than reporting a failed start.
+The scripts that drive the binary need [`nak`](https://github.com/fiatjaf/nak) on `PATH` and a
+relay binary in `zig-out/bin/` (or `RELAY_BINARY`). Each starts the relay on its own port (7777,
+7781, 7782; `PORT` overrides the last two) and refuses to start if something already listens
+there.
 
 Run a subset of tests while iterating:
 

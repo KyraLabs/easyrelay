@@ -170,6 +170,7 @@ systemctl start easyrelay
 ```
 
 Test the restore path before needing it. A backup that has never been restored is a hypothesis.
+`scripts/backup-restore.sh` runs this sequence against a relay accepting writes, and CI runs it.
 
 ## Compaction
 
