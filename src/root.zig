@@ -32,6 +32,8 @@ pub const policy = @import("relay/policy.zig");
 
 pub const reaper = @import("relay/reaper.zig");
 
+pub const metrics = @import("relay/metrics.zig");
+
 pub const writer = @import("relay/writer.zig");
 
 pub const diagnostics = @import("relay/diagnostics.zig");
@@ -70,6 +72,7 @@ test {
     _ = rate;
     _ = policy;
     _ = reaper;
+    _ = metrics;
     _ = diagnostics;
     _ = outbox;
     _ = server;

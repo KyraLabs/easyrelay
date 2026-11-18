@@ -159,12 +159,10 @@ Feeds the NIP-11 document directly. `supported_nips` is not configurable: it is 
 
 ## `metrics`
 
-Phase 3.
-
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `enabled` | bool | `true` | Serve `GET /metrics`. |
-| `path` | string | `/metrics` | Exposition path. |
+| `enabled` | bool | `true` | Serve Prometheus metrics. |
+| `path` | string | `/metrics` | Exposition path. Must start with `/` and must not be `/health`. |
 
 Metrics are served on the same listener as the relay. Restrict access at the reverse proxy; see
 [operations.md](operations.md).

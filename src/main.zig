@@ -289,7 +289,10 @@ fn serve(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, loaded: Loade
     var connections = easyrelay.hub.Hub.init(gpa, io);
     defer connections.deinit();
 
+    var counters: easyrelay.metrics.Metrics = .{};
+
     var writer = try easyrelay.writer.Writer.init(gpa, io, events.store(), &connections, settings.rate_limit.write_queue_depth);
+    writer.metrics = &counters;
     defer writer.deinit();
     try writer.start();
     defer writer.stop();
@@ -310,9 +313,17 @@ fn serve(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, loaded: Loade
         .limits = sessionLimits(settings),
         .authors = if (authors) |*present| present else null,
         .policy = try admissionPolicy(arena, settings),
+        .metrics = &counters,
     };
     const information = try easyrelay.nip11.Responses.render(arena, settings);
-    var app: easyrelay.server.App = .{ .gpa = gpa, .shared = &shared, .information = &information, .rates = rates };
+    var app: easyrelay.server.App = .{
+        .gpa = gpa,
+        .shared = &shared,
+        .information = &information,
+        .rates = rates,
+        .metrics = &counters,
+        .metrics_path = if (settings.metrics.enabled) settings.metrics.path else null,
+    };
 
     const options = serverOptions(settings);
     var relay = easyrelay.server.init(gpa, &app, options) catch |err| {

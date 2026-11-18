@@ -5,6 +5,7 @@ const codec = @import("codec.zig");
 const hub = @import("hub.zig");
 const rate = @import("rate.zig");
 const policy = @import("policy.zig");
+const metrics = @import("metrics.zig");
 const subscriptions = @import("subscriptions.zig");
 const validation = @import("validation.zig");
 const write_queue = @import("writer.zig");
@@ -55,6 +56,7 @@ pub const Shared = struct {
     /// Per-author publishing budgets, charged only once a signature has verified.
     authors: ?*rate.Authors = null,
     policy: policy.Policy = .{},
+    metrics: ?*metrics.Metrics = null,
 };
 
 pub const Context = struct {
@@ -174,7 +176,7 @@ pub const Session = struct {
         event: Event,
         serialized_length: usize,
     ) Error!void {
-        if (self.peer) |peer| if (peer.rates) |*rates| if (!rates.event(context.clock_ns)) return self.sendOk(.{
+        if (self.peer) |peer| if (peer.rates) |*rates| if (!rates.event(context.clock_ns)) return self.answer(.{
             .event_id = event.id,
             .accepted = false,
             .prefix = .rate_limited,
@@ -185,39 +187,42 @@ pub const Session = struct {
             .limits = self.shared.limits.event,
             .signer = context.signer,
         };
-        validator.validate(
+        const validation_started = std.Io.Timestamp.now(self.shared.io, .awake);
+        const validated = validator.validate(
             context.arena,
             &event,
             serialized_length,
             context.now,
             &diagnostics,
-        ) catch |err| switch (err) {
-            error.Invalid => return self.sendOk(.{
+        );
+        if (self.shared.metrics) |counters| counters.validation.observe(elapsed(self.shared.io, validation_started));
+        validated catch |err| switch (err) {
+            error.Invalid => return self.answer(.{
                 .event_id = event.id,
                 .accepted = false,
                 .prefix = .invalid,
                 .reason = diagnostics.message(),
             }),
-            error.OutOfMemory => return self.sendOk(.{
+            error.OutOfMemory => return self.answer(.{
                 .event_id = event.id,
                 .accepted = false,
                 .prefix = .internal,
                 .reason = "the relay ran out of memory validating this event",
             }),
         };
-        const expires = kinds.expiration(&event) catch return self.sendOk(.{
+        const expires = kinds.expiration(&event) catch return self.answer(.{
             .event_id = event.id,
             .accepted = false,
             .prefix = .invalid,
             .reason = "the expiration tag is not a unix timestamp",
         });
-        if (expires) |at| if (at <= context.now) return self.sendOk(.{
+        if (expires) |at| if (at <= context.now) return self.answer(.{
             .event_id = event.id,
             .accepted = false,
             .prefix = .invalid,
             .reason = "this event has already expired",
         });
-        if (event.kind == auth_kind) return self.sendOk(.{
+        if (event.kind == auth_kind) return self.answer(.{
             .event_id = event.id,
             .accepted = false,
             .prefix = .invalid,
@@ -228,20 +233,20 @@ pub const Session = struct {
         }
         if (isProtected(&event)) {
             if (!self.isAuthenticated()) return self.refuseUnauthenticated(event.id, "only its author may publish a protected event");
-            if (!self.peer.?.isAuthenticatedAs(&event.pubkey)) return self.sendOk(.{
+            if (!self.peer.?.isAuthenticatedAs(&event.pubkey)) return self.answer(.{
                 .event_id = event.id,
                 .accepted = false,
                 .prefix = .restricted,
                 .reason = "only its author may publish a protected event",
             });
         }
-        if (self.shared.policy.refusal(&event)) |reason| return self.sendOk(.{
+        if (self.shared.policy.refusal(&event)) |reason| return self.answer(.{
             .event_id = event.id,
             .accepted = false,
             .prefix = .blocked,
             .reason = reason,
         });
-        if (self.shared.authors) |authors| if (!authors.take(&event.pubkey, context.clock_ns)) return self.sendOk(.{
+        if (self.shared.authors) |authors| if (!authors.take(&event.pubkey, context.clock_ns)) return self.answer(.{
             .event_id = event.id,
             .accepted = false,
             .prefix = .rate_limited,
@@ -250,12 +255,12 @@ pub const Session = struct {
 
         if (kinds.classify(event.kind) == .ephemeral) {
             self.shared.hub.broadcast(context.arena, &event, null);
-            return self.sendOk(.{ .event_id = event.id, .accepted = true });
+            return self.answer(.{ .event_id = event.id, .accepted = true });
         }
 
         if (self.shared.writer) |queue| {
             const reply: write_queue.Reply = .{ .subscriber = self.subscriber, .generation = self.subscriber.generation };
-            queue.submit(&event, reply) catch |err| return self.sendOk(.{
+            queue.submit(&event, reply) catch |err| return self.answer(.{
                 .event_id = event.id,
                 .accepted = false,
                 .prefix = switch (err) {
@@ -273,9 +278,15 @@ pub const Session = struct {
         var result: store.PutResult = undefined;
         var local_id: u64 = 0;
         self.shared.store.putBatch((&event)[0..1], (&result)[0..1], (&local_id)[0..1]) catch |err|
-            return self.sendOk(write_queue.failure(event.id, err));
+            return self.answer(write_queue.failure(event.id, err));
         if (result == .stored) self.shared.hub.broadcast(context.arena, &event, local_id);
-        return self.sendOk(write_queue.ok(event.id, result));
+        return self.answer(write_queue.ok(event.id, result));
+    }
+
+    /// An answer to `EVENT`, counted by outcome.
+    fn answer(self: *Session, ok: codec.Ok) Error!void {
+        if (self.shared.metrics) |counters| counters.received(ok);
+        return self.sendOk(ok);
     }
 
     fn closeSubscription(self: *Session, subscription_id: []const u8) void {
@@ -392,9 +403,16 @@ pub const Session = struct {
         };
 
         var watermark: u64 = 0;
+        var exhausted = false;
         var store_sink = sink.sink();
         store_sink.watermark = &watermark;
         store_sink.now = context.now;
+        store_sink.exhausted = &exhausted;
+        const query_started = std.Io.Timestamp.now(self.shared.io, .awake);
+        defer if (self.shared.metrics) |counters| {
+            counters.query.observe(elapsed(self.shared.io, query_started));
+            if (exhausted) counters.exhausted();
+        };
         self.shared.store.query(bounded, store_sink) catch |err| switch (err) {
             error.Abort => return sink.failure orelse error.WriteFailed,
             error.OutOfMemory, error.Backend => {
@@ -482,6 +500,10 @@ pub const Session = struct {
     }
 };
 
+fn elapsed(io: std.Io, since: std.Io.Timestamp) u64 {
+    return @intCast(@max(0, since.durationTo(std.Io.Timestamp.now(io, .awake)).nanoseconds));
+}
+
 /// NIP-70: a `["-"]` tag.
 fn isProtected(event: *const Event) bool {
     for (event.tags) |tag| {
@@ -545,6 +567,8 @@ const Recorder = struct {
     gpa: std.mem.Allocator,
     current: std.Io.Writer.Allocating,
     messages: std.ArrayList([]u8),
+    /// Stands in for a slow client.
+    send_delay_ms: u32 = 0,
 
     fn init(gpa: std.mem.Allocator) Recorder {
         return .{ .gpa = gpa, .current = .init(gpa), .messages = .empty };
@@ -570,6 +594,7 @@ const Recorder = struct {
 
     fn send(ptr: *anyopaque) Responder.Error!void {
         const self: *Recorder = @ptrCast(@alignCast(ptr));
+        if (self.send_delay_ms != 0) std.Io.sleep(testing.io, .fromMilliseconds(self.send_delay_ms), .awake) catch {};
         const message = self.gpa.dupe(u8, self.current.written()) catch return error.WriteFailed;
         errdefer self.gpa.free(message);
         self.messages.append(self.gpa, message) catch return error.WriteFailed;
@@ -958,11 +983,16 @@ const FailingStore = struct {
     put_error: ?store.Error = null,
     query_error: ?store.Error = null,
 
-    const vtable: store.Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query, .reap = reap };
+    const vtable: store.Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query, .reap = reap, .stats = stats };
 
     fn reap(ptr: *anyopaque, now: i64, max: usize) store.Error!usize {
         _ = .{ ptr, now, max };
         return 0;
+    }
+
+    fn stats(ptr: *anyopaque) store.Error!store.Stats {
+        _ = ptr;
+        return .{ .events = 0 };
     }
 
     fn interface(self: *FailingStore) store.Store {
@@ -1069,11 +1099,16 @@ const RacingStore = struct {
     arena: std.mem.Allocator,
     live: []const struct { event: Event, local_id: ?u64 },
 
-    const vtable: store.Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query, .reap = reap };
+    const vtable: store.Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query, .reap = reap, .stats = stats };
 
     fn reap(ptr: *anyopaque, now: i64, max: usize) store.Error!usize {
         const self: *RacingStore = @ptrCast(@alignCast(ptr));
         return self.inner.reap(now, max);
+    }
+
+    fn stats(ptr: *anyopaque) store.Error!store.Stats {
+        const self: *RacingStore = @ptrCast(@alignCast(ptr));
+        return self.inner.stats();
     }
 
     fn interface(self: *RacingStore) store.Store {
@@ -1168,4 +1203,17 @@ test "an event the policy refuses is answered with blocked: and not stored" {
     harness.recorder.clear();
     try harness.handle("[\"REQ\",\"s\",{}]");
     try testing.expectEqualStrings("[\"EOSE\",\"s\"]", harness.recorder.only());
+}
+
+test "the validation metric times the validator alone, not the answer that follows" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+    var counters: metrics.Metrics = .{};
+    harness.shared.metrics = &counters;
+    harness.recorder.send_delay_ms = 200;
+
+    try harness.handle(try harness.eventMessage(try harness.signedEvent("timed")));
+    try testing.expectEqual(@as(u64, 1), counters.events_received[@intFromEnum(metrics.Outcome.accepted)].load(.monotonic));
+    try testing.expect(counters.validation.sum_ns.load(.monotonic) < 100 * std.time.ns_per_ms);
 }

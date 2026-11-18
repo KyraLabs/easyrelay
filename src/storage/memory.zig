@@ -8,6 +8,7 @@ const PutResult = store.PutResult;
 const QueryError = store.QueryError;
 const Sink = store.Sink;
 const Store = store.Store;
+const Stats = store.Stats;
 
 const Event = nostr.event.Event;
 const Filter = nostr.filter.Filter;
@@ -52,7 +53,12 @@ pub const Memory = struct {
         return self.order.items.len;
     }
 
-    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased, .reap = reapErased };
+    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased, .reap = reapErased, .stats = statsErased };
+
+    fn statsErased(ptr: *anyopaque) Error!Stats {
+        const self: *Memory = @ptrCast(@alignCast(ptr));
+        return .{ .events = self.count() };
+    }
 
     fn reapErased(ptr: *anyopaque, now: i64, max: usize) Error!usize {
         const self: *Memory = @ptrCast(@alignCast(ptr));

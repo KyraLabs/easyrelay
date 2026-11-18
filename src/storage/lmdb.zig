@@ -13,6 +13,7 @@ const Filter = nostr.filter.Filter;
 const PutResult = store.PutResult;
 const Sink = store.Sink;
 const Store = store.Store;
+const Stats = store.Stats;
 const StoreError = store.Error;
 const StoreQueryError = store.QueryError;
 
@@ -298,6 +299,46 @@ const Choice = union(enum) {
     }
 };
 
+/// The oldest transaction id a snapshot may still read: the last commit, or an older open reader,
+/// in this process or another. Read before the caller's own transaction begins, so that
+/// transaction does not hold back the answer.
+fn oldestSnapshot(env: lmdb.Environment, last_txnid: usize) Error!usize {
+    var oldest = last_txnid;
+    if (lmdb_c.mdb_reader_list(env.ptr, lowerToReader, &oldest) < 0) return error.Backend;
+    return oldest;
+}
+
+/// One line per reader slot, `pid thread txnid`, plus a header; idle slots show `-` for txnid.
+fn lowerToReader(message: [*c]const u8, context: ?*anyopaque) callconv(.c) c_int {
+    const oldest: *usize = @ptrCast(@alignCast(context.?));
+    var fields = std.mem.tokenizeAny(u8, std.mem.span(message), " \n");
+    _ = fields.next();
+    _ = fields.next();
+    const txnid = std.fmt.parseInt(usize, fields.next() orelse return 0, 10) catch return 0;
+    oldest.* = @min(oldest.*, txnid);
+    return 0;
+}
+
+/// LMDB's freelist (database 0) is keyed by the transaction that freed each page list, and a
+/// list is reusable only once that transaction is older than every snapshot. Each value is a
+/// page-number list led by its length.
+fn reusablePages(txn: lmdb.Transaction, oldest: usize) Error!u64 {
+    const native = @import("builtin").cpu.arch.endian();
+    const freelist: lmdb.Database = .{ .txn = txn, .dbi = 0 };
+    const cursor = freelist.cursor() catch return error.Backend;
+    defer cursor.deinit();
+    var total: u64 = 0;
+    var key = cursor.goToFirst() catch return error.Backend;
+    while (key) |freed_by| : (key = cursor.goToNext() catch return error.Backend) {
+        if (freed_by.len != @sizeOf(usize)) return error.Corrupt;
+        if (std.mem.readInt(usize, freed_by[0..@sizeOf(usize)], native) >= oldest) break;
+        const value = cursor.getCurrentValue() catch return error.Backend;
+        if (value.len < @sizeOf(usize)) return error.Corrupt;
+        total += std.mem.readInt(usize, value[0..@sizeOf(usize)], native);
+    }
+    return total;
+}
+
 pub const Lmdb = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -412,7 +453,31 @@ pub const Lmdb = struct {
         };
     }
 
-    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased, .reap = reapErased };
+    const vtable: Store.VTable = .{ .put = putErased, .putBatch = putBatchErased, .query = queryErased, .reap = reapErased, .stats = statsErased };
+
+    fn statsErased(ptr: *anyopaque) StoreError!Stats {
+        const self: *Lmdb = @ptrCast(@alignCast(ptr));
+        return self.stats() catch error.Backend;
+    }
+
+    /// The file only grows, so the pages it reaches overstate what is in use: pages freed by a
+    /// deletion are reused by later writes, once no snapshot can still read them.
+    fn stats(self: *Lmdb) Error!Stats {
+        var info: lmdb_c.MDB_envinfo = undefined;
+        if (lmdb_c.mdb_env_info(self.env.ptr, &info) != 0) return error.Backend;
+        const page_size = (self.env.stat() catch return error.Backend).psize;
+
+        self.readers.waitUncancelable(self.io);
+        defer self.readers.post(self.io);
+        const oldest = try oldestSnapshot(self.env, info.me_last_txnid);
+        const txn = lmdb.Transaction.init(self.env, .{ .mode = .ReadOnly }) catch return error.Backend;
+        defer txn.abort();
+        const events = (try database(txn, events_db)).stat() catch return error.Backend;
+        const reached = info.me_last_pgno + 1;
+        const in_use = reached - @min(reached, try reusablePages(txn, oldest));
+        const used: f64 = @floatFromInt(in_use * page_size);
+        return .{ .events = events.entries, .used_ratio = used / @as(f64, @floatFromInt(info.me_mapsize)) };
+    }
 
     fn reapErased(ptr: *anyopaque, now: i64, max: usize) StoreError!usize {
         const self: *Lmdb = @ptrCast(@alignCast(ptr));
@@ -582,6 +647,9 @@ pub const Lmdb = struct {
         var event_arena = std.heap.ArenaAllocator.init(self.gpa);
         defer event_arena.deinit();
         var scanned: usize = 0;
+        defer if (sink.exhausted) |exhausted| {
+            exhausted.* = pending != 0 and scanned >= self.max_scan;
+        };
         while (pending != 0 and scanned < self.max_scan) {
             var next: ?Head = null;
             for (sources.items) |source| {
@@ -1394,6 +1462,26 @@ test "the scan budget ends a query early" {
     try testing.expectEqual(@as(usize, 0), collector.len);
     try backend.store().query(&.{.{}}, collector.sink());
     try testing.expectEqual(@as(usize, 3), collector.len);
+
+    var exhausted = false;
+    var sink = collector.sink();
+    sink.exhausted = &exhausted;
+    collector.len = 0;
+    try backend.store().query(&.{.{ .limit = 5 }}, sink);
+    try testing.expect(exhausted);
+    collector.len = 0;
+    try backend.store().query(&.{.{ .limit = 1 }}, sink);
+    try testing.expect(!exhausted);
+}
+
+test "stats count the stored events and how much of the map is in use" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    for (0..3) |position| _ = try fixture.backend.store().put(&kindEvent(@intCast(position + 1), 1700000000, 1));
+    const stats = try fixture.backend.store().stats();
+    try testing.expectEqual(@as(u64, 3), stats.events);
+    try testing.expect(stats.used_ratio.? > 0 and stats.used_ratio.? < 0.01);
 }
 
 test "a deletion holds across a restart" {
@@ -1736,4 +1824,62 @@ test "a store from before NIP-40 indexes its expiring events when it is opened" 
     try backend.store().query(&.{.{}}, collector.sink());
     try testing.expectEqual(@as(usize, 1), collector.len);
     try testing.expectEqual(@as(u8, 3), collector.idAt(0));
+}
+
+test "space freed by removing events no longer counts as used" {
+    var fixture: Fixture = undefined;
+    try fixture.init();
+    defer fixture.deinit();
+    var tags: [300][1]nostr.event.Tag = undefined;
+    var fields: [300][2][]const u8 = undefined;
+    const content = "x" ** 4096;
+    for (&tags, &fields, 0..) |*event_tags, *event_fields, position| {
+        var event = expiringEvent(event_tags, event_fields, 0, 1, "100");
+        event.id = [_]u8{0} ** 32;
+        std.mem.writeInt(u16, event.id[0..2], @intCast(position), .big);
+        event.content = content;
+        _ = try fixture.backend.store().put(&event);
+    }
+    const full = (try fixture.backend.store().stats()).used_ratio.?;
+    try testing.expectEqual(@as(usize, 300), try fixture.backend.store().reap(200, 1000));
+    _ = try fixture.backend.store().put(&kindEvent(1, 1700000000, 1));
+    const emptied = (try fixture.backend.store().stats()).used_ratio.?;
+    try testing.expect(emptied < full / 4);
+}
+
+test "pages an open reader still holds are not counted as reusable" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    const map_size = 16 * 1024 * 1024;
+    var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{ .map_size = map_size });
+    defer backend.close();
+    _ = try backend.store().put(&kindEvent(1, 1700000000, 1));
+    const content = "y" ** 16384;
+    var list = kindEvent(2, 1700000000, 10002);
+    list.content = content;
+    _ = try backend.store().put(&list);
+
+    var inside: std.atomic.Value(usize) = .init(0);
+    var release: std.atomic.Value(bool) = .init(false);
+    var holder: SlotHolder = .{ .backend = &backend, .inside = &inside, .release = &release };
+    const thread = try std.Thread.spawn(.{}, SlotHolder.run, .{&holder});
+    while (inside.load(.acquire) == 0) std.Thread.yield() catch {};
+
+    const before = (try backend.store().stats()).used_ratio.?;
+    for (3..43) |id| {
+        var newer = kindEvent(@intCast(id), 1700000000 + @as(i64, @intCast(id)), 10002);
+        newer.content = content;
+        try testing.expectEqual(PutResult.stored, try backend.store().put(&newer));
+    }
+    const held = (try backend.store().stats()).used_ratio.?;
+    release.store(true, .release);
+    thread.join();
+    try holder.result;
+    const released = (try backend.store().stats()).used_ratio.?;
+
+    const replaced: f64 = 40 * content.len;
+    try testing.expect((held - before) * map_size > replaced);
+    try testing.expect((held - released) * map_size > replaced);
 }

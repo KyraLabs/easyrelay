@@ -12,6 +12,12 @@ pub const Config = struct {
     policy: Policy = .{},
     info: Info = .{},
     logging: Logging = .{},
+    metrics: Metrics = .{},
+};
+
+pub const Metrics = struct {
+    enabled: bool = true,
+    path: []const u8 = "/metrics",
 };
 
 pub const Logging = struct {
@@ -150,6 +156,10 @@ const descriptions = .{
         .relay_countries = "ISO 3166-1 alpha-2 codes.",
         .language_tags = "IETF language tags.",
     },
+    .metrics = .{
+        .enabled = "Serve Prometheus metrics. Restrict the path at the reverse proxy.",
+        .path = "Path the metrics are served on.",
+    },
     .logging = .{
         .level = "Most verbose level written: .@\"error\", .warn, .info or .debug.",
         .format = "`.json`, one object per line, or `.text` for a terminal.",
@@ -285,6 +295,10 @@ pub fn validate(config: Config, diagnostics: *Diagnostics) error{InvalidConfig}!
     if (config.storage.path.len == 0) return diagnostics.fail("storage.path must not be empty", .{});
     if (config.storage.map_size < 1024 * 1024) return diagnostics.fail("storage.map_size is {d} bytes; it must be at least 1048576 (1 MiB)", .{config.storage.map_size});
     if (config.storage.max_scan == 0) return diagnostics.fail("storage.max_scan must be at least 1", .{});
+    if (config.metrics.path.len < 2 or config.metrics.path[0] != '/' or std.mem.indexOfAny(u8, config.metrics.path, " ?#") != null) {
+        return diagnostics.fail("metrics.path must start with / and name a path, such as \"/metrics\"", .{});
+    }
+    if (std.mem.eql(u8, config.metrics.path, "/health")) return diagnostics.fail("metrics.path must not be /health, which the health check uses", .{});
     if (config.storage.reaper_interval_s == 0) return diagnostics.fail("storage.reaper_interval_s must be at least 1", .{});
     if (config.rate_limit.write_queue_depth == 0) return diagnostics.fail("rate_limit.write_queue_depth must be at least 1", .{});
     inline for (.{ "events_per_second", "messages_per_second", "subscriptions_per_minute", "author_events_per_second" }) |name| {
@@ -483,6 +497,8 @@ test "every validation error names the setting it is about" {
         .{ .config = .{ .storage = .{ .map_size = 4096 } }, .key = "storage.map_size" },
         .{ .config = .{ .storage = .{ .max_scan = 0 } }, .key = "storage.max_scan" },
         .{ .config = .{ .storage = .{ .reaper_interval_s = 0 } }, .key = "storage.reaper_interval_s" },
+        .{ .config = .{ .metrics = .{ .path = "metrics" } }, .key = "metrics.path" },
+        .{ .config = .{ .metrics = .{ .path = "/health" } }, .key = "metrics.path" },
         .{ .config = .{ .network = .{ .write_timeout_ms = 0 } }, .key = "network.write_timeout_ms" },
         .{ .config = .{ .network = .{ .ping_interval_s = 300, .idle_timeout_s = 300 } }, .key = "network.ping_interval_s" },
         .{ .config = .{ .network = .{ .idle_timeout_s = 5_000_000 } }, .key = "network.idle_timeout_s" },

@@ -72,6 +72,18 @@ pub const Hub = struct {
         }
     }
 
+    pub fn subscriptionCount(self: *Hub) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var total: usize = 0;
+        for (self.members.items) |member| {
+            member.mutex.lockUncancelable(self.io);
+            defer member.mutex.unlock(self.io);
+            total += member.registry.count();
+        }
+        return total;
+    }
+
     pub fn count(self: *Hub) usize {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

@@ -29,12 +29,21 @@ pub const Sink = struct {
     /// When set, an event whose NIP-40 expiration is at or before it is skipped and does not
     /// count toward any filter's `limit`.
     now: ?i64 = null,
+    /// Set to true when the query was answered early because it reached its scan budget.
+    exhausted: ?*bool = null,
 
     pub const Abort = error{Abort};
 
     pub fn emit(self: Sink, event: *const Event) Abort!void {
         return self.emitFn(self.ptr, event);
     }
+};
+
+pub const Stats = struct {
+    events: u64,
+    /// Fraction of a fixed-size store in use, not counting space freed for reuse; null for a store
+    /// with no fixed size.
+    used_ratio: ?f64 = null,
 };
 
 pub const Store = struct {
@@ -46,6 +55,7 @@ pub const Store = struct {
         putBatch: *const fn (ptr: *anyopaque, events: []const Event, results: []PutResult, local_ids: ?[]u64) Error!void,
         query: *const fn (ptr: *anyopaque, filters: []const Filter, sink: Sink) QueryError!void,
         reap: *const fn (ptr: *anyopaque, now: i64, max: usize) Error!usize,
+        stats: *const fn (ptr: *anyopaque) Error!Stats,
     };
 
     /// Ephemeral events must not be passed; they are never stored.
@@ -71,6 +81,10 @@ pub const Store = struct {
     pub fn reap(self: Store, now: i64, max: usize) Error!usize {
         return self.vtable.reap(self.ptr, now, max);
     }
+
+    pub fn stats(self: Store) Error!Stats {
+        return self.vtable.stats(self.ptr);
+    }
 };
 
 const testing = std.testing;
@@ -81,7 +95,12 @@ const StubStore = struct {
     events: []const Event = &.{},
     last_filters: []const Filter = &.{},
 
-    const vtable: Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query, .reap = reap };
+    const vtable: Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query, .reap = reap, .stats = stats };
+
+    fn stats(ptr: *anyopaque) Error!Stats {
+        _ = ptr;
+        return .{ .events = 0 };
+    }
 
     fn reap(ptr: *anyopaque, now: i64, max: usize) Error!usize {
         _ = .{ ptr, now, max };

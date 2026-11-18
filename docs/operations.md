@@ -183,7 +183,8 @@ Prometheus exposition on `GET /metrics`. The metrics that matter:
 Alert on `write_queue_depth` sustained above zero and on `store_map_used_ratio` above 0.8. The
 first means writes are backing up; the second means a hard failure is approaching.
 
-`GET /health` returns 200 when the relay is accepting connections and its store is writable.
+`GET /health` returns 200 `ok` when the relay is accepting connections and its store answers
+with under 95% of `storage.map_size` in use, and 503 otherwise.
 
 ## Logs
 

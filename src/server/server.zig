@@ -9,6 +9,7 @@ const socket = @import("../transport/socket.zig");
 const hub = @import("../relay/hub.zig");
 const nip11 = @import("../relay/nip11.zig");
 const rate = @import("../relay/rate.zig");
+const metrics = @import("../relay/metrics.zig");
 const session = @import("../relay/session.zig");
 const subscriptions = @import("../relay/subscriptions.zig");
 
@@ -21,7 +22,13 @@ pub const App = struct {
     information: ?*const nip11.Responses = null,
     /// Per-connection budgets; null leaves connections unlimited.
     rates: ?rate.Limits = null,
+    metrics: ?*metrics.Metrics = null,
+    /// Where `GET` serves the metrics; null serves none.
+    metrics_path: ?[]const u8 = null,
 };
+
+/// Above this the store is reported unhealthy: a write may no longer fit.
+const healthy_map_ratio = 0.95;
 
 pub const Options = struct {
     address: []const u8 = "127.0.0.1",
@@ -155,6 +162,17 @@ pub fn init(gpa: std.mem.Allocator, app: *App, options: Options) !Server {
     return .{ .app = app, .options = options, .io = io, .address = bound.socket.address, .listener = bound };
 }
 
+const health_ok = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 3\r\nConnection: close\r\n\r\nok\n";
+const health_unavailable = "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain\r\nContent-Length: 12\r\nConnection: close\r\n\r\nunavailable\n";
+
+/// The path of a `GET`, without its query string.
+fn requestPath(request: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, request, "GET ")) return null;
+    const rest = request[4..];
+    const end = std.mem.indexOfAny(u8, rest, " ?\r") orelse return null;
+    return rest[0..end];
+}
+
 fn writeAll(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8) void {
     var buffer: [256]u8 = undefined;
     var writer = stream.writer(io, &buffer);
@@ -245,6 +263,7 @@ const Connection = struct {
         const key = switch (handshake.classify(request)) {
             .upgrade => |key| key,
             .plain => {
+                if (try self.respondPlain(request)) return;
                 const answer = if (app.information) |information| information.respond(request) else null;
                 self.writeRaw(answer orelse handshake.bad_request);
                 return;
@@ -335,6 +354,43 @@ const Connection = struct {
                 .close => return self.sendClose(.normal),
             }
         }
+    }
+
+    /// `GET /health` and the metrics path. False leaves the request to the information document.
+    fn respondPlain(self: *Connection, request: []const u8) !bool {
+        const app = self.server.app;
+        const path = requestPath(request) orelse return false;
+        if (std.mem.eql(u8, path, "/health")) {
+            self.writeRaw(if (self.healthy()) health_ok else health_unavailable);
+            return true;
+        }
+        const exposition = app.metrics orelse return false;
+        const metrics_path = app.metrics_path orelse return false;
+        if (!std.mem.eql(u8, path, metrics_path)) return false;
+
+        var body: std.Io.Writer.Allocating = .init(app.gpa);
+        defer body.deinit();
+        const stats = app.shared.store.stats() catch null;
+        try exposition.write(&body.writer, .{
+            .connections = app.shared.hub.count(),
+            .subscriptions = app.shared.hub.subscriptionCount(),
+            .write_queue_depth = if (app.shared.writer) |queue| queue.queued() else 0,
+            .store_events = if (stats) |present| present.events else null,
+            .store_map_used_ratio = if (stats) |present| present.used_ratio else null,
+        });
+        var response: std.Io.Writer.Allocating = .init(app.gpa);
+        defer response.deinit();
+        try response.writer.print("HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n" ++
+            "Content-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ body.written().len, body.written() });
+        self.writeRaw(response.written());
+        return true;
+    }
+
+    fn healthy(self: *Connection) bool {
+        if (self.server.stopping.load(.acquire)) return false;
+        const stats = self.server.app.shared.store.stats() catch return false;
+        const ratio = stats.used_ratio orelse return true;
+        return ratio < healthy_map_ratio;
     }
 
     /// Before the handshake completes; there is no sender thread yet.
@@ -644,6 +700,32 @@ test "a connection over its message rate is closed with policy violation" {
     try client.send("[\"REQ\",\"s\",{}]");
     const closed = (try client.receiveMessage()).close;
     try testing.expectEqual(@as(?u16, @intFromEnum(frame.CloseCode.policy_violation)), closed.code);
+}
+
+test "health answers ok, and metrics are served only on their configured path" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{}, null);
+    defer fixture.stop();
+    var counters: metrics.Metrics = .{};
+    fixture.app.metrics = &counters;
+    fixture.app.metrics_path = "/metrics";
+    const io = fixture.threaded.io();
+
+    const health = try exchange(testing.allocator, io, fixture.port(), "GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+    defer testing.allocator.free(health);
+    try testing.expect(std.mem.startsWith(u8, health, "HTTP/1.1 200 OK\r\n"));
+    try testing.expect(std.mem.endsWith(u8, health, "\r\n\r\nok\n"));
+
+    const exposition = try exchange(testing.allocator, io, fixture.port(), "GET /metrics?x=1 HTTP/1.1\r\nHost: x\r\n\r\n");
+    defer testing.allocator.free(exposition);
+    try testing.expect(std.mem.startsWith(u8, exposition, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4"));
+    try testing.expect(std.mem.indexOf(u8, exposition, "\neasyrelay_connections_active ") != null);
+    try testing.expect(std.mem.indexOf(u8, exposition, "\neasyrelay_store_events 0\n") != null);
+
+    fixture.app.metrics_path = null;
+    const hidden = try exchange(testing.allocator, io, fixture.port(), "GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n");
+    defer testing.allocator.free(hidden);
+    try testing.expect(std.mem.startsWith(u8, hidden, "HTTP/1.1 400 "));
 }
 
 test "a quiet connection is pinged, and one that stays silent is closed as idle" {
