@@ -187,8 +187,16 @@ first means writes are backing up; the second means a hard failure is approachin
 
 ## Logs
 
-Structured JSON by default, one object per line, to stdout for the journal to collect. Set
-`logging.format = .text` for a readable terminal during development.
+Structured JSON by default, one object per line, on stderr for the journal to collect:
+
+```json
+{"time":"2026-11-17T10:00:00Z","level":"info","scope":"server","message":"conn=42 closed: not reading what it subscribed to (network.write_buffer_limit)"}
+```
+
+Every line about a connection carries `conn=<n>`, a number assigned when it was accepted, so one
+connection's lines can be followed with `grep 'conn=42 '`. Set `logging.format = .text` for a
+readable terminal during development, and `logging.level = .debug` to see each connection open
+and close. The startup summary goes to stdout.
 
 Logs never contain event content or full pubkeys at `info` level.
 

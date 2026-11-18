@@ -152,12 +152,10 @@ Feeds the NIP-11 document directly. `supported_nips` is not configurable: it is 
 
 ## `logging`
 
-Phase 3.
-
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `level` | enum | `info` | `error`, `warn`, `info`, `debug`. |
-| `format` | enum | `json` | `json` or `text`. |
+| `level` | enum | `info` | `.@"error"`, `.warn`, `.info`, `.debug` (`error`, `warn`, `info`, `debug` in the environment). |
+| `format` | enum | `json` | `.json`, one object per line, or `.text`. |
 
 ## `metrics`
 

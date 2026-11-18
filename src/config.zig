@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const logging = @import("logging.zig");
+
 pub const default_path = "easyrelay.zon";
 
 pub const Config = struct {
@@ -9,6 +11,12 @@ pub const Config = struct {
     rate_limit: RateLimit = .{},
     policy: Policy = .{},
     info: Info = .{},
+    logging: Logging = .{},
+};
+
+pub const Logging = struct {
+    level: logging.Level = .info,
+    format: logging.Format = .json,
 };
 
 pub const Network = struct {
@@ -142,6 +150,10 @@ const descriptions = .{
         .relay_countries = "ISO 3166-1 alpha-2 codes.",
         .language_tags = "IETF language tags.",
     },
+    .logging = .{
+        .level = "Most verbose level written: .@\"error\", .warn, .info or .debug.",
+        .format = "`.json`, one object per line, or `.text` for a terminal.",
+    },
 };
 
 pub const Error = error{ InvalidConfig, OutOfMemory };
@@ -220,6 +232,7 @@ fn parseValue(comptime T: type, arena: std.mem.Allocator, text: []const u8) erro
         },
         .int => return std.fmt.parseInt(T, text, 10) catch null,
         .float => return std.fmt.parseFloat(T, text) catch null,
+        .@"enum" => return std.meta.stringToEnum(T, text),
         .pointer => |pointer| {
             if (pointer.child == u8) return try arena.dupe(u8, text);
             var items: std.ArrayList(pointer.child) = .empty;
@@ -240,6 +253,11 @@ fn describeType(comptime T: type) []const u8 {
         .bool => "true or false",
         .int => "an integer in range for " ++ @typeName(T),
         .float => "a number",
+        .@"enum" => |info| blk: {
+            var names: []const u8 = "one of";
+            for (info.fields, 0..) |field, position| names = names ++ (if (position == 0) " " else ", ") ++ field.name;
+            break :blk names;
+        },
         .pointer => |pointer| if (pointer.child == u8) "a string" else "a comma-separated list",
         else => @typeName(T),
     };
@@ -353,6 +371,7 @@ fn writeValue(writer: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
             try writer.writeAll(text);
             if (std.mem.indexOfAny(u8, text, ".en") == null) try writer.writeAll(".0");
         },
+        .@"enum" => try writer.print(".{f}", .{std.zig.fmtId(@tagName(value))}),
         .pointer => |pointer| {
             if (pointer.child == u8) return writer.print("\"{f}\"", .{std.zig.fmtString(value)});
             try writer.writeAll(".{");
@@ -508,4 +527,28 @@ test "a list setting from the environment parses each item as its own type" {
 
     try environment.put("EASYRELAY_POLICY_BLOCKED_KINDS", "1,70000");
     try testing.expectError(error.InvalidConfig, applyEnvironment(arena_state.allocator(), &settings, &environment, &diagnostics));
+}
+
+test "an enum setting round-trips through the template and parses from the environment" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    var environment = std.process.Environ.Map.init(arena);
+    try environment.put("EASYRELAY_LOGGING_LEVEL", "error");
+    try environment.put("EASYRELAY_LOGGING_FORMAT", "text");
+    var settings: Config = .{};
+    var diagnostics: Diagnostics = .{};
+    try applyEnvironment(arena, &settings, &environment, &diagnostics);
+    try testing.expectEqual(logging.Level.@"error", settings.logging.level);
+    try testing.expectEqual(logging.Format.text, settings.logging.format);
+
+    var text: std.Io.Writer.Allocating = .init(arena);
+    try writeTemplate(&text.writer);
+    const source = try std.mem.replaceOwned(u8, arena, text.written(), ".level = .info", ".level = .@\"error\"");
+    const parsed = try parseText(arena, source, &diagnostics);
+    try testing.expectEqual(logging.Level.@"error", parsed.logging.level);
+
+    try environment.put("EASYRELAY_LOGGING_LEVEL", "loud");
+    try testing.expectError(error.InvalidConfig, applyEnvironment(arena, &settings, &environment, &diagnostics));
+    try testing.expect(std.mem.indexOf(u8, diagnostics.message(), "one of error, warn, info, debug") != null);
 }

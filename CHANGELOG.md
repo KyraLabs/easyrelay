@@ -49,6 +49,7 @@ versions may contain breaking changes; they will always be listed under `Changed
 - Backpressure: a client that does not read what it subscribed to is disconnected at
   `network.write_buffer_limit` instead of stalling other clients; pings and an idle timeout.
 - Graceful shutdown on SIGTERM and SIGINT: connections close, queued events are committed.
+- Structured logs, JSON or text, with a number per connection.
 - Design documentation: architecture, protocol contract, storage model, NIP coverage,
   configuration reference, operations runbook, test strategy, and nine architecture decision
   records.

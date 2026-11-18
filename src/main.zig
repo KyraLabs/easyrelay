@@ -4,6 +4,12 @@ const Io = std.Io;
 const easyrelay = @import("easyrelay");
 const config = easyrelay.config;
 
+pub const std_options: std.Options = .{
+    .logFn = easyrelay.logging.logFn,
+    // Filtering happens at run time, against logging.level.
+    .log_level = .debug,
+};
+
 const usage =
     \\easyrelay — a Nostr relay
     \\
@@ -263,6 +269,7 @@ const log = std.log.scoped(.main);
 
 fn serve(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, loaded: Loaded, stdout: *Io.Writer, stderr: *Io.Writer) !void {
     const settings = loaded.settings;
+    easyrelay.logging.configure(settings.logging.level, settings.logging.format);
     var shutdown = Shutdown.block();
     var events = easyrelay.lmdb.Lmdb.open(gpa, io, settings.storage.path, storeOptions(settings)) catch |err| {
         if (err == error.InUse) {

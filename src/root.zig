@@ -42,6 +42,8 @@ pub const outbox = @import("server/outbox.zig");
 
 pub const config = @import("config.zig");
 
+pub const logging = @import("logging.zig");
+
 pub const nip11 = @import("relay/nip11.zig");
 
 pub const frame = @import("transport/frame.zig");
@@ -75,6 +77,7 @@ test {
     _ = index;
     _ = writer;
     _ = config;
+    _ = logging;
     _ = nip11;
     _ = frame;
     _ = handshake;

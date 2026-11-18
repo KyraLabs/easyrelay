@@ -54,6 +54,8 @@ pub const Server = struct {
     mutex: std.Io.Mutex = .init,
     open: std.ArrayList(*Connection) = .empty,
     drained: std.Io.Condition = .init,
+    /// Numbers connections for the logs, so one connection's lines can be followed.
+    next_connection: std.atomic.Value(u64) = .init(1),
 
     pub fn deinit(self: *Server) void {
         std.debug.assert(self.open.items.len == 0);
@@ -164,6 +166,7 @@ fn writeAll(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8) void {
 /// no other thread ever blocks on this client's socket.
 const Connection = struct {
     server: *Server,
+    id: u64,
     stream: std.Io.net.Stream,
     subscriber: hub.Subscriber,
     outbox: Outbox,
@@ -174,6 +177,7 @@ const Connection = struct {
         const self = try gpa.create(Connection);
         self.* = .{
             .server = server,
+            .id = server.next_connection.fetchAdd(1, .monotonic),
             .stream = stream,
             .subscriber = .{
                 .registry = subscriptions.Registry.init(gpa, server.app.shared.limits.subscription),
@@ -196,7 +200,10 @@ const Connection = struct {
     fn run(self: *Connection) void {
         const server = self.server;
         defer server.untrack(self);
-        self.serve() catch |err| log.debug("connection ended: {t}", .{err});
+        log.debug("conn={d} opened", .{self.id});
+        if (self.serve()) {
+            log.debug("conn={d} closed", .{self.id});
+        } else |err| log.debug("conn={d} closed: {t}", .{ self.id, err });
         self.outbox.finish();
         if (self.sender) |sender| sender.join();
         self.sender = null;
@@ -208,7 +215,7 @@ const Connection = struct {
         defer batch.deinit(gpa);
         while (self.outbox.take(&batch)) {
             socket.writeAll(self.stream.socket.handle, batch.items) catch |err| {
-                log.debug("closing a connection whose writes failed: {t}", .{err});
+                log.debug("conn={d} writes failed: {t}", .{ self.id, err });
                 self.outbox.fail();
                 self.stream.shutdown(self.server.io, .both) catch {};
                 return;
@@ -287,7 +294,7 @@ const Connection = struct {
                     reader.err = null;
                     const quiet = last_heard.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
                     if (options.idle_timeout_ms != 0 and quiet >= options.idle_timeout_ms) {
-                        log.debug("closing a connection idle for {d} ms", .{quiet});
+                        log.debug("conn={d} idle for {d} ms", .{ self.id, quiet });
                         return self.sendClose(.going_away);
                     }
                     if (options.ping_interval_ms != 0) try self.sendFrame(.ping, "");
@@ -316,7 +323,7 @@ const Connection = struct {
                         .clock_ns = std.Io.Timestamp.now(io, .awake).nanoseconds,
                     }, text) catch |err| switch (err) {
                         error.RateLimited => {
-                            log.info("closing a connection that sent messages faster than rate_limit.messages_per_second", .{});
+                            log.info("conn={d} closed: messages faster than rate_limit.messages_per_second", .{self.id});
                             return self.sendClose(.policy_violation);
                         },
                         else => |other| return other,
@@ -352,7 +359,7 @@ const Connection = struct {
         const self: *Connection = @ptrCast(@alignCast(ptr));
         self.outbox.queue(.text, message) catch |err| switch (err) {
             error.Overflow => {
-                log.info("closing a connection that is not reading what it subscribed to", .{});
+                log.info("conn={d} closed: not reading what it subscribed to (network.write_buffer_limit)", .{self.id});
                 self.stream.shutdown(self.server.io, .both) catch {};
             },
             error.Closed => {},
