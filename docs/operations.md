@@ -1,7 +1,6 @@
 # Operations
 
-> Describes the target operational surface. Most of it lands in Phase 3; see the
-> [roadmap](roadmap.md).
+> Describes the operational surface Phase 3 delivers; see the [roadmap](roadmap.md).
 
 ## Deployment model
 
@@ -27,12 +26,17 @@ RELAY_DOMAIN=relay.example.com docker compose up -d
 ```
 
 That is a public relay on `wss://relay.example.com`. Caddy obtains the certificate and renews
-it; easyrelay runs on the internal network with its data on a named volume; metrics stay off the
-public interface.
+it; easyrelay runs on the internal network from the `ghcr.io/kyralabs/easyrelay` image, with its
+data on a named volume, a read-only root filesystem and every capability dropped; `/metrics`
+answers 404 through Caddy. `EASYRELAY_VERSION` pins an image tag; it defaults to `latest`.
 
-To change relay settings, drop an `easyrelay.zon` next to the compose file — it is mounted
-automatically if present. Generate a starting point with `docker compose run --rm easyrelay
-init > easyrelay.zon`.
+To change relay settings, drop an `easyrelay.zon` next to the compose file — the directory is
+mounted read-only as the relay's working directory, so the file is read when it exists.
+Generate a starting point with `docker compose run --rm easyrelay init > easyrelay.zon`, then
+`docker compose up -d` again. If `metrics.path` is changed, change the Caddy block in the compose
+file to match, or the new path is public.
+
+`docker compose stop` sends SIGTERM and allows 60 seconds for the write queue to drain.
 
 Everything below is for operators who want to run the binary directly instead.
 
@@ -64,33 +68,21 @@ A `fail` line exits with status 1; `warn` lines do not. The store fails past 95%
 
 ## systemd unit
 
-```ini
-[Unit]
-Description=easyrelay
-After=network.target
+The unit ships as [`deploy/easyrelay.service`](../deploy/easyrelay.service), and is attached to
+every release. It runs the relay as an `easyrelay` system user with `/etc/easyrelay` as its
+working directory, so `/etc/easyrelay/easyrelay.zon` is read when it exists, and keeps the data in
+`/var/lib/easyrelay`:
 
-[Service]
-Type=simple
-User=easyrelay
-Group=easyrelay
-ExecStart=/usr/local/bin/easyrelay --config /etc/easyrelay/easyrelay.zon
-Restart=on-failure
-RestartSec=5s
-
-StateDirectory=easyrelay
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=/var/lib/easyrelay
-LimitNOFILE=65536
-
-[Install]
-WantedBy=multi-user.target
+```bash
+install -m 0755 easyrelay /usr/local/bin/easyrelay
+install -m 0644 easyrelay.service /etc/systemd/system/easyrelay.service
+useradd --system --home-dir /var/lib/easyrelay --shell /usr/sbin/nologin easyrelay
+systemctl daemon-reload && systemctl enable --now easyrelay
 ```
 
 `LimitNOFILE` matters: every connection is a file descriptor, and the default limit will cap
-concurrency long before anything else does.
+concurrency long before anything else does. `TimeoutStopSec=60s` is the time SIGTERM has to
+drain the write queue.
 
 ## Reverse proxy
 

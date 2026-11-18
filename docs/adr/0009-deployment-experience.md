@@ -91,6 +91,28 @@ start. Rejected: it does not compose with containers, systemd or configuration m
 first run is maximally frictionless. Rejected firmly. A default that makes the first five
 minutes pleasant and the first month dangerous is not ease, it is a trap.
 
+## What Phase 3 settled (2026-11-17)
+
+The commitments above are now artifacts, and these choices fill in what the record left open:
+
+- **The container image is `FROM scratch`** holding the static musl binary and nothing else,
+  built from the same cross-compiled binaries as the release tarballs rather than compiled inside
+  Docker. There is no base image to patch and no shell to exploit. It runs as root inside the
+  container, which `scratch` leaves no alternative to without a base image; the compose file
+  compensates with a read-only root filesystem, every capability dropped and
+  `no-new-privileges`, and the image runs nowhere it was not given a volume.
+- **The compose file needs nothing beside it.** The Caddyfile is inline (`configs.content`),
+  so the documented `curl` of one file stays true. The compose directory is mounted read-only as
+  the relay's working directory, which is how an `easyrelay.zon` dropped next to it is picked up
+  without a bind mount of a file that may not exist.
+- **The image is published to `ghcr.io/kyralabs/easyrelay`** for `linux/amd64` and
+  `linux/arm64` by the release workflow, with the runner's own Docker rather than third-party
+  actions.
+- **CI starts the compose file with `RELAY_DOMAIN=localhost`**, for which Caddy issues a
+  certificate from its own local authority, and checks health, NIP-11, the WebSocket upgrade and
+  that `/metrics` is hidden over TLS. A certificate from a public CA needs a public domain, so
+  that part of the exit criterion stays a manual release check.
+
 ## Revisit when
 
 The compose path measurably fails the Phase 3 exit criterion — an unfamiliar operator cannot get

@@ -1,0 +1,55 @@
+# A public relay: easyrelay behind Caddy, which obtains and renews the TLS certificate.
+#
+#   RELAY_DOMAIN=relay.example.com docker compose up -d
+#
+# Point the domain's A (and AAAA) record at this machine first, and leave ports 80 and 443 free.
+# To change relay settings, put an easyrelay.zon next to this file; it is read if present.
+# `docker compose run --rm easyrelay init > easyrelay.zon` writes one with every default.
+
+name: easyrelay
+
+services:
+  easyrelay:
+    image: ghcr.io/kyralabs/easyrelay:${EASYRELAY_VERSION:-latest}
+    restart: unless-stopped
+    volumes:
+      - data:/var/lib/easyrelay
+      # The working directory, so ./easyrelay.zon is found here when it exists.
+      - ./:/etc/easyrelay:ro
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    # SIGTERM drains the write queue before exit; allow it the time.
+    stop_grace_period: 60s
+    ulimits:
+      nofile: 65536
+
+  caddy:
+    image: caddy:2
+    restart: unless-stopped
+    depends_on: [easyrelay]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+
+configs:
+  caddyfile:
+    content: |
+      ${RELAY_DOMAIN:?set RELAY_DOMAIN to the domain pointed at this machine} {
+        # Metrics stay on the internal network: scrape easyrelay:7777/metrics from there.
+        @metrics path /metrics
+        respond @metrics 404
+        reverse_proxy easyrelay:7777
+      }
+
+volumes:
+  data:
+  caddy_data:
+  caddy_config:

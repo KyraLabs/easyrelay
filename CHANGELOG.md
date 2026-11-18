@@ -52,6 +52,8 @@ versions may contain breaking changes; they will always be listed under `Changed
 - Structured logs, JSON or text, with a number per connection; Prometheus metrics on
   `GET /metrics` and `GET /health`.
 - `easyrelay doctor`, `easyrelay backup` (online) and `easyrelay compact`.
+- Distribution: a `FROM scratch` container image published to `ghcr.io/kyralabs/easyrelay`,
+  `deploy/docker-compose.yml` behind Caddy, and `deploy/easyrelay.service`, attached to releases.
 - Design documentation: architecture, protocol contract, storage model, NIP coverage,
   configuration reference, operations runbook, test strategy, and nine architecture decision
   records.

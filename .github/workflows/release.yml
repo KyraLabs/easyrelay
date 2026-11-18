@@ -57,6 +57,43 @@ jobs:
           path: dist/*.tar.gz*
           if-no-files-found: error
 
+  image:
+    name: Publish the container image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - id: zig
+        run: echo "version=$(tr -d '[:space:]' < .zigversion)" >> "$GITHUB_OUTPUT"
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ steps.zig.outputs.version }}
+          cache-key: release-image
+
+      - name: Build the binaries the image holds
+        run: |
+          zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe --prefix dist/linux-amd64
+          zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSafe --prefix dist/linux-arm64
+
+      # The runner's own docker and buildx; a multi-platform push needs a container builder.
+      - name: Build and push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$GH_TOKEN" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+          docker buildx create --use
+          version="${{ inputs.tag || github.ref_name }}"
+          image="ghcr.io/kyralabs/easyrelay"
+          docker buildx build --platform linux/amd64,linux/arm64 --push \
+            --tag "$image:${version#v}" --tag "$image:latest" .
+
   publish:
     name: Publish release
     needs: build
@@ -76,9 +113,11 @@ jobs:
       - name: Collect checksums
         run: |
           set -euo pipefail
+          cp deploy/docker-compose.yml deploy/easyrelay.service dist/
           cd dist
           cat ./*.sha256 > SHA256SUMS
           rm -f ./*.sha256
+          sha256sum docker-compose.yml easyrelay.service >> SHA256SUMS
           sha256sum -c SHA256SUMS
           ls -la
 

@@ -58,12 +58,22 @@ zig fmt --check --exclude zig-pkg .   # formatting gate, identical to CI
 ./scripts/interop-nak.sh     # publish and read back with nak, against the built binary
 ./scripts/shutdown-durability.sh  # SIGTERM during writes loses no acknowledged event
 ./scripts/backup-restore.sh  # back up a relay accepting writes, restore, compare
+./scripts/check-compose.sh   # probe a running deploy/docker-compose.yml stack over TLS
 ```
 
 The scripts that drive the binary need [`nak`](https://github.com/fiatjaf/nak) on `PATH` and a
 relay binary in `zig-out/bin/` (or `RELAY_BINARY`). Each starts the relay on its own port (7777,
 7781, 7782; `PORT` overrides the last two) and refuses to start if something already listens
-there.
+there. `check-compose.sh` expects a stack started with `RELAY_DOMAIN=localhost` and probes
+`https://localhost`, or `ORIGIN`.
+
+The container image holds only the cross-compiled binary:
+
+```bash
+zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe --prefix dist/linux-amd64
+docker build -t ghcr.io/kyralabs/easyrelay:latest .
+cd deploy && RELAY_DOMAIN=localhost docker compose up -d && ../scripts/check-compose.sh
+```
 
 Run a subset of tests while iterating:
 
