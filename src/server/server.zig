@@ -3,6 +3,7 @@ const nostr = @import("nostr");
 
 const frame = @import("../transport/frame.zig");
 const handshake = @import("../transport/handshake.zig");
+const Outbox = @import("outbox.zig").Outbox;
 const listener = @import("../transport/listener.zig");
 const socket = @import("../transport/socket.zig");
 const hub = @import("../relay/hub.zig");
@@ -25,9 +26,15 @@ pub const Options = struct {
     max_connections: usize = 1024,
     handshake_timeout_ms: u32 = 5000,
     max_message_size: usize = 131072,
+    write_buffer_limit: usize = 1024 * 1024,
+    write_timeout_ms: u32 = 30_000,
 };
 
 const thread_stack_size = 4 * 1024 * 1024;
+/// glibc carves static TLS out of each thread's stack, and std's per-thread signal stack alone is 256 KiB.
+const sender_stack_size = 1024 * 1024;
+/// A sender batch that grew past this is freed after writing, so an idle connection holds little.
+const retained_batch_capacity = 64 * 1024;
 const service_unavailable = "HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
 
 pub const Server = struct {
@@ -146,14 +153,14 @@ fn writeAll(io: std.Io, stream: std.Io.net.Stream, bytes: []const u8) void {
     writer.interface.flush() catch {};
 }
 
+/// Writes after the handshake go through `outbox` to a sender thread of the connection's own, so
+/// no other thread ever blocks on this client's socket.
 const Connection = struct {
     server: *Server,
     stream: std.Io.net.Stream,
     subscriber: hub.Subscriber,
-    write_mutex: std.Io.Mutex = .init,
-    write_buffer: [4096]u8 = undefined,
-    writer: std.Io.net.Stream.Writer = undefined,
-    broken: std.atomic.Value(bool) = .init(false),
+    outbox: Outbox,
+    sender: ?std.Thread = null,
 
     fn create(server: *Server, stream: std.Io.net.Stream) !*Connection {
         const gpa = server.app.gpa;
@@ -165,13 +172,15 @@ const Connection = struct {
                 .registry = subscriptions.Registry.init(gpa, server.app.shared.limits.subscription),
                 .delivery = .{ .ptr = self, .sendFn = deliver },
             },
+            .outbox = .init(gpa, server.io, server.options.write_buffer_limit),
         };
-        self.writer = stream.writer(server.io, &self.write_buffer);
         return self;
     }
 
     fn destroy(self: *Connection) void {
         const gpa = self.server.app.gpa;
+        std.debug.assert(self.sender == null);
+        self.outbox.deinit();
         self.subscriber.registry.deinit();
         self.stream.close(self.server.io);
         gpa.destroy(self);
@@ -181,6 +190,25 @@ const Connection = struct {
         const server = self.server;
         defer server.untrack(self);
         self.serve() catch |err| log.debug("connection ended: {t}", .{err});
+        self.outbox.finish();
+        if (self.sender) |sender| sender.join();
+        self.sender = null;
+    }
+
+    fn sendLoop(self: *Connection) void {
+        const gpa = self.server.app.gpa;
+        var batch: std.ArrayList(u8) = .empty;
+        defer batch.deinit(gpa);
+        while (self.outbox.take(&batch)) {
+            socket.writeAll(self.stream.socket.handle, batch.items) catch |err| {
+                log.debug("closing a connection whose writes failed: {t}", .{err});
+                self.outbox.fail();
+                self.stream.shutdown(self.server.io, .both) catch {};
+                return;
+            };
+            batch.clearRetainingCapacity();
+            if (batch.capacity > retained_batch_capacity) batch.clearAndFree(gpa);
+        }
     }
 
     fn serve(self: *Connection) !void {
@@ -193,6 +221,7 @@ const Connection = struct {
         const read_buffer = try gpa.alloc(u8, handshake.max_request);
         defer gpa.free(read_buffer);
         var reader = socket.Reader.init(handle, read_buffer);
+        try socket.setSendTimeout(handle, server.options.write_timeout_ms);
 
         reader.setDeadline(io, server.options.handshake_timeout_ms);
         const request = handshake.readRequest(&reader.interface) catch |err| {
@@ -210,12 +239,13 @@ const Connection = struct {
             .malformed => return self.writeRaw(handshake.bad_request),
         };
         {
-            self.write_mutex.lockUncancelable(io);
-            defer self.write_mutex.unlock(io);
-            try handshake.writeUpgrade(&self.writer.interface, &key);
-            try self.writer.interface.flush();
+            var upgrade_buffer: [256]u8 = undefined;
+            var upgrade: std.Io.Writer = .fixed(&upgrade_buffer);
+            try handshake.writeUpgrade(&upgrade, &key);
+            try socket.writeAll(handle, upgrade.buffered());
         }
         try reader.clearDeadline();
+        self.sender = try std.Thread.spawn(.{ .stack_size = sender_stack_size }, sendLoop, .{self});
 
         try app.shared.hub.join(&self.subscriber);
         defer app.shared.hub.leave(&self.subscriber);
@@ -259,38 +289,33 @@ const Connection = struct {
         }
     }
 
+    /// Before the handshake completes; there is no sender thread yet.
     fn writeRaw(self: *Connection, bytes: []const u8) void {
-        self.write_mutex.lockUncancelable(self.server.io);
-        defer self.write_mutex.unlock(self.server.io);
-        self.writer.interface.writeAll(bytes) catch return;
-        self.writer.interface.flush() catch {};
+        socket.writeAll(self.stream.socket.handle, bytes) catch {};
     }
 
+    /// From the connection's own thread: waits for room in the outbox.
     fn sendFrame(self: *Connection, opcode: frame.Opcode, payload: []const u8) std.Io.Writer.Error!void {
-        if (self.broken.load(.acquire)) return error.WriteFailed;
-        self.write_mutex.lockUncancelable(self.server.io);
-        defer self.write_mutex.unlock(self.server.io);
-        frame.writeFrame(&self.writer.interface, opcode, payload, null) catch |err| return self.fail(err);
-        self.writer.interface.flush() catch |err| return self.fail(err);
+        self.outbox.send(opcode, payload) catch return error.WriteFailed;
     }
 
     fn sendClose(self: *Connection, code: frame.CloseCode) void {
-        self.write_mutex.lockUncancelable(self.server.io);
-        defer self.write_mutex.unlock(self.server.io);
-        frame.writeClose(&self.writer.interface, code, null) catch return;
-        self.writer.interface.flush() catch {};
+        var payload: [2]u8 = undefined;
+        std.mem.writeInt(u16, &payload, @intFromEnum(code), .big);
+        self.outbox.send(.close, &payload) catch {};
     }
 
-    /// A failed write leaves the frame half sent, so the connection cannot be written to again.
-    fn fail(self: *Connection, err: std.Io.Writer.Error) std.Io.Writer.Error {
-        self.broken.store(true, .release);
-        self.stream.shutdown(self.server.io, .both) catch {};
-        return err;
-    }
-
+    /// From other threads: never waits. A client too slow to take what it subscribed to is
+    /// disconnected rather than buffered for.
     fn deliver(ptr: *anyopaque, message: []const u8) void {
         const self: *Connection = @ptrCast(@alignCast(ptr));
-        self.sendFrame(.text, message) catch |err| log.debug("dropping a delivery: {t}", .{err});
+        self.outbox.queue(.text, message) catch |err| switch (err) {
+            error.Overflow => {
+                log.info("closing a connection that is not reading what it subscribed to", .{});
+                self.stream.shutdown(self.server.io, .both) catch {};
+            },
+            error.Closed => {},
+        };
     }
 };
 
@@ -524,4 +549,35 @@ test "connections over the limit are refused with 503" {
     const refused = try exchange(testing.allocator, io, fixture.port(), "GET / HTTP/1.1\r\n\r\n");
     defer testing.allocator.free(refused);
     try testing.expect(std.mem.startsWith(u8, refused, "HTTP/1.1 503 "));
+}
+
+test "a subscriber that stops reading is disconnected without slowing a publisher" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{ .write_buffer_limit = 256 * 1024 }, null);
+    defer fixture.stop();
+    const io = fixture.threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const stalled = try Client.connect(testing.allocator, io, fixture.port(), 2000);
+    defer stalled.close();
+    try stalled.send("[\"REQ\",\"firehose\",{}]");
+    try testing.expectEqualStrings("[\"EOSE\",\"firehose\"]", try stalled.receive());
+
+    const publisher = try Client.connect(testing.allocator, io, fixture.port(), 2000);
+    defer publisher.close();
+    const content = try arena.alloc(u8, 32 * 1024);
+    @memset(content, 'x');
+
+    var published: usize = 0;
+    while (fixture.connections.count() > 1) : (published += 1) {
+        try testing.expect(published < 2000);
+        content[0] = 'a' + @as(u8, @intCast(published % 26));
+        content[1] = 'a' + @as(u8, @intCast(published / 26 % 26));
+        const message, _ = try signedEventMessage(arena, io, 7, content);
+        try publisher.send(message);
+        try testing.expect(std.mem.indexOf(u8, try publisher.receive(), ",true,") != null);
+    }
+    try testing.expectEqual(@as(usize, 1), fixture.connections.count());
 }

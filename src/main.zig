@@ -165,6 +165,7 @@ fn sessionLimits(settings: config.Config) easyrelay.session.Limits {
             .max_subscriptions = limits.max_subscriptions,
             .max_limit = limits.max_limit,
             .default_limit = limits.default_limit,
+            .max_held_bytes = settings.network.write_buffer_limit,
         },
     };
 }
@@ -176,6 +177,8 @@ fn serverOptions(settings: config.Config) easyrelay.server.Options {
         .max_connections = settings.network.max_connections,
         .handshake_timeout_ms = settings.network.handshake_timeout_ms,
         .max_message_size = settings.limits.max_message_size,
+        .write_buffer_limit = settings.network.write_buffer_limit,
+        .write_timeout_ms = settings.network.write_timeout_ms,
     };
 }
 

@@ -8,6 +8,28 @@ pub const Limits = struct {
     max_subscriptions: usize = 20,
     max_limit: usize = 5000,
     default_limit: usize = 500,
+    /// Live-event bytes one subscription may hold back while its stored phase is sent.
+    max_held_bytes: usize = 1024 * 1024,
+};
+
+/// A live event held back until the stored phase it arrived during has been sent.
+pub const Held = struct {
+    /// Null for an ephemeral event, which no stored phase can have seen.
+    local_id: ?u64,
+    message: []u8,
+};
+
+pub const Holding = struct {
+    messages: std.ArrayList(Held) = .empty,
+    bytes: usize = 0,
+    /// More arrived than `max_held_bytes`; the subscription cannot be completed in order.
+    overflowed: bool = false,
+
+    pub fn deinit(self: *Holding, gpa: std.mem.Allocator) void {
+        for (self.messages.items) |held| gpa.free(held.message);
+        self.messages.deinit(gpa);
+        self.* = undefined;
+    }
 };
 
 pub const Subscription = struct {
@@ -15,6 +37,8 @@ pub const Subscription = struct {
     filters: []const Filter,
     /// Live events at or below this local id were visible to the stored phase.
     watermark: u64 = 0,
+    /// Set from `hold` until `release` drains it: live events wait here so they follow `EOSE`.
+    holding: ?Holding = null,
     arena: std.heap.ArenaAllocator,
 };
 
@@ -33,7 +57,7 @@ pub const Registry = struct {
     }
 
     pub fn deinit(self: *Registry) void {
-        for (self.entries.items) |*entry| entry.arena.deinit();
+        for (self.entries.items) |*entry| self.free(entry);
         self.entries.deinit(self.gpa);
         self.* = undefined;
     }
@@ -42,8 +66,63 @@ pub const Registry = struct {
         return self.entries.items.len;
     }
 
-    pub fn items(self: Registry) []const Subscription {
+    pub fn items(self: Registry) []Subscription {
         return self.entries.items;
+    }
+
+    /// Holds live events for `id` until `release`.
+    pub fn hold(self: *Registry, id: []const u8) void {
+        const index = self.indexOf(id) orelse return;
+        std.debug.assert(self.entries.items[index].holding == null);
+        self.entries.items[index].holding = .{};
+    }
+
+    /// Keeps a copy of `message` for a subscription in its stored phase.
+    pub fn keep(self: *Registry, subscription: *Subscription, local_id: ?u64, message: []const u8) void {
+        std.debug.assert(subscription.holding != null);
+        const holding = &subscription.holding.?;
+        if (holding.overflowed) return;
+        if (holding.bytes + message.len > self.limits.max_held_bytes) {
+            holding.overflowed = true;
+            return;
+        }
+        const copy = self.gpa.dupe(u8, message) catch {
+            holding.overflowed = true;
+            return;
+        };
+        holding.messages.append(self.gpa, .{ .local_id = local_id, .message = copy }) catch {
+            self.gpa.free(copy);
+            holding.overflowed = true;
+            return;
+        };
+        holding.bytes += message.len;
+    }
+
+    pub const Released = union(enum) {
+        /// Nothing was held; the subscription is live.
+        live,
+        /// Send these, then call `release` again.
+        held: Holding,
+        overflowed,
+        gone,
+    };
+
+    /// Takes what `id` has held so far. Once nothing is left the subscription goes live in the same
+    /// step, so no live event can slip between the last held one and the first delivered directly.
+    pub fn release(self: *Registry, id: []const u8) Released {
+        const index = self.indexOf(id) orelse return .gone;
+        const subscription = &self.entries.items[index];
+        if (subscription.holding == null) return .live;
+        const holding = &subscription.holding.?;
+        if (holding.overflowed) return .overflowed;
+        if (holding.messages.items.len == 0) {
+            holding.deinit(self.gpa);
+            subscription.holding = null;
+            return .live;
+        }
+        const taken = holding.*;
+        holding.* = .{};
+        return .{ .held = taken };
     }
 
     pub fn setWatermark(self: *Registry, id: []const u8, watermark: u64) void {
@@ -73,7 +152,7 @@ pub const Registry = struct {
         };
 
         if (existing) |index| {
-            self.entries.items[index].arena.deinit();
+            self.free(&self.entries.items[index]);
             self.entries.items[index] = owned;
             return;
         }
@@ -82,9 +161,14 @@ pub const Registry = struct {
 
     pub fn close(self: *Registry, id: []const u8) bool {
         const index = self.indexOf(id) orelse return false;
-        self.entries.items[index].arena.deinit();
+        self.free(&self.entries.items[index]);
         _ = self.entries.orderedRemove(index);
         return true;
+    }
+
+    fn free(self: *Registry, subscription: *Subscription) void {
+        if (subscription.holding) |*holding| holding.deinit(self.gpa);
+        subscription.arena.deinit();
     }
 
     fn indexOf(self: Registry, id: []const u8) ?usize {
@@ -229,4 +313,49 @@ test "a replacement that cannot be built leaves the old subscription serving" {
     try testing.expectEqual(@as(usize, 1), registry.count());
     try testing.expectEqual(@as(u16, 1), surviving.filters[0].kinds.?[0]);
     try testing.expectEqualStrings("original", surviving.filters[0].tags.?[0].values[0]);
+}
+
+test "a held subscription keeps live events until released, then goes live" {
+    var registry = Registry.init(testing.allocator, .{});
+    defer registry.deinit();
+    try registry.open("s", &.{});
+    registry.hold("s");
+
+    registry.keep(&registry.items()[0], 7, "first");
+    var released = registry.release("s");
+    try testing.expectEqualStrings("first", released.held.messages.items[0].message);
+    try testing.expectEqual(@as(?u64, 7), released.held.messages.items[0].local_id);
+    released.held.deinit(testing.allocator);
+
+    registry.keep(&registry.items()[0], null, "second");
+    released = registry.release("s");
+    try testing.expectEqualStrings("second", released.held.messages.items[0].message);
+    released.held.deinit(testing.allocator);
+
+    try testing.expectEqual(Registry.Released.live, registry.release("s"));
+    try testing.expect(registry.find("s").?.holding == null);
+}
+
+test "holding more than the limit marks the subscription overflowed" {
+    var registry = Registry.init(testing.allocator, .{ .max_held_bytes = 8 });
+    defer registry.deinit();
+    try registry.open("s", &.{});
+    registry.hold("s");
+
+    registry.keep(&registry.items()[0], 1, "12345");
+    registry.keep(&registry.items()[0], 2, "67890");
+    try testing.expectEqual(Registry.Released.overflowed, registry.release("s"));
+}
+
+test "closing or replacing a held subscription frees what it held" {
+    var registry = Registry.init(testing.allocator, .{});
+    defer registry.deinit();
+    try registry.open("s", &.{});
+    registry.hold("s");
+    registry.keep(&registry.items()[0], 1, "held");
+    try registry.open("s", &.{});
+    registry.hold("s");
+    registry.keep(&registry.items()[0], 2, "held again");
+    try testing.expect(registry.close("s"));
+    try testing.expectEqual(Registry.Released.gone, registry.release("s"));
 }

@@ -69,9 +69,7 @@ pub const Session = struct {
         ) catch |err| switch (err) {
             error.MalformedMessage, error.UnsupportedMessage => {
                 if (diagnostics.subject) |subscription_id| {
-                    self.subscriber.mutex.lockUncancelable(self.shared.io);
-                    defer self.subscriber.mutex.unlock(self.shared.io);
-                    _ = self.subscriber.registry.close(subscription_id);
+                    self.closeSubscription(subscription_id);
                     return self.sendClosed(subscription_id, .invalid, diagnostics.message());
                 }
                 return self.sendNotice(diagnostics.message());
@@ -82,11 +80,7 @@ pub const Session = struct {
         switch (message) {
             .event => |event| try self.publish(context, event, data.len),
             .req => |req| try self.subscribe(context, req),
-            .close => |close| {
-                self.subscriber.mutex.lockUncancelable(self.shared.io);
-                defer self.subscriber.mutex.unlock(self.shared.io);
-                _ = self.subscriber.registry.close(close.subscription_id);
-            },
+            .close => |close| self.closeSubscription(close.subscription_id),
         }
     }
 
@@ -152,24 +146,37 @@ pub const Session = struct {
         return self.sendOk(write_queue.ok(event.id, result));
     }
 
-    fn subscribe(self: *Session, context: Context, req: codec.ClientMessage.Req) Error!void {
+    fn closeSubscription(self: *Session, subscription_id: []const u8) void {
         self.subscriber.mutex.lockUncancelable(self.shared.io);
         defer self.subscriber.mutex.unlock(self.shared.io);
+        _ = self.subscriber.registry.close(subscription_id);
+    }
 
-        self.subscriber.registry.open(req.subscription_id, req.filters) catch |err| switch (err) {
-            error.TooMany => return self.sendClosed(
+    /// The stored phase runs without the subscriber's lock, which the writer thread takes to fan
+    /// out; holding it while a slow client drains a large result would stall every write. Live
+    /// events arriving meanwhile are held and sent after `EOSE`.
+    fn subscribe(self: *Session, context: Context, req: codec.ClientMessage.Req) Error!void {
+        const opened = opened: {
+            self.subscriber.mutex.lockUncancelable(self.shared.io);
+            defer self.subscriber.mutex.unlock(self.shared.io);
+            self.subscriber.registry.open(req.subscription_id, req.filters) catch |err| {
+                if (err == error.OutOfMemory) _ = self.subscriber.registry.close(req.subscription_id);
+                break :opened err;
+            };
+            self.subscriber.registry.hold(req.subscription_id);
+            break :opened {};
+        };
+        opened catch |err| return switch (err) {
+            error.TooMany => self.sendClosed(
                 req.subscription_id,
                 .blocked,
                 "this connection already holds as many subscriptions as it may",
             ),
-            error.OutOfMemory => {
-                _ = self.subscriber.registry.close(req.subscription_id);
-                return self.sendClosed(
-                    req.subscription_id,
-                    .internal,
-                    "the relay ran out of memory opening this subscription",
-                );
-            },
+            error.OutOfMemory => self.sendClosed(
+                req.subscription_id,
+                .internal,
+                "the relay ran out of memory opening this subscription",
+            ),
         };
 
         var sink: EventSink = .{
@@ -177,7 +184,7 @@ pub const Session = struct {
             .subscription_id = req.subscription_id,
         };
         const bounded = subscriptions.resolveLimits(context.arena, req.filters, self.shared.limits.subscription) catch {
-            _ = self.subscriber.registry.close(req.subscription_id);
+            self.closeSubscription(req.subscription_id);
             return self.sendClosed(
                 req.subscription_id,
                 .internal,
@@ -191,7 +198,7 @@ pub const Session = struct {
         self.shared.store.query(bounded, store_sink) catch |err| switch (err) {
             error.Abort => return sink.failure orelse error.WriteFailed,
             error.OutOfMemory, error.Backend => {
-                _ = self.subscriber.registry.close(req.subscription_id);
+                self.closeSubscription(req.subscription_id);
                 return self.sendClosed(
                     req.subscription_id,
                     .internal,
@@ -200,8 +207,43 @@ pub const Session = struct {
             },
         };
 
-        self.subscriber.registry.setWatermark(req.subscription_id, watermark);
+        {
+            self.subscriber.mutex.lockUncancelable(self.shared.io);
+            defer self.subscriber.mutex.unlock(self.shared.io);
+            self.subscriber.registry.setWatermark(req.subscription_id, watermark);
+        }
         try self.sendEose(req.subscription_id);
+        try self.sendHeld(req.subscription_id, watermark);
+    }
+
+    /// Bounded by the hold limit: every pass either sends what was held or ends the phase.
+    fn sendHeld(self: *Session, subscription_id: []const u8, watermark: u64) Error!void {
+        while (true) {
+            var released = released: {
+                self.subscriber.mutex.lockUncancelable(self.shared.io);
+                defer self.subscriber.mutex.unlock(self.shared.io);
+                const released = self.subscriber.registry.release(subscription_id);
+                if (released == .overflowed) _ = self.subscriber.registry.close(subscription_id);
+                break :released released;
+            };
+            switch (released) {
+                .live, .gone => return,
+                .overflowed => return self.sendClosed(
+                    subscription_id,
+                    .internal,
+                    "live events for this subscription arrived faster than they could be sent",
+                ),
+                .held => |*holding| {
+                    defer holding.deinit(self.subscriber.registry.gpa);
+                    for (holding.messages.items) |held| {
+                        if (held.local_id) |id| if (id <= watermark) continue;
+                        const writer = try self.responder.begin();
+                        try writer.writeAll(held.message);
+                        try self.responder.send();
+                    }
+                },
+            }
+        }
     }
 
     fn sendEvent(self: *Session, subscription_id: []const u8, event: Event) Error!void {
@@ -776,4 +818,94 @@ test "an event the stored phase already sent is not delivered live as well" {
     harness.shared.hub.broadcast(harness.arena(), &event, local_id);
     try testing.expectEqual(@as(usize, 1), harness.delivered.items.len);
     try testing.expect(std.mem.startsWith(u8, harness.delivered.items[0], "[\"EVENT\",\"before\","));
+}
+
+/// Answers a query from the backing store, then publishes live events before the caller sees the
+/// query end — as if the writer committed them while the stored phase was being sent.
+const RacingStore = struct {
+    inner: store.Store,
+    connections: *hub.Hub,
+    arena: std.mem.Allocator,
+    live: []const struct { event: Event, local_id: ?u64 },
+
+    const vtable: store.Store.VTable = .{ .put = put, .putBatch = putBatch, .query = query };
+
+    fn interface(self: *RacingStore) store.Store {
+        return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    fn put(ptr: *anyopaque, event: *const Event) store.Error!store.PutResult {
+        const self: *RacingStore = @ptrCast(@alignCast(ptr));
+        return self.inner.put(event);
+    }
+
+    fn putBatch(ptr: *anyopaque, events: []const Event, results: []store.PutResult, local_ids: ?[]u64) store.Error!void {
+        const self: *RacingStore = @ptrCast(@alignCast(ptr));
+        return self.inner.putBatch(events, results, local_ids);
+    }
+
+    fn query(ptr: *anyopaque, filters: []const nostr.filter.Filter, sink: store.Sink) store.QueryError!void {
+        const self: *RacingStore = @ptrCast(@alignCast(ptr));
+        try self.inner.query(filters, sink);
+        for (self.live) |live| self.connections.broadcast(self.arena, &live.event, live.local_id);
+    }
+};
+
+test "live events arriving during the stored phase follow EOSE, minus what the snapshot held" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+
+    const stored = try harness.signedEventAt(test_now - 10, "stored");
+    var result: store.PutResult = undefined;
+    var stored_id: u64 = 0;
+    try harness.shared.store.putBatch((&stored)[0..1], (&result)[0..1], (&stored_id)[0..1]);
+
+    var racing: RacingStore = .{
+        .inner = harness.shared.store,
+        .connections = &harness.connections,
+        .arena = harness.arena(),
+        .live = &.{
+            .{ .event = stored, .local_id = stored_id },
+            .{ .event = try harness.signedEventAt(test_now, "committed meanwhile"), .local_id = stored_id + 1 },
+            .{ .event = try harness.signedEventAt(test_now, "ephemeral meanwhile"), .local_id = null },
+        },
+    };
+    harness.shared.store = racing.interface();
+
+    try harness.handle("[\"REQ\",\"s\",{}]");
+
+    const sent = harness.recorder.messages.items;
+    try testing.expectEqual(@as(usize, 4), sent.len);
+    try testing.expect(std.mem.indexOf(u8, sent[0], "\"stored\"") != null);
+    try testing.expectEqualStrings("[\"EOSE\",\"s\"]", sent[1]);
+    try testing.expect(std.mem.indexOf(u8, sent[2], "committed meanwhile") != null);
+    try testing.expect(std.mem.indexOf(u8, sent[3], "ephemeral meanwhile") != null);
+    try testing.expectEqual(@as(usize, 0), harness.delivered.items.len);
+    try testing.expect(harness.subscriber.registry.find("s").?.holding == null);
+
+    harness.shared.hub.broadcast(harness.arena(), &(try harness.signedEventAt(test_now, "after")), stored_id + 2);
+    try testing.expectEqual(@as(usize, 1), harness.delivered.items.len);
+}
+
+test "a stored phase that holds more live events than allowed is closed with error:" {
+    var harness = Harness.init(.{ .subscription = .{ .max_held_bytes = 16 } });
+    try harness.start();
+    defer harness.deinit();
+
+    var racing: RacingStore = .{
+        .inner = harness.shared.store,
+        .connections = &harness.connections,
+        .arena = harness.arena(),
+        .live = &.{.{ .event = try harness.signedEventAt(test_now, "too much to hold"), .local_id = 1 }},
+    };
+    harness.shared.store = racing.interface();
+
+    try harness.handle("[\"REQ\",\"s\",{}]");
+
+    const sent = harness.recorder.messages.items;
+    try testing.expectEqual(@as(usize, 2), sent.len);
+    try testing.expectEqualStrings("[\"EOSE\",\"s\"]", sent[0]);
+    try testing.expect(std.mem.startsWith(u8, sent[1], "[\"CLOSED\",\"s\",\"error:"));
+    try testing.expectEqual(@as(usize, 0), harness.subscriber.registry.count());
 }

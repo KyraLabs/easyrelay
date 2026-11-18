@@ -47,7 +47,8 @@ ignored line.
 | `handshake_timeout_ms` | u32 | `5000` | Time allowed to complete the WebSocket handshake, from accept to the end of the request. |
 | `ping_interval_s` | u32 | `30` | Interval between pings on idle connections. `0` disables. Phase 3. |
 | `idle_timeout_s` | u32 | `300` | Close a connection after this long with no traffic. `0` disables. Phase 3. |
-| `write_buffer_limit` | usize | `1048576` | Per-connection pending write bytes before the connection is dropped. Backpressure, not buffering. Phase 3. |
+| `write_buffer_limit` | usize | `1048576` | Per-connection pending write bytes before the connection is dropped. Backpressure, not buffering. Also bounds the live events one subscription holds while its stored events are sent. At least twice `limits.max_message_size`. |
+| `write_timeout_ms` | u32 | `30000` | Time a write to a client may make no progress before the connection is dropped. |
 
 ## `storage`
 

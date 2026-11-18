@@ -5,11 +5,40 @@ const Handle = std.Io.net.Socket.Handle;
 
 /// Bounds every blocking read on `handle`; zero removes the bound.
 pub fn setReceiveTimeout(handle: Handle, milliseconds: u32) error{Unexpected}!void {
+    try setTimeout(handle, posix.SO.RCVTIMEO, milliseconds);
+}
+
+/// Bounds every blocking write on `handle` that makes no progress; zero removes the bound.
+pub fn setSendTimeout(handle: Handle, milliseconds: u32) error{Unexpected}!void {
+    try setTimeout(handle, posix.SO.SNDTIMEO, milliseconds);
+}
+
+fn setTimeout(handle: Handle, option: u32, milliseconds: u32) error{Unexpected}!void {
     const timeout: posix.timeval = .{
         .sec = @intCast(milliseconds / 1000),
         .usec = @intCast((milliseconds % 1000) * 1000),
     };
-    posix.setsockopt(handle, posix.SOL.SOCKET, posix.SO.RCVTIMEO, std.mem.asBytes(&timeout)) catch return error.Unexpected;
+    posix.setsockopt(handle, posix.SOL.SOCKET, option, std.mem.asBytes(&timeout)) catch return error.Unexpected;
+}
+
+pub const WriteError = error{ Timeout, ConnectionReset, Unexpected };
+
+const send_flags: u32 = if (@hasDecl(posix.MSG, "NOSIGNAL")) posix.MSG.NOSIGNAL else 0;
+
+/// Writes all of `bytes`, reporting a send timeout as `error.Timeout`.
+pub fn writeAll(handle: Handle, bytes: []const u8) WriteError!void {
+    var sent: usize = 0;
+    while (sent < bytes.len) {
+        const rest = bytes[sent..];
+        const rc = std.c.send(handle, rest.ptr, rest.len, send_flags);
+        switch (posix.errno(rc)) {
+            .SUCCESS => sent += @intCast(rc),
+            .INTR => continue,
+            .AGAIN => return error.Timeout,
+            .PIPE, .CONNRESET, .NOTCONN => return error.ConnectionReset,
+            else => return error.Unexpected,
+        }
+    }
 }
 
 pub const ReadError = error{ Timeout, ConnectionReset, Unexpected };

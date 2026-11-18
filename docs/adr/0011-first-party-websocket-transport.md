@@ -34,6 +34,16 @@ The specifics:
 
 - **One thread per connection**, blocking reads, bounded by `network.max_connections`. ADR-0005
   already accepts this ceiling until Phase 6.
+- **A second thread per connection writes to it** (added in Phase 3). Every frame after the
+  handshake goes into a per-connection outbox bounded by `network.write_buffer_limit`, and that
+  connection's sender thread alone writes to the socket, under a send timeout
+  (`network.write_timeout_ms`). Without it, the writer thread fanning out an event blocked on any
+  subscriber whose socket buffer was full, so one client that stopped reading stalled every
+  write on the relay. Fan-out and replies from other threads never wait: a frame that does not
+  fit closes the connection. The connection's own thread does wait for room, since its client is
+  the one being slow, but only up to half the limit, leaving the rest for live events. The
+  sender's stack is small (256 KiB), and the doubling of threads is within the ceiling Phase 6
+  exists to lift.
 - **Every resource bounded**: the handshake request size, the handshake time (an absolute
   deadline, which a client sending one byte at a time cannot extend), the frame payload and the
   assembled message size (`limits.max_message_size`).

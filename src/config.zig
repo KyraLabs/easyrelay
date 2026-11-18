@@ -15,6 +15,8 @@ pub const Network = struct {
     port: u16 = 7777,
     max_connections: usize = 1024,
     handshake_timeout_ms: u32 = 5000,
+    write_buffer_limit: usize = 1024 * 1024,
+    write_timeout_ms: u32 = 30_000,
 };
 
 pub const Storage = struct {
@@ -62,6 +64,8 @@ const descriptions = .{
         .port = "Bind port.",
         .max_connections = "Connections accepted before new ones are refused.",
         .handshake_timeout_ms = "Time allowed to complete the WebSocket handshake, from accept to the end of the request.",
+        .write_buffer_limit = "Per-connection pending write bytes before the connection is dropped. Backpressure, not buffering.",
+        .write_timeout_ms = "Time a write to a client may make no progress before the connection is dropped.",
     },
     .storage = .{
         .path = "Data directory. The LMDB environment lives in its `events` subdirectory.",
@@ -205,6 +209,11 @@ pub fn validate(config: Config, diagnostics: *Diagnostics) error{InvalidConfig}!
     if (config.network.address.len == 0) return diagnostics.fail("network.address must not be empty", .{});
     if (config.network.port == 0) return diagnostics.fail("network.port must not be 0", .{});
     if (config.network.max_connections == 0) return diagnostics.fail("network.max_connections must be at least 1", .{});
+    if (config.network.write_timeout_ms == 0) return diagnostics.fail("network.write_timeout_ms must be at least 1", .{});
+    if (config.network.write_buffer_limit < 2 * limits.max_message_size) return diagnostics.fail(
+        "network.write_buffer_limit ({d}) is below twice limits.max_message_size ({d}); raise write_buffer_limit",
+        .{ config.network.write_buffer_limit, limits.max_message_size },
+    );
     if (config.storage.path.len == 0) return diagnostics.fail("storage.path must not be empty", .{});
     if (config.storage.map_size < 1024 * 1024) return diagnostics.fail("storage.map_size is {d} bytes; it must be at least 1048576 (1 MiB)", .{config.storage.map_size});
     if (config.storage.max_scan == 0) return diagnostics.fail("storage.max_scan must be at least 1", .{});
@@ -371,6 +380,8 @@ test "every validation error names the setting it is about" {
         .{ .config = .{ .storage = .{ .path = "" } }, .key = "storage.path" },
         .{ .config = .{ .storage = .{ .map_size = 4096 } }, .key = "storage.map_size" },
         .{ .config = .{ .storage = .{ .max_scan = 0 } }, .key = "storage.max_scan" },
+        .{ .config = .{ .network = .{ .write_timeout_ms = 0 } }, .key = "network.write_timeout_ms" },
+        .{ .config = .{ .network = .{ .write_buffer_limit = 1000 } }, .key = "network.write_buffer_limit" },
         .{ .config = .{ .rate_limit = .{ .write_queue_depth = 0 } }, .key = "rate_limit.write_queue_depth" },
         .{ .config = .{ .limits = .{ .max_filters = 0 } }, .key = "limits.max_filters" },
         .{ .config = .{ .limits = .{ .default_limit = 9000 } }, .key = "limits.default_limit" },

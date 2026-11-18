@@ -32,6 +32,8 @@ pub const diagnostics = @import("relay/diagnostics.zig");
 
 pub const server = @import("server/server.zig");
 
+pub const outbox = @import("server/outbox.zig");
+
 pub const config = @import("config.zig");
 
 pub const nip11 = @import("relay/nip11.zig");
@@ -58,6 +60,7 @@ test {
     _ = subscriptions;
     _ = hub;
     _ = diagnostics;
+    _ = outbox;
     _ = server;
     _ = kind;
     _ = index;

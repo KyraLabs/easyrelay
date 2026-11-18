@@ -209,6 +209,14 @@ Enforced before signature verification and advertised in NIP-11 `limitation`:
 
 All are configurable; see [configuration.md](configuration.md).
 
+## Backpressure
+
+A connection that does not read what it subscribed to is closed once its pending outbound bytes
+pass `network.write_buffer_limit`, or once a write to it makes no progress for
+`network.write_timeout_ms`. Live events matching a subscription that arrive while its stored
+events are still being sent are held and follow its `EOSE`; if more arrive than
+`network.write_buffer_limit` allows, the subscription is closed with `CLOSED` and `error:`.
+
 ## References
 
 - [NIP-01 — Basic protocol flow](https://github.com/nostr-protocol/nips/blob/master/01.md)

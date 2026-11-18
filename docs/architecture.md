@@ -40,10 +40,13 @@ Owns sockets and nothing else. A first-party RFC 6455 implementation over `std.I
 
 One connection maps to one thread, which reads its frames and handles its messages one at a
 time, so the layers above need no per-connection locking for what a connection receives. Writes
-to a connection come from its own thread and from the hub's fan-out, and are serialised by a
-per-connection lock. This layer bounds the handshake request and its duration, the frame payload
-and the assembled message size, answers ping with pong, and refuses a protocol violation with a
-close frame naming it. Closing a connection whose write backlog grows without bound is Phase 3.
+to a connection come from its own thread and from the hub's fan-out; after the handshake both
+go into a per-connection outbox that a second, sending thread drains, so no other thread ever
+blocks on a client's socket. The outbox is bounded by `network.write_buffer_limit`: fan-out that
+does not fit closes the connection, while the connection's own replies wait for room. This
+layer bounds the handshake request and its duration, the frame payload and the assembled message
+size, and the time a write may make no progress; it answers ping with pong, and refuses a
+protocol violation with a close frame naming it.
 
 The same listener serves the plain HTTP surface: the NIP-11 relay information document when the
 request carries `Accept: application/nostr+json`, `GET /metrics`, and `GET /health`.
@@ -158,7 +161,12 @@ Consequences that shape the rest of the design:
 - **The write queue is bounded.** When it fills, new events are rejected with a `rate-limited:`
   `OK` rather than queued. Backpressure is visible to the client, not absorbed silently.
 - **Fan-out happens after the write commits**, on the writer thread, so a subscriber never
-  receives an event that a subsequent read would fail to find.
+  receives an event that a subsequent read would fail to find. Fan-out only copies into each
+  connection's outbox and never waits on a socket.
+- **A `REQ`'s stored phase runs without the subscriber's lock.** Live events matching it that
+  arrive meanwhile are held, up to `network.write_buffer_limit` bytes, and sent after `EOSE`,
+  minus those the query's snapshot already contained. A subscription that would hold more is
+  closed with `CLOSED` `error:`.
 - **Long-lived read transactions pin old pages.** A slow subscriber draining a large `REQ` keeps
   a read transaction open and prevents LMDB from reclaiming pages, which grows the file. Query
   results are therefore bounded and streamed with a cap, never materialised in full.
