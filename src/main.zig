@@ -15,6 +15,9 @@ const usage =
     \\
     \\Usage: easyrelay [--config <path>]
     \\       easyrelay init
+    \\       easyrelay doctor [--config <path>]
+    \\       easyrelay backup --out <file> [--config <path>]
+    \\       easyrelay compact [--config <path>]
     \\
     \\With no options it serves a relay on ws://127.0.0.1:7777 and keeps its
     \\events in ./data. There is nothing to configure and no file to write first.
@@ -22,9 +25,14 @@ const usage =
     \\Commands:
     \\  init             Print a configuration file with every default, to edit
     \\                   and save as easyrelay.zon
+    \\  doctor           Check the configuration, the data directory and the
+    \\                   store, and say how the relay will be reached
+    \\  backup           Copy the store to a new file while the relay keeps serving
+    \\  compact          Rewrite the store without its free pages; stop the relay first
     \\
     \\Options:
     \\  --config <path>  Read this configuration file instead of ./easyrelay.zon
+    \\  --out <file>     Where backup writes its copy; the file must not exist
     \\  -h, --help       Show this message and exit
     \\  -V, --version    Show the version and exit
     \\
@@ -35,29 +43,58 @@ const usage =
 const Command = union(enum) {
     serve: ?[]const u8,
     init,
+    doctor: ?[]const u8,
+    backup: struct { config: ?[]const u8, out: []const u8 },
+    compact: ?[]const u8,
     help,
     version,
 };
 
 const UsageError = struct { message: []const u8, argument: []const u8 = "" };
 
+const Verb = enum { serve, init, doctor, backup, compact };
+
 fn parseArguments(args: []const []const u8) union(enum) { command: Command, wrong: UsageError } {
     var config_path: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    var verb: Verb = .serve;
     var index: usize = 0;
+    if (args.len != 0) {
+        for ([_]Verb{ .init, .doctor, .backup, .compact }) |candidate| {
+            if (std.mem.eql(u8, args[0], @tagName(candidate))) {
+                verb = candidate;
+                index = 1;
+            }
+        }
+    }
     while (index < args.len) : (index += 1) {
         const arg = args[index];
         if (std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help")) return .{ .command = .help };
         if (std.mem.eql(u8, arg, "-V") or std.mem.eql(u8, arg, "--version")) return .{ .command = .version };
-        if (std.mem.eql(u8, arg, "init") and index == 0 and args.len == 1) return .{ .command = .init };
-        if (std.mem.eql(u8, arg, "--config")) {
+        if (verb != .init and std.mem.eql(u8, arg, "--config")) {
             index += 1;
             if (index == args.len) return .{ .wrong = .{ .message = "--config needs a path" } };
             config_path = args[index];
             continue;
         }
+        if (verb == .backup and std.mem.eql(u8, arg, "--out")) {
+            index += 1;
+            if (index == args.len) return .{ .wrong = .{ .message = "--out needs a file path" } };
+            out_path = args[index];
+            continue;
+        }
         return .{ .wrong = .{ .message = "unknown argument", .argument = arg } };
     }
-    return .{ .command = .{ .serve = config_path } };
+    return .{ .command = switch (verb) {
+        .serve => .{ .serve = config_path },
+        .init => .init,
+        .doctor => .{ .doctor = config_path },
+        .compact => .{ .compact = config_path },
+        .backup => .{ .backup = .{
+            .config = config_path,
+            .out = out_path orelse return .{ .wrong = .{ .message = "backup needs --out <file>" } },
+        } },
+    } };
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -92,18 +129,133 @@ pub fn main(init: std.process.Init) !void {
         .help => try stdout.writeAll(usage),
         .version => try stdout.print("easyrelay {s}\n", .{easyrelay.version}),
         .init => try config.writeTemplate(stdout),
-        .serve => |config_path| {
-            const loaded = load(arena, io, init.environ_map, config_path) catch |err| switch (err) {
-                error.InvalidConfig => {
-                    try stderr.flush();
-                    std.process.exit(2);
-                },
-                else => return err,
+        .serve => |config_path| try serve(gpa, arena, io, try loadOrExit(arena, io, init.environ_map, config_path, stderr), stdout, stderr),
+        .doctor => |config_path| {
+            const healthy = try doctor(gpa, arena, io, init.environ_map, config_path, stdout);
+            try stdout.flush();
+            if (!healthy) std.process.exit(1);
+        },
+        .backup => |request| {
+            const loaded = try loadOrExit(arena, io, init.environ_map, request.config, stderr);
+            const settings = loaded.settings;
+            easyrelay.lmdb.backup(gpa, io, settings.storage.path, settings.storage.map_size, request.out) catch |err| {
+                try stderr.print("error: backup failed: {s}\n", .{copyFailure(err)});
+                try stderr.flush();
+                std.process.exit(1);
             };
-            try serve(gpa, arena, io, loaded, stdout, stderr);
+            try stdout.print("backed up {s} to {s}\n", .{ settings.storage.path, request.out });
+        },
+        .compact => |config_path| {
+            const loaded = try loadOrExit(arena, io, init.environ_map, config_path, stderr);
+            const settings = loaded.settings;
+            const sizes = easyrelay.lmdb.compact(gpa, io, settings.storage.path, storeOptions(settings)) catch |err| {
+                try stderr.print("error: compaction failed: {s}\n", .{copyFailure(err)});
+                try stderr.flush();
+                std.process.exit(1);
+            };
+            try stdout.print("compacted {s}: {d} bytes, now {d}\n", .{ settings.storage.path, sizes.before, sizes.after });
         },
     }
     try stdout.flush();
+}
+
+fn loadOrExit(arena: std.mem.Allocator, io: Io, environment: *const std.process.Environ.Map, path: ?[]const u8, stderr: *Io.Writer) !Loaded {
+    return load(arena, io, environment, path) catch |err| switch (err) {
+        error.InvalidConfig => {
+            try stderr.flush();
+            std.process.exit(2);
+        },
+        else => return err,
+    };
+}
+
+fn copyFailure(err: easyrelay.lmdb.CopyError) []const u8 {
+    return switch (err) {
+        error.NoStore => "there is no store in storage.path; check the path, or start the relay once to create it",
+        error.Output => "the output could not be written; it must not already exist, and its directory must be writable",
+        error.InUse => "a relay is serving this store; stop it first",
+        error.OutOfMemory => "out of memory",
+        error.Backend => "LMDB refused the store; check that storage.map_size is at least the size it was created with",
+    };
+}
+
+const Report = struct {
+    out: *Io.Writer,
+    failed: bool = false,
+
+    fn line(self: *Report, comptime status: []const u8, topic: []const u8, comptime format: []const u8, args: anytype) !void {
+        if (comptime std.mem.eql(u8, status, "fail")) self.failed = true;
+        try self.out.print("{s: <5}{s: <15}" ++ format ++ "\n", .{ status, topic } ++ args);
+    }
+};
+
+/// Above these fractions of storage.map_size, doctor warns and then fails.
+const map_warn_ratio = 0.8;
+const map_fail_ratio = 0.95;
+
+fn doctor(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, environment: *const std.process.Environ.Map, config_path: ?[]const u8, stdout: *Io.Writer) !bool {
+    var report: Report = .{ .out = stdout };
+    const loaded = load(arena, io, environment, config_path) catch |err| switch (err) {
+        error.InvalidConfig => {
+            try report.line("fail", "configuration", "does not load; the reason is above", .{});
+            return false;
+        },
+        else => return err,
+    };
+    const settings = loaded.settings;
+    try report.line("ok", "configuration", "{s}", .{loaded.source});
+
+    const data_dir = settings.storage.path;
+    if (Io.Dir.cwd().openDir(io, data_dir, .{})) |opened| {
+        var dir = opened;
+        defer dir.close(io);
+        const probe = ".easyrelay-doctor";
+        if (dir.createFile(io, probe, .{})) |file| {
+            file.close(io);
+            dir.deleteFile(io, probe) catch {};
+            try report.line("ok", "data directory", "{s} is writable", .{data_dir});
+        } else |err| try report.line("fail", "data directory", "{s} is not writable ({t}); fix its ownership or permissions", .{ data_dir, err });
+    } else |err| switch (err) {
+        error.FileNotFound => try report.line("ok", "data directory", "{s} does not exist yet; the relay creates it on first start", .{data_dir}),
+        else => try report.line("fail", "data directory", "{s} cannot be opened ({t})", .{ data_dir, err }),
+    }
+
+    if (easyrelay.lmdb.inspect(gpa, io, data_dir, settings.storage.map_size)) |stats| {
+        const ratio = stats.used_ratio orelse 0;
+        const percent = ratio * 100;
+        if (ratio >= map_fail_ratio) {
+            try report.line("fail", "store", "{d} events, {d:.1}% of storage.map_size used; raise storage.map_size before writes fail", .{ stats.events, percent });
+        } else if (ratio >= map_warn_ratio) {
+            try report.line("warn", "store", "{d} events, {d:.1}% of storage.map_size used; plan to raise storage.map_size", .{ stats.events, percent });
+        } else {
+            try report.line("ok", "store", "{d} events, {d:.1}% of storage.map_size used", .{ stats.events, percent });
+        }
+    } else |err| switch (err) {
+        error.NoStore => try report.line("ok", "store", "none yet; created on first start", .{}),
+        else => try report.line("fail", "store", "cannot be read: {s}", .{copyFailure(err)}),
+    }
+    if (!settings.storage.durable) try report.line("warn", "durability", "storage.durable is false: a crash can lose recently accepted events", .{});
+
+    const network = settings.network;
+    if (isLoopback(network.address)) {
+        try report.line("ok", "network", "{s}:{d} is reachable from this machine only; a TLS reverse proxy in front makes it public", .{ network.address, network.port });
+    } else {
+        try report.line("warn", "network", "{s}:{d} accepts connections from other machines; easyrelay speaks plain ws, so TLS must come from a proxy in front", .{ network.address, network.port });
+        if (settings.metrics.enabled) try report.line("warn", "metrics", "{s} is served to anyone who can reach the relay; block it at the proxy", .{settings.metrics.path});
+    }
+    const address = std.Io.net.IpAddress.parse(network.address, network.port) catch {
+        try report.line("fail", "network", "network.address {s} is not an IP address", .{network.address});
+        return !report.failed;
+    };
+    if (easyrelay.listener.listen(address, 1)) |bound| {
+        var server = bound;
+        server.deinit(io);
+        try report.line("ok", "port", "{d} is free", .{network.port});
+    } else |err| switch (err) {
+        error.AddressInUse => try report.line("warn", "port", "{d} is in use; if that is not this relay already running, choose another network.port", .{network.port}),
+        else => try report.line("fail", "port", "cannot listen on {s}:{d} ({t})", .{ network.address, network.port, err }),
+    }
+    return !report.failed;
 }
 
 const Loaded = struct {
@@ -363,6 +515,18 @@ fn parsed(args: []const []const u8) Command {
     };
 }
 
+test "commands take their own options" {
+    try testing.expectEqual(@as(?[]const u8, null), parsed(&.{"doctor"}).doctor);
+    try testing.expectEqualStrings("relay.zon", parsed(&.{ "doctor", "--config", "relay.zon" }).doctor.?);
+    try testing.expectEqualStrings("relay.zon", parsed(&.{ "compact", "--config", "relay.zon" }).compact.?);
+    const backup = parsed(&.{ "backup", "--out", "copy.mdb", "--config", "relay.zon" }).backup;
+    try testing.expectEqualStrings("copy.mdb", backup.out);
+    try testing.expectEqualStrings("relay.zon", backup.config.?);
+    for ([_][]const []const u8{ &.{"backup"}, &.{ "backup", "--out" }, &.{ "doctor", "--out", "x" }, &.{ "init", "--config", "x" }, &.{ "--config", "x", "doctor" } }) |args| {
+        try testing.expect(parseArguments(args) == .wrong);
+    }
+}
+
 test "arguments select a command" {
     try testing.expectEqual(Command.help, parsed(&.{"-h"}));
     try testing.expectEqual(Command.help, parsed(&.{"--help"}));
@@ -380,7 +544,7 @@ test "anything else is a usage error" {
 }
 
 test "usage text names every command and flag" {
-    for ([_][]const u8{ "-h", "--help", "-V", "--version", "init", "--config" }) |flag| {
+    for ([_][]const u8{ "-h", "--help", "-V", "--version", "init", "doctor", "backup", "compact", "--config", "--out" }) |flag| {
         try testing.expect(std.mem.indexOf(u8, usage, flag) != null);
     }
 }

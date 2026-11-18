@@ -27,13 +27,15 @@ pub const Error = error{
 };
 
 pub const Options = struct {
-    map_size: usize = 10 * 1024 * 1024 * 1024,
+    map_size: usize = map_size_default,
     max_readers: u32 = 126,
     max_scan: usize = 100_000,
     durable: bool = true,
 };
 
 pub const subdirectory = "events";
+
+pub const map_size_default = 10 * 1024 * 1024 * 1024;
 
 const lock_file = "easyrelay.lock";
 
@@ -299,6 +301,73 @@ const Choice = union(enum) {
     }
 };
 
+pub const CopyError = error{
+    OutOfMemory,
+    /// The store directory or its data file does not exist.
+    NoStore,
+    /// The output exists, or cannot be created or written.
+    Output,
+    /// Another process holds the data directory.
+    InUse,
+    Backend,
+};
+
+const data_file = "data.mdb";
+const compacting_file = "data.mdb.compacting";
+
+/// Writes a compacted, consistent copy of the store to `out_path`, which must not exist. Takes no
+/// lock of its own, so it runs beside a serving relay; the copy is the store as of one read
+/// snapshot.
+pub fn backup(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, map_size: usize, out_path: []const u8) CopyError!void {
+    const path = try std.fs.path.joinZ(gpa, &.{ data_dir, subdirectory });
+    defer gpa.free(path);
+    try expectStore(gpa, io, path);
+
+    const env = lmdb.Environment.init(path, .{
+        .map_size = map_size,
+        .max_dbs = max_databases,
+        .read_only = true,
+        .no_tls = true,
+    }) catch return error.Backend;
+    defer env.deinit();
+    const out = std.Io.Dir.cwd().createFile(io, out_path, .{ .exclusive = true }) catch return error.Output;
+    defer out.close(io);
+    errdefer std.Io.Dir.cwd().deleteFile(io, out_path) catch {};
+    if (lmdb_c.mdb_env_copyfd2(env.ptr, out.handle, lmdb_c.MDB_CP_COMPACT) != 0) return error.Output;
+    out.sync(io) catch return error.Output;
+}
+
+/// Reads the store's statistics without its lock, beside a serving relay if there is one.
+pub fn inspect(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, map_size: usize) CopyError!Stats {
+    const path = try std.fs.path.joinZ(gpa, &.{ data_dir, subdirectory });
+    defer gpa.free(path);
+    try expectStore(gpa, io, path);
+    const env = lmdb.Environment.init(path, .{
+        .map_size = map_size,
+        .max_dbs = max_databases,
+        .read_only = true,
+        .no_tls = true,
+    }) catch return error.Backend;
+    defer env.deinit();
+    return environmentStats(env) catch error.Backend;
+}
+
+/// The file only grows, so the pages it reaches overstate what is in use: pages freed by a
+/// deletion are reused by later writes, once no snapshot can still read them.
+fn environmentStats(env: lmdb.Environment) Error!Stats {
+    var info: lmdb_c.MDB_envinfo = undefined;
+    if (lmdb_c.mdb_env_info(env.ptr, &info) != 0) return error.Backend;
+    const page_size = (env.stat() catch return error.Backend).psize;
+    const oldest = try oldestSnapshot(env, info.me_last_txnid);
+    const txn = lmdb.Transaction.init(env, .{ .mode = .ReadOnly }) catch return error.Backend;
+    defer txn.abort();
+    const events = (lmdb.Database.open(txn, events_db, .{}) catch return error.Backend).stat() catch return error.Backend;
+    const reached = info.me_last_pgno + 1;
+    const in_use = reached - @min(reached, try reusablePages(txn, oldest));
+    const used: f64 = @floatFromInt(in_use * page_size);
+    return .{ .events = events.entries, .used_ratio = used / @as(f64, @floatFromInt(info.me_mapsize)) };
+}
+
 /// The oldest transaction id a snapshot may still read: the last commit, or an older open reader,
 /// in this process or another. Read before the caller's own transaction begins, so that
 /// transaction does not hold back the answer.
@@ -337,6 +406,42 @@ fn reusablePages(txn: lmdb.Transaction, oldest: usize) Error!u64 {
         total += std.mem.readInt(usize, value[0..@sizeOf(usize)], native);
     }
     return total;
+}
+
+pub const Compacted = struct { before: u64, after: u64 };
+
+/// Rewrites the store without its free pages. Needs the relay stopped: it takes the same lock.
+pub fn compact(gpa: std.mem.Allocator, io: std.Io, data_dir: []const u8, options: Options) CopyError!Compacted {
+    const path = try std.fs.path.join(gpa, &.{ data_dir, subdirectory });
+    defer gpa.free(path);
+    try expectStore(gpa, io, path);
+    var store_dir = std.Io.Dir.cwd().openDir(io, path, .{}) catch return error.NoStore;
+    defer store_dir.close(io);
+    const before = (store_dir.statFile(io, data_file, .{}) catch return error.NoStore).size;
+
+    {
+        var opened = Lmdb.open(gpa, io, data_dir, options) catch |err| return switch (err) {
+            error.InUse => error.InUse,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.Backend,
+        };
+        defer opened.close();
+        const out = store_dir.createFile(io, compacting_file, .{}) catch return error.Output;
+        defer out.close(io);
+        errdefer store_dir.deleteFile(io, compacting_file) catch {};
+        if (lmdb_c.mdb_env_copyfd2(opened.env.ptr, out.handle, lmdb_c.MDB_CP_COMPACT) != 0) return error.Output;
+        out.sync(io) catch return error.Output;
+        // Renamed while the lock is still held, so no relay can open the old file meanwhile.
+        store_dir.rename(compacting_file, store_dir, data_file, io) catch return error.Output;
+    }
+    const after = (store_dir.statFile(io, data_file, .{}) catch return error.Backend).size;
+    return .{ .before = before, .after = after };
+}
+
+fn expectStore(gpa: std.mem.Allocator, io: std.Io, store_path: []const u8) CopyError!void {
+    const file = try std.fs.path.join(gpa, &.{ store_path, data_file });
+    defer gpa.free(file);
+    _ = std.Io.Dir.cwd().statFile(io, file, .{}) catch return error.NoStore;
 }
 
 pub const Lmdb = struct {
@@ -460,23 +565,10 @@ pub const Lmdb = struct {
         return self.stats() catch error.Backend;
     }
 
-    /// The file only grows, so the pages it reaches overstate what is in use: pages freed by a
-    /// deletion are reused by later writes, once no snapshot can still read them.
     fn stats(self: *Lmdb) Error!Stats {
-        var info: lmdb_c.MDB_envinfo = undefined;
-        if (lmdb_c.mdb_env_info(self.env.ptr, &info) != 0) return error.Backend;
-        const page_size = (self.env.stat() catch return error.Backend).psize;
-
         self.readers.waitUncancelable(self.io);
         defer self.readers.post(self.io);
-        const oldest = try oldestSnapshot(self.env, info.me_last_txnid);
-        const txn = lmdb.Transaction.init(self.env, .{ .mode = .ReadOnly }) catch return error.Backend;
-        defer txn.abort();
-        const events = (try database(txn, events_db)).stat() catch return error.Backend;
-        const reached = info.me_last_pgno + 1;
-        const in_use = reached - @min(reached, try reusablePages(txn, oldest));
-        const used: f64 = @floatFromInt(in_use * page_size);
-        return .{ .events = events.entries, .used_ratio = used / @as(f64, @floatFromInt(info.me_mapsize)) };
+        return environmentStats(self.env);
     }
 
     fn reapErased(ptr: *anyopaque, now: i64, max: usize) StoreError!usize {
@@ -1787,6 +1879,57 @@ test "a replaced event leaves no expiration entry behind" {
     var collector: Collector = .{};
     try fixture.backend.store().query(&.{.{}}, collector.sink());
     try testing.expectEqual(@as(u8, 2), collector.idAt(0));
+}
+
+// LMDB forbids opening one environment twice in a process; scripts/backup-restore.sh covers a serving relay.
+test "a backup reopens as a store with the same events, and never overwrites a file" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    {
+        var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+        defer backend.close();
+        for (0..5) |position| _ = try backend.store().put(&kindEvent(@intCast(position + 1), 1700000000, 1));
+    }
+
+    const out_path = try std.fs.path.join(testing.allocator, &.{ data_dir, "backup.mdb" });
+    defer testing.allocator.free(out_path);
+    try backup(testing.allocator, testing.io, data_dir, map_size_default, out_path);
+    try testing.expectError(error.Output, backup(testing.allocator, testing.io, data_dir, map_size_default, out_path));
+
+    const restored_dir = try std.fs.path.join(testing.allocator, &.{ data_dir, "restored" });
+    defer testing.allocator.free(restored_dir);
+    const restored_store = try std.fs.path.join(testing.allocator, &.{ restored_dir, subdirectory });
+    defer testing.allocator.free(restored_store);
+    try std.Io.Dir.cwd().createDirPath(testing.io, restored_store);
+    const restored_file = try std.fs.path.join(testing.allocator, &.{ restored_store, data_file });
+    defer testing.allocator.free(restored_file);
+    try std.Io.Dir.cwd().rename(out_path, std.Io.Dir.cwd(), restored_file, testing.io);
+
+    var restored = try Lmdb.open(testing.allocator, testing.io, restored_dir, .{});
+    defer restored.close();
+    try testing.expectEqual(@as(u64, 5), (try restored.store().stats()).events);
+    try testing.expectEqual(PutResult.stored, try restored.store().put(&kindEvent(9, 1700000000, 1)));
+}
+
+test "compaction keeps every event, and is refused while a relay holds the store" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buffer: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const data_dir = try tmpPath(&tmp, &path_buffer);
+    try testing.expectError(error.NoStore, compact(testing.allocator, testing.io, data_dir, .{}));
+    {
+        var backend = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+        defer backend.close();
+        for (0..50) |position| _ = try backend.store().put(&kindEvent(@intCast(position + 1), 1700000000, 1));
+        try testing.expectError(error.InUse, compact(testing.allocator, testing.io, data_dir, .{}));
+    }
+    const sizes = try compact(testing.allocator, testing.io, data_dir, .{});
+    try testing.expect(sizes.after <= sizes.before);
+    var reopened = try Lmdb.open(testing.allocator, testing.io, data_dir, .{});
+    defer reopened.close();
+    try testing.expectEqual(@as(u64, 50), (try reopened.store().stats()).events);
 }
 
 test "a store from before NIP-40 indexes its expiring events when it is opened" {

@@ -51,6 +51,7 @@ versions may contain breaking changes; they will always be listed under `Changed
 - Graceful shutdown on SIGTERM and SIGINT: connections close, queued events are committed.
 - Structured logs, JSON or text, with a number per connection; Prometheus metrics on
   `GET /metrics` and `GET /health`.
+- `easyrelay doctor`, `easyrelay backup` (online) and `easyrelay compact`.
 - Design documentation: architecture, protocol contract, storage model, NIP coverage,
   configuration reference, operations runbook, test strategy, and nine architecture decision
   records.

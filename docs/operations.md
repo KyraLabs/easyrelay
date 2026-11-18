@@ -48,7 +48,19 @@ easyrelay doctor --config ./easyrelay.zon    # validate config and environment b
 `easyrelay doctor` checks that the configuration parses and is internally consistent, that the
 data directory exists and is writable, how much map-size headroom remains, and whether the relay
 will be reachable from anywhere other than loopback. Run it after any configuration change and
-before restarting a relay people depend on.
+before restarting a relay people depend on. It reads the store without taking its lock, so it
+also runs beside a serving relay:
+
+```
+ok   configuration  /etc/easyrelay/easyrelay.zon
+ok   data directory /var/lib/easyrelay is writable
+ok   store          1204331 events, 41.7% of storage.map_size used
+ok   network        127.0.0.1:7777 is reachable from this machine only; a TLS reverse proxy in front makes it public
+warn port           7777 is in use; if that is not this relay already running, choose another network.port
+```
+
+A `fail` line exits with status 1; `warn` lines do not. The store fails past 95% of
+`storage.map_size` and warns past 80%.
 
 ## systemd unit
 
@@ -141,11 +153,21 @@ LMDB provides a consistent snapshot, so the data directory can be copied while t
 and while writes continue. The copy is crash-consistent as of the moment it started.
 
 ```bash
-# online backup
+# online backup, while the relay keeps serving
 easyrelay backup --config /etc/easyrelay/easyrelay.zon --out /backup/easyrelay-$(date -Iseconds).mdb
 ```
 
-To restore: stop the relay, replace the data directory contents with the backup, start it again.
+The backup is a single compacted file holding every event committed when it began. `--out` must
+not exist. The command reads the store without taking the relay's lock, so it runs beside it.
+
+To restore, with `storage.path` at `/var/lib/easyrelay`:
+
+```bash
+systemctl stop easyrelay
+cp /backup/easyrelay-<date>.mdb /var/lib/easyrelay/events/data.mdb
+chown easyrelay:easyrelay /var/lib/easyrelay/events/data.mdb
+systemctl start easyrelay
+```
 
 Test the restore path before needing it. A backup that has never been restored is a hypothesis.
 
@@ -160,6 +182,9 @@ systemctl stop easyrelay
 easyrelay compact --config /etc/easyrelay/easyrelay.zon
 systemctl start easyrelay
 ```
+
+`compact` refuses to run while a relay holds the store, and prints the file size before and
+after.
 
 Only worth doing after a retention policy change or a large expiration sweep. Routine
 compaction is unnecessary; LMDB reuses free pages on its own.
