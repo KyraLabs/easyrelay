@@ -15,11 +15,11 @@ Status values: `supported`, `in progress`, `planned`, `out of scope`.
 | [11](https://github.com/nostr-protocol/nips/blob/master/11.md) | Relay information document | supported | 2 | Served on `Accept: application/nostr+json`, with CORS. Generated from configuration and from this table. |
 | [13](https://github.com/nostr-protocol/nips/blob/master/13.md) | Proof of work | planned | 4 | Configurable minimum difficulty; validates the committed `nonce` tag, not just leading zeroes. |
 | [40](https://github.com/nostr-protocol/nips/blob/master/40.md) | Expiration timestamp | planned | 3 | Reaper plus query-time filtering. |
-| [42](https://github.com/nostr-protocol/nips/blob/master/42.md) | Authentication of clients | planned | 3 | Kind 22242 challenge/response; gates writes, reads, or both. |
+| [42](https://github.com/nostr-protocol/nips/blob/master/42.md) | Authentication of clients | supported | 3 | Kind 22242 challenge/response; gates writes, reads, or both (`policy.auth_required_for_*`). Conformance tests in `tests/conformance/nip42.zig`. |
 | [45](https://github.com/nostr-protocol/nips/blob/master/45.md) | Event counts | planned | 4 | Exact counts from index cursors, subject to the same scan budget as queries. |
 | [50](https://github.com/nostr-protocol/nips/blob/master/50.md) | Search capability | planned | 4 | Needs its own full-text index; the largest single item in Phase 4. |
 | [65](https://github.com/nostr-protocol/nips/blob/master/65.md) | Relay list metadata | planned | 2 | For a relay this is correct replaceable handling of kind 10002. No special-casing. |
-| [70](https://github.com/nostr-protocol/nips/blob/master/70.md) | Protected events | planned | 3 | The `-` tag; requires NIP-42, so it ships alongside it. |
+| [70](https://github.com/nostr-protocol/nips/blob/master/70.md) | Protected events | supported | 3 | The `-` tag: accepted only from a client authenticated as the author. Conformance tests in `tests/conformance/nip70.zig`. |
 | [77](https://github.com/nostr-protocol/nips/blob/master/77.md) | Negentropy syncing | planned | 5 | Set reconciliation, both initiator and responder. No Zig implementation exists; ported from the C++ reference. |
 | [86](https://github.com/nostr-protocol/nips/blob/master/86.md) | Relay management API | planned | 4 | Authenticated JSON-RPC over HTTP for operator actions. |
 

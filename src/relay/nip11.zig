@@ -89,9 +89,10 @@ fn renderDocument(arena: std.mem.Allocator, settings: config.Config) error{OutOf
             .created_at_lower_limit = limits.created_at_lower_limit_s,
             .created_at_upper_limit = limits.created_at_upper_limit_s,
             .min_pow_difficulty = 0,
-            .auth_required = false,
+            .auth_required = settings.policy.auth_required_for_read or settings.policy.auth_required_for_write,
             .payment_required = false,
-            .restricted_writes = settings.policy.allowed_pubkeys != null or settings.policy.allowed_kinds != null,
+            .restricted_writes = settings.policy.auth_required_for_write or settings.policy.allowed_pubkeys != null or
+                settings.policy.allowed_kinds != null,
         },
         .posting_policy = info.posting_policy,
         .privacy_policy = info.privacy_policy,
@@ -158,16 +159,18 @@ test "only a GET asking for nostr+json, or a preflight, is answered" {
     try testing.expect(responses.respond("garbage") == null);
 }
 
-test "allow lists are advertised in limitation" {
+test "authentication and allow lists are advertised in limitation" {
     var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
     const open = try std.json.parseFromSliceLeaky(std.json.Value, arena, try renderDocument(arena, .{}), .{});
+    try testing.expect(!open.object.get("limitation").?.object.get("auth_required").?.bool);
     try testing.expect(!open.object.get("limitation").?.object.get("restricted_writes").?.bool);
 
     const gated = try std.json.parseFromSliceLeaky(std.json.Value, arena, try renderDocument(arena, .{
-        .policy = .{ .allowed_kinds = &.{1} },
+        .policy = .{ .auth_required_for_read = true, .allowed_kinds = &.{1} },
     }), .{});
+    try testing.expect(gated.object.get("limitation").?.object.get("auth_required").?.bool);
     try testing.expect(gated.object.get("limitation").?.object.get("restricted_writes").?.bool);
 }

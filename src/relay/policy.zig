@@ -9,12 +9,16 @@ pub const Policy = struct {
     blocked_pubkeys: []const [32]u8 = &.{},
     allowed_kinds: ?[]const u16 = null,
     blocked_kinds: []const u16 = &.{},
+    auth_required_for_write: bool = false,
+    auth_required_for_read: bool = false,
 
     pub const Lists = struct {
         allowed_pubkeys: ?[]const []const u8 = null,
         blocked_pubkeys: []const []const u8 = &.{},
         allowed_kinds: ?[]const u16 = null,
         blocked_kinds: []const u16 = &.{},
+        auth_required_for_write: bool = false,
+        auth_required_for_read: bool = false,
     };
 
     /// Pubkeys are hex, already validated by the configuration. Everything is allocated in `arena`.
@@ -24,6 +28,8 @@ pub const Policy = struct {
             .blocked_pubkeys = try decodeSorted(arena, lists.blocked_pubkeys),
             .allowed_kinds = if (lists.allowed_kinds) |kinds| try sortedKinds(arena, kinds) else null,
             .blocked_kinds = try sortedKinds(arena, lists.blocked_kinds),
+            .auth_required_for_write = lists.auth_required_for_write,
+            .auth_required_for_read = lists.auth_required_for_read,
         };
     }
 

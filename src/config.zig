@@ -60,6 +60,8 @@ pub const Policy = struct {
     blocked_pubkeys: []const []const u8 = &.{},
     allowed_kinds: ?[]const u16 = null,
     blocked_kinds: []const u16 = &.{},
+    auth_required_for_write: bool = false,
+    auth_required_for_read: bool = false,
 };
 
 pub const Info = struct {
@@ -122,6 +124,8 @@ const descriptions = .{
         .blocked_pubkeys = "These authors may never publish. Hex pubkeys.",
         .allowed_kinds = "If set, only these kinds are accepted.",
         .blocked_kinds = "These kinds are always refused.",
+        .auth_required_for_write = "Require NIP-42 authentication before accepting events.",
+        .auth_required_for_read = "Require NIP-42 authentication before serving subscriptions.",
     },
     .info = .{
         .name = "Relay name in the NIP-11 document.",

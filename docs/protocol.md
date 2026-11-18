@@ -192,6 +192,39 @@ A kind-5 event is stored as a regular event and acts on its `e` and `a` tags:
 A target that is not stored when the request arrives is not remembered: without the event the
 relay cannot tell whether the request's author wrote it.
 
+## Authentication (NIP-42)
+
+Each connection gets its own challenge, 16 random bytes in hex. The relay sends
+`["AUTH", <challenge>]` when the connection opens if `policy.auth_required_for_write` or
+`policy.auth_required_for_read` is set, and otherwise just before the first `auth-required:` the
+connection would receive.
+
+A client answers with `["AUTH", <event>]`. The event is accepted, and its `pubkey` remembered for
+the rest of the connection, when all of these hold; otherwise it is answered with `OK` `false`
+and `invalid:`:
+
+- it passes the same validation as any event (id, signature, structural limits);
+- its kind is 22242;
+- its `created_at` is within ten minutes of now;
+- its `challenge` tag equals this connection's challenge;
+- its `relay` tag names the host the client connected to, compared with the request's `Host`
+  header ignoring scheme, path, case and a default port. A request without a `Host` header skips
+  this check; the per-connection challenge already prevents replay.
+
+A connection may authenticate as up to eight pubkeys; past that the oldest is forgotten. A kind
+22242 event sent with `EVENT` is refused with `invalid:` and never stored or broadcast.
+
+| Situation | Answer |
+| --- | --- |
+| `EVENT` while `auth_required_for_write` and unauthenticated | `OK` `false` with `auth-required:` |
+| `REQ` while `auth_required_for_read` and unauthenticated | `CLOSED` with `auth-required:` |
+
+## Protected events (NIP-70)
+
+An event carrying a `["-"]` tag is accepted only from a connection authenticated as its author.
+Unauthenticated, it is refused with `auth-required:`; authenticated as someone else, with
+`restricted:`.
+
 ## Structural limits
 
 Enforced before signature verification and advertised in NIP-11 `limitation`:

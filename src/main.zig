@@ -187,6 +187,8 @@ fn admissionPolicy(arena: std.mem.Allocator, settings: config.Config) !easyrelay
         .blocked_pubkeys = lists.blocked_pubkeys,
         .allowed_kinds = lists.allowed_kinds,
         .blocked_kinds = lists.blocked_kinds,
+        .auth_required_for_write = lists.auth_required_for_write,
+        .auth_required_for_read = lists.auth_required_for_read,
     });
 }
 

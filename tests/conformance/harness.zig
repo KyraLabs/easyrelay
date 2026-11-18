@@ -13,7 +13,16 @@ pub const Relay = struct {
     server: easyrelay.server.Server,
     listener: std.Thread,
 
+    pub const Options = struct {
+        limits: easyrelay.session.Limits = .{},
+        policy: easyrelay.policy.Policy = .{},
+    };
+
     pub fn start(gpa: std.mem.Allocator, limits: easyrelay.session.Limits) !*Relay {
+        return startWith(gpa, .{ .limits = limits });
+    }
+
+    pub fn startWith(gpa: std.mem.Allocator, options: Options) !*Relay {
         const self = try gpa.create(Relay);
         errdefer gpa.destroy(self);
 
@@ -44,7 +53,8 @@ pub const Relay = struct {
             .store = self.events.store(),
             .hub = &self.connections,
             .writer = &self.writer,
-            .limits = limits,
+            .limits = options.limits,
+            .policy = options.policy,
         };
         self.app = .{ .gpa = gpa, .shared = &self.shared };
         self.server = try easyrelay.server.init(gpa, &self.app, .{ .port = 0 });
@@ -79,6 +89,9 @@ pub const Client = struct {
     arena: std.heap.ArenaAllocator,
     socket: *easyrelay.client.Client,
 
+    /// The URL a client connected through the harness names in its `relay` tag.
+    pub const relay_url = "ws://127.0.0.1";
+
     pub fn connect(relay: *Relay) !Client {
         const socket = try easyrelay.client.Client.connect(relay.gpa, relay.io(), relay.port(), 2000);
         return .{ .arena = std.heap.ArenaAllocator.init(relay.gpa), .socket = socket };
@@ -107,6 +120,13 @@ pub const Client = struct {
 
     pub fn receiveJson(self: *Client) !std.json.Value {
         return std.json.parseFromSliceLeaky(std.json.Value, self.allocator(), try self.receive(), .{});
+    }
+
+    /// Sends `["AUTH", event]`.
+    pub fn sendAuth(self: *Client, event: nostr.event.Event) !void {
+        const encoded = try nostr.message.encodeEvent(self.allocator(), event);
+        std.debug.assert(std.mem.startsWith(u8, encoded, "[\"EVENT\","));
+        try self.send(try std.mem.concat(self.allocator(), u8, &.{ "[\"AUTH\",", encoded["[\"EVENT\",".len..] }));
     }
 
     /// Fails if anything arrives within `window_ms`.
@@ -144,6 +164,15 @@ pub const Author = struct {
         content: []const u8,
     ) !nostr.event.Event {
         return nostr.event.create(arena, self.signer, self.keypair, created_at, kind, tags, content, null);
+    }
+
+    /// A NIP-42 authentication event answering `challenge`, created now.
+    pub fn authEvent(self: Author, arena: std.mem.Allocator, io: std.Io, challenge: []const u8, relay_url: []const u8) !nostr.event.Event {
+        const now = std.Io.Timestamp.now(io, .real).toSeconds();
+        const tags = try arena.alloc(nostr.event.Tag, 2);
+        tags[0] = try arena.dupe([]const u8, &.{ "relay", relay_url });
+        tags[1] = try arena.dupe([]const u8, &.{ "challenge", challenge });
+        return self.event(arena, now, 22242, tags, "");
     }
 
     pub fn pubkeyHex(self: Author) [64]u8 {

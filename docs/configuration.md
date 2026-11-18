@@ -111,8 +111,8 @@ strict, and the key keeps anyone from choosing a pubkey that lands on another's 
 | `allowed_kinds` | ?[]u16 | `null` | If set, only these kinds are accepted. |
 | `blocked_kinds` | []u16 | `[]` | These kinds are always rejected. |
 | `min_pow_difficulty` | u8 | `0` | NIP-13 minimum leading zero bits. `0` disables. Phase 4. |
-| `auth_required_for_write` | bool | `false` | Require NIP-42 before accepting events. Phase 3, with NIP-42. |
-| `auth_required_for_read` | bool | `false` | Require NIP-42 before serving subscriptions. Phase 3, with NIP-42. |
+| `auth_required_for_write` | bool | `false` | Require NIP-42 before accepting events. |
+| `auth_required_for_read` | bool | `false` | Require NIP-42 before serving subscriptions. |
 | `plugin` | ?string | `null` | Path to an external write-policy executable. Phase 4. |
 
 An allow list and a deny list containing the same entry is a configuration error, not a

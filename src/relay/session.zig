@@ -66,13 +66,64 @@ pub const Context = struct {
     clock_ns: i96 = 0,
 };
 
+/// NIP-42.
+pub const auth_kind: u16 = 22242;
+/// How far an AUTH event's `created_at` may be from now.
+pub const auth_window_s: i64 = 600;
+
 /// What a session remembers about its connection between messages.
 pub const Peer = struct {
     /// Null means unlimited.
     rates: ?rate.Connection = null,
+    /// Hex of 16 random bytes.
+    challenge: [32]u8,
+    challenged: bool = false,
+    host_buffer: [256]u8 = undefined,
+    host_len: usize = 0,
+    authenticated: [max_authenticated][32]u8 = undefined,
+    authenticated_len: usize = 0,
 
-    pub fn init(rates: ?rate.Limits) Peer {
-        return .{ .rates = if (rates) |limits| .init(limits) else null };
+    pub const max_authenticated = 8;
+
+    /// `host_header` is the client's Host header; one too long to keep is treated as absent.
+    pub fn init(io: std.Io, rates: ?rate.Limits, host_header: ?[]const u8) Peer {
+        var nonce: [16]u8 = undefined;
+        io.randomSecure(&nonce) catch io.random(&nonce);
+        var peer: Peer = .{
+            .rates = if (rates) |limits| .init(limits) else null,
+            .challenge = std.fmt.bytesToHex(nonce, .lower),
+        };
+        if (host_header) |text| if (text.len <= peer.host_buffer.len) {
+            @memcpy(peer.host_buffer[0..text.len], text);
+            peer.host_len = text.len;
+        };
+        return peer;
+    }
+
+    pub fn host(self: *const Peer) []const u8 {
+        return self.host_buffer[0..self.host_len];
+    }
+
+    pub fn isAuthenticated(self: *const Peer) bool {
+        return self.authenticated_len != 0;
+    }
+
+    pub fn isAuthenticatedAs(self: *const Peer, pubkey: *const [32]u8) bool {
+        for (self.authenticated[0..self.authenticated_len]) |*known| {
+            if (std.mem.eql(u8, known, pubkey)) return true;
+        }
+        return false;
+    }
+
+    /// Past the bound, the oldest authentication is forgotten.
+    fn remember(self: *Peer, pubkey: *const [32]u8) void {
+        if (self.isAuthenticatedAs(pubkey)) return;
+        if (self.authenticated_len == max_authenticated) {
+            std.mem.copyForwards([32]u8, self.authenticated[0 .. max_authenticated - 1], self.authenticated[1..]);
+            self.authenticated_len -= 1;
+        }
+        self.authenticated[self.authenticated_len] = pubkey.*;
+        self.authenticated_len += 1;
     }
 };
 
@@ -80,8 +131,14 @@ pub const Session = struct {
     shared: *const Shared,
     responder: Responder,
     subscriber: *hub.Subscriber,
-    /// Null for a session with no connection behind it, which is unlimited.
+    /// Null for a session with no connection behind it: unlimited, and unable to authenticate.
     peer: ?*Peer = null,
+
+    /// Sent once, when the connection opens.
+    pub fn greet(self: *Session) Error!void {
+        const policy_requires = self.shared.policy.auth_required_for_read or self.shared.policy.auth_required_for_write;
+        if (policy_requires) try self.challenge();
+    }
 
     pub fn handle(self: *Session, context: Context, data: []const u8) Error!void {
         if (self.peer) |peer| if (peer.rates) |*rates| if (!rates.message(context.clock_ns)) return error.RateLimited;
@@ -105,6 +162,7 @@ pub const Session = struct {
 
         switch (message) {
             .event => |event| try self.publish(context, event, data.len),
+            .auth => |event| try self.authenticate(context, event, data.len),
             .req => |req| try self.subscribe(context, req),
             .close => |close| self.closeSubscription(close.subscription_id),
         }
@@ -147,6 +205,24 @@ pub const Session = struct {
                 .reason = "the relay ran out of memory validating this event",
             }),
         };
+        if (event.kind == auth_kind) return self.sendOk(.{
+            .event_id = event.id,
+            .accepted = false,
+            .prefix = .invalid,
+            .reason = "an authentication event is sent with AUTH, not EVENT",
+        });
+        if (self.shared.policy.auth_required_for_write and !self.isAuthenticated()) {
+            return self.refuseUnauthenticated(event.id, "this relay requires authentication to publish");
+        }
+        if (isProtected(&event)) {
+            if (!self.isAuthenticated()) return self.refuseUnauthenticated(event.id, "only its author may publish a protected event");
+            if (!self.peer.?.isAuthenticatedAs(&event.pubkey)) return self.sendOk(.{
+                .event_id = event.id,
+                .accepted = false,
+                .prefix = .restricted,
+                .reason = "only its author may publish a protected event",
+            });
+        }
         if (self.shared.policy.refusal(&event)) |reason| return self.sendOk(.{
             .event_id = event.id,
             .accepted = false,
@@ -199,11 +275,74 @@ pub const Session = struct {
     /// The stored phase runs without the subscriber's lock, which the writer thread takes to fan
     /// out; holding it while a slow client drains a large result would stall every write. Live
     /// events arriving meanwhile are held and sent after `EOSE`.
+    fn isAuthenticated(self: *const Session) bool {
+        const peer = self.peer orelse return false;
+        return peer.isAuthenticated();
+    }
+
+    /// NIP-42 asks for the challenge to precede the first `auth-required:` a client sees.
+    fn challenge(self: *Session) Error!void {
+        const peer = self.peer orelse return;
+        if (peer.challenged) return;
+        const writer = try self.responder.begin();
+        try codec.writeAuthChallenge(writer, &peer.challenge);
+        try self.responder.send();
+        peer.challenged = true;
+    }
+
+    fn refuseUnauthenticated(self: *Session, event_id: [32]u8, reason: []const u8) Error!void {
+        try self.challenge();
+        return self.sendOk(.{ .event_id = event_id, .accepted = false, .prefix = .auth_required, .reason = reason });
+    }
+
+    fn authenticate(self: *Session, context: Context, event: Event, serialized_length: usize) Error!void {
+        const peer = self.peer orelse return self.sendOk(.{
+            .event_id = event.id,
+            .accepted = false,
+            .prefix = .restricted,
+            .reason = "this connection cannot authenticate",
+        });
+        var diagnostics: validation.Diagnostics = .{};
+        const validator = validation.Validator{ .limits = self.shared.limits.event, .signer = context.signer };
+        validator.validate(context.arena, &event, serialized_length, context.now, &diagnostics) catch |err| switch (err) {
+            error.Invalid => return self.refuseAuth(event.id, diagnostics.message()),
+            error.OutOfMemory => return self.sendOk(.{
+                .event_id = event.id,
+                .accepted = false,
+                .prefix = .internal,
+                .reason = "the relay ran out of memory validating this event",
+            }),
+        };
+        if (event.kind != auth_kind) return self.refuseAuth(event.id, "an authentication event must be kind 22242");
+        if (@abs(event.created_at - context.now) > auth_window_s) {
+            return self.refuseAuth(event.id, "an authentication event must be created within ten minutes of now");
+        }
+        const answered = tagValue(&event, "challenge") orelse "";
+        if (!std.mem.eql(u8, answered, &peer.challenge)) {
+            return self.refuseAuth(event.id, "the authentication event does not answer this connection's challenge");
+        }
+        if (peer.host_len != 0) {
+            const relay = tagValue(&event, "relay") orelse "";
+            if (!sameRelay(relay, peer.host())) return self.refuseAuth(event.id, "the authentication event names a different relay");
+        }
+        peer.remember(&event.pubkey);
+        return self.sendOk(.{ .event_id = event.id, .accepted = true });
+    }
+
+    fn refuseAuth(self: *Session, event_id: [32]u8, reason: []const u8) Error!void {
+        return self.sendOk(.{ .event_id = event_id, .accepted = false, .prefix = .invalid, .reason = reason });
+    }
+
     fn subscribe(self: *Session, context: Context, req: codec.ClientMessage.Req) Error!void {
         if (self.peer) |peer| if (peer.rates) |*rates| if (!rates.subscription(context.clock_ns)) {
             self.closeSubscription(req.subscription_id);
             return self.sendClosed(req.subscription_id, .rate_limited, "this connection is opening subscriptions too fast");
         };
+        if (self.shared.policy.auth_required_for_read and !self.isAuthenticated()) {
+            self.closeSubscription(req.subscription_id);
+            try self.challenge();
+            return self.sendClosed(req.subscription_id, .auth_required, "this relay requires authentication to subscribe");
+        }
         const opened = opened: {
             self.subscriber.mutex.lockUncancelable(self.shared.io);
             defer self.subscriber.mutex.unlock(self.shared.io);
@@ -329,6 +468,42 @@ pub const Session = struct {
         try self.responder.send();
     }
 };
+
+/// NIP-70: a `["-"]` tag.
+fn isProtected(event: *const Event) bool {
+    for (event.tags) |tag| {
+        if (tag.len != 0 and std.mem.eql(u8, tag[0], "-")) return true;
+    }
+    return false;
+}
+
+fn tagValue(event: *const Event, name: []const u8) ?[]const u8 {
+    for (event.tags) |tag| {
+        if (tag.len >= 2 and std.mem.eql(u8, tag[0], name)) return tag[1];
+    }
+    return null;
+}
+
+/// Compares the authority of a `relay` tag's URL with the Host header the client connected with.
+/// Scheme, path, trailing slash and a default port are ignored, and so is case.
+fn sameRelay(url: []const u8, host: []const u8) bool {
+    var rest = url;
+    for ([_][]const u8{ "wss://", "ws://" }) |scheme| {
+        if (std.ascii.startsWithIgnoreCase(rest, scheme)) {
+            rest = rest[scheme.len..];
+            break;
+        }
+    }
+    const authority = rest[0 .. std.mem.indexOfAny(u8, rest, "/?#") orelse rest.len];
+    return std.ascii.eqlIgnoreCase(withoutDefaultPort(authority), withoutDefaultPort(host));
+}
+
+fn withoutDefaultPort(authority: []const u8) []const u8 {
+    for ([_][]const u8{ ":443", ":80" }) |port| {
+        if (std.mem.endsWith(u8, authority, port)) return authority[0 .. authority.len - port.len];
+    }
+    return authority;
+}
 
 const EventSink = struct {
     session: *Session,

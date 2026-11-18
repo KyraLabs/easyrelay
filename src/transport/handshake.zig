@@ -71,6 +71,19 @@ pub fn classify(request: []const u8) Kind {
     return .{ .upgrade = text[0..24].* };
 }
 
+/// The value of the first header named `name`, ignoring case, in a complete request.
+pub fn headerValue(request: []const u8, name: []const u8) ?[]const u8 {
+    const line_end = std.mem.indexOf(u8, request, "\r\n") orelse return null;
+    var headers = std.mem.splitSequence(u8, request[line_end + 2 ..], "\r\n");
+    while (headers.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, line[0..colon], " \t"), name)) {
+            return std.mem.trim(u8, line[colon + 1 ..], " \t");
+        }
+    }
+    return null;
+}
+
 fn hasToken(value: []const u8, token: []const u8) bool {
     var tokens = std.mem.splitScalar(u8, value, ',');
     while (tokens.next()) |candidate| {
@@ -167,4 +180,9 @@ test "any 24-character key is classified without crashing" {
             .plain, .bad_version => return error.TestUnexpectedResult,
         }
     }
+}
+
+test "a header is found by name regardless of case" {
+    try testing.expectEqualStrings("server.example.com", headerValue(upgrade_request, "host").?);
+    try testing.expectEqual(@as(?[]const u8, null), headerValue(upgrade_request, "origin"));
 }

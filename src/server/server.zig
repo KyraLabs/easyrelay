@@ -267,7 +267,16 @@ const Connection = struct {
         defer signer.deinit();
         var responder: Responder = .{ .connection = self, .message = .init(gpa) };
         defer responder.message.deinit();
-        var peer: session.Peer = .init(app.rates);
+        var peer: session.Peer = .init(io, app.rates, handshake.headerValue(request, "host"));
+        {
+            var opening: session.Session = .{
+                .shared = app.shared,
+                .responder = responder.interface(),
+                .subscriber = &self.subscriber,
+                .peer = &peer,
+            };
+            opening.greet() catch return;
+        }
 
         var last_heard = std.Io.Timestamp.now(io, .awake);
         while (true) {
