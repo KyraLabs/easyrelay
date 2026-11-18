@@ -194,8 +194,48 @@ fn isLoopback(address: []const u8) bool {
     return std.mem.startsWith(u8, address, "127.") or std.mem.eql(u8, address, "::1") or std.mem.eql(u8, address, "localhost");
 }
 
+/// SIGTERM and SIGINT are blocked in every thread and taken by one thread with `sigwait`, so the
+/// shutdown runs as ordinary code rather than inside a signal handler.
+const Shutdown = struct {
+    signals: std.posix.sigset_t,
+    thread: ?std.Thread = null,
+
+    /// Before any other thread starts, so each inherits the mask.
+    fn block() Shutdown {
+        var signals = std.posix.sigemptyset();
+        std.posix.sigaddset(&signals, .TERM);
+        std.posix.sigaddset(&signals, .INT);
+        std.posix.sigprocmask(std.posix.SIG.BLOCK, &signals, null);
+        return .{ .signals = signals };
+    }
+
+    fn watch(self: *Shutdown, relay: *easyrelay.server.Server) !void {
+        self.thread = try std.Thread.spawn(.{}, wait, .{ self, relay });
+    }
+
+    fn wait(self: *Shutdown, relay: *easyrelay.server.Server) void {
+        var received: c_int = 0;
+        if (std.c.sigwait(&self.signals, &received) == 0) {
+            log.info("signal {d} received: closing connections, then committing queued events", .{received});
+        }
+        relay.stop();
+    }
+
+    /// Releases the watcher if the relay stopped for another reason, so it is never left holding a
+    /// pointer to a relay that is gone.
+    fn finish(self: *Shutdown) void {
+        const thread = self.thread orelse return;
+        _ = std.c.kill(std.c.getpid(), .TERM);
+        thread.join();
+        self.thread = null;
+    }
+};
+
+const log = std.log.scoped(.main);
+
 fn serve(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, loaded: Loaded, stdout: *Io.Writer, stderr: *Io.Writer) !void {
     const settings = loaded.settings;
+    var shutdown = Shutdown.block();
     var events = easyrelay.lmdb.Lmdb.open(gpa, io, settings.storage.path, storeOptions(settings)) catch |err| {
         if (err == error.InUse) {
             try stderr.print("error: another easyrelay is already serving {s}. Stop it, or point storage.path elsewhere\n", .{settings.storage.path});
@@ -253,6 +293,8 @@ fn serve(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, loaded: Loade
     }
     try stdout.flush();
 
+    try shutdown.watch(&relay);
+    defer shutdown.finish();
     try relay.listen();
 }
 
