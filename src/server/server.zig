@@ -8,6 +8,7 @@ const listener = @import("../transport/listener.zig");
 const socket = @import("../transport/socket.zig");
 const hub = @import("../relay/hub.zig");
 const nip11 = @import("../relay/nip11.zig");
+const rate = @import("../relay/rate.zig");
 const session = @import("../relay/session.zig");
 const subscriptions = @import("../relay/subscriptions.zig");
 
@@ -18,6 +19,8 @@ pub const App = struct {
     shared: *const session.Shared,
     live: std.atomic.Value(usize) = .init(0),
     information: ?*const nip11.Responses = null,
+    /// Per-connection budgets; null leaves connections unlimited.
+    rates: ?rate.Limits = null,
 };
 
 pub const Options = struct {
@@ -264,6 +267,7 @@ const Connection = struct {
         defer signer.deinit();
         var responder: Responder = .{ .connection = self, .message = .init(gpa) };
         defer responder.message.deinit();
+        var peer: session.Peer = .init(app.rates);
 
         var last_heard = std.Io.Timestamp.now(io, .awake);
         while (true) {
@@ -294,12 +298,20 @@ const Connection = struct {
                         .shared = app.shared,
                         .responder = responder.interface(),
                         .subscriber = &self.subscriber,
+                        .peer = &peer,
                     };
-                    try current.handle(.{
+                    current.handle(.{
                         .arena = arena.allocator(),
                         .signer = signer,
                         .now = std.Io.Timestamp.now(io, .real).toSeconds(),
-                    }, text);
+                        .clock_ns = std.Io.Timestamp.now(io, .awake).nanoseconds,
+                    }, text) catch |err| switch (err) {
+                        error.RateLimited => {
+                            log.info("closing a connection that sent messages faster than rate_limit.messages_per_second", .{});
+                            return self.sendClose(.policy_violation);
+                        },
+                        else => |other| return other,
+                    };
                 },
                 .binary => return self.sendClose(.unsupported_data),
                 .ping => |payload| try self.sendFrame(.pong, payload),
@@ -602,6 +614,22 @@ test "a subscriber that stops reading is disconnected without slowing a publishe
     try testing.expectEqual(@as(usize, 1), fixture.connections.count());
 }
 
+test "a connection over its message rate is closed with policy violation" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{}, null);
+    fixture.app.rates = .{ .messages = .{ .per_second = 0.001, .burst = 2 } };
+    defer fixture.stop();
+    const client = try Client.connect(testing.allocator, fixture.threaded.io(), fixture.port(), 2000);
+    defer client.close();
+
+    for (0..2) |_| {
+        try client.send("[\"CLOSE\",\"nothing\"]");
+    }
+    try client.send("[\"REQ\",\"s\",{}]");
+    const closed = (try client.receiveMessage()).close;
+    try testing.expectEqual(@as(?u16, @intFromEnum(frame.CloseCode.policy_violation)), closed.code);
+}
+
 test "a quiet connection is pinged, and one that stays silent is closed as idle" {
     var fixture: Fixture = undefined;
     try fixture.start(.{ .ping_interval_ms = 100, .idle_timeout_ms = 350 }, null);
@@ -772,4 +800,56 @@ test "a ping flood is answered without disturbing other connections" {
     defer bystander.close();
     try bystander.send("[\"REQ\",\"s\",{}]");
     try testing.expectEqualStrings("[\"EOSE\",\"s\"]", try bystander.receive());
+}
+
+test "a connection flooding events is limited while a well-behaved one is served promptly" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{}, null);
+    defer fixture.stop();
+    fixture.app.rates = .{};
+    const io = fixture.threaded.io();
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const watcher = try Client.connect(testing.allocator, io, fixture.port(), 2000);
+    defer watcher.close();
+    try watcher.send("[\"REQ\",\"bystander\",{\"kinds\":[1],\"#t\":[\"bystander\"]}]");
+    try testing.expectEqualStrings("[\"EOSE\",\"bystander\"]", try watcher.receive());
+
+    var flood: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer flood.deinit();
+    var signer = nostr.keys.Signer.init();
+    defer signer.deinit();
+    const flooder_key = try signer.keyPairFromSecretKey([_]u8{20} ** 32);
+    const now = std.Io.Timestamp.now(io, .real).toSeconds();
+    for (0..90) |position| {
+        const content = try std.fmt.allocPrint(arena, "flood {d}", .{position});
+        const event = try nostr.event.create(arena, signer, flooder_key, now, 1, &.{}, content, null);
+        try frame.writeFrame(&flood.writer, .text, try nostr.message.encodeEvent(arena, event), .{ 1, 2, 3, 4 });
+    }
+    const flooder = try Client.connect(testing.allocator, io, fixture.port(), 2000);
+    defer flooder.close();
+    try flooder.sendRaw(flood.written());
+
+    const bystander = try Client.connect(testing.allocator, io, fixture.port(), 2000);
+    defer bystander.close();
+    const bystander_key = try signer.keyPairFromSecretKey([_]u8{21} ** 32);
+    var slowest_ms: i64 = 0;
+    for (0..10) |position| {
+        const content = try std.fmt.allocPrint(arena, "bystander {d}", .{position});
+        const event = try nostr.event.create(arena, signer, bystander_key, now, 1, &.{&.{ "t", "bystander" }}, content, null);
+        const sent = std.Io.Timestamp.now(io, .awake);
+        try bystander.send(try nostr.message.encodeEvent(arena, event));
+        try testing.expect(std.mem.indexOf(u8, try bystander.receive(), ",true,") != null);
+        slowest_ms = @max(slowest_ms, sent.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds());
+    }
+    try testing.expect(slowest_ms < 250);
+    for (0..10) |_| try testing.expect(std.mem.indexOf(u8, try watcher.receive(), "bystander") != null);
+
+    var limited: usize = 0;
+    for (0..90) |_| {
+        if (std.mem.indexOf(u8, try flooder.receive(), "rate-limited:") != null) limited += 1;
+    }
+    try testing.expect(limited >= 90 - 50);
 }

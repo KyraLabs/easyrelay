@@ -40,6 +40,7 @@ versions may contain breaking changes; they will always be listed under `Changed
 - Continuous integration: formatting gate, toolchain-pin consistency check, native tests on
   Linux and macOS, and cross-compilation of every published release target.
 - Release automation producing static Linux binaries and macOS binaries with checksums.
+- Rate limits per connection (events, messages, `REQ`s) and per author, all configurable.
 - Backpressure: a client that does not read what it subscribed to is disconnected at
   `network.write_buffer_limit` instead of stalling other clients; pings and an idle timeout.
 - Graceful shutdown on SIGTERM and SIGINT: connections close, queued events are committed.

@@ -170,6 +170,20 @@ fn sessionLimits(settings: config.Config) easyrelay.session.Limits {
     };
 }
 
+fn rateLimits(settings: config.Config) easyrelay.rate.Limits {
+    const limits = settings.rate_limit;
+    return .{
+        .events = rule(limits.events_per_second, limits.events_burst),
+        .messages = rule(limits.messages_per_second, limits.messages_burst),
+        .subscriptions = rule(if (limits.subscriptions_per_minute) |per_minute| per_minute / 60 else null, limits.subscriptions_burst),
+        .author_events = rule(limits.author_events_per_second, limits.author_events_burst),
+    };
+}
+
+fn rule(per_second: ?f64, burst: usize) ?easyrelay.rate.Rule {
+    return .{ .per_second = per_second orelse return null, .burst = burst };
+}
+
 fn serverOptions(settings: config.Config) easyrelay.server.Options {
     return .{
         .address = settings.network.address,
@@ -261,15 +275,20 @@ fn serve(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, loaded: Loade
     try writer.start();
     defer writer.stop();
 
+    const rates = rateLimits(settings);
+    var authors: ?easyrelay.rate.Authors = if (rates.author_events) |author_rule| try .init(gpa, io, author_rule) else null;
+    defer if (authors) |*present| present.deinit(gpa);
+
     const shared: easyrelay.session.Shared = .{
         .io = io,
         .store = events.store(),
         .hub = &connections,
         .writer = &writer,
         .limits = sessionLimits(settings),
+        .authors = if (authors) |*present| present else null,
     };
     const information = try easyrelay.nip11.Responses.render(arena, settings);
-    var app: easyrelay.server.App = .{ .gpa = gpa, .shared = &shared, .information = &information };
+    var app: easyrelay.server.App = .{ .gpa = gpa, .shared = &shared, .information = &information, .rates = rates };
 
     const options = serverOptions(settings);
     var relay = easyrelay.server.init(gpa, &app, options) catch |err| {
@@ -342,4 +361,15 @@ test "loopback addresses are recognised" {
     try testing.expect(isLoopback("127.0.0.1"));
     try testing.expect(isLoopback("::1"));
     try testing.expect(!isLoopback("0.0.0.0"));
+}
+
+test "rate limits follow the settings, and null disables a bucket" {
+    var settings: config.Config = .{};
+    settings.rate_limit.subscriptions_per_minute = 120;
+    settings.rate_limit.events_per_second = null;
+    const limits = rateLimits(settings);
+    try testing.expectEqual(@as(?easyrelay.rate.Rule, null), limits.events);
+    try testing.expectEqual(@as(f64, 2), limits.subscriptions.?.per_second);
+    try testing.expectEqual(@as(usize, 20), limits.subscriptions.?.burst);
+    try testing.expectEqual(@as(f64, 50), limits.messages.?.per_second);
 }

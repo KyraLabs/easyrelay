@@ -22,6 +22,7 @@ pub const CloseCode = enum(u16) {
     protocol_error = 1002,
     unsupported_data = 1003,
     invalid_payload = 1007,
+    policy_violation = 1008,
     too_big = 1009,
     internal_error = 1011,
     _,

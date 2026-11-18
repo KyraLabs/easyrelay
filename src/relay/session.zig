@@ -3,6 +3,7 @@ const nostr = @import("nostr");
 
 const codec = @import("codec.zig");
 const hub = @import("hub.zig");
+const rate = @import("rate.zig");
 const subscriptions = @import("subscriptions.zig");
 const validation = @import("validation.zig");
 const write_queue = @import("writer.zig");
@@ -31,7 +32,11 @@ pub const Responder = struct {
     }
 };
 
-pub const Error = Responder.Error || error{OutOfMemory};
+pub const Error = Responder.Error || error{
+    OutOfMemory,
+    /// The connection sent messages faster than `rate.Limits.messages` allows; close it.
+    RateLimited,
+};
 
 pub const Limits = struct {
     event: validation.Limits = .{},
@@ -46,20 +51,39 @@ pub const Shared = struct {
     /// When set, events are committed on the writer thread, which sends their `OK`.
     writer: ?*write_queue.Writer = null,
     limits: Limits = .{},
+    /// Per-author publishing budgets, charged only once a signature has verified.
+    authors: ?*rate.Authors = null,
 };
 
 pub const Context = struct {
     arena: std.mem.Allocator,
     signer: nostr.keys.Signer,
+    /// Wall-clock seconds, for `created_at` checks.
     now: i64,
+    /// Monotonic nanoseconds, for rate limits.
+    clock_ns: i96 = 0,
+};
+
+/// What a session remembers about its connection between messages.
+pub const Peer = struct {
+    /// Null means unlimited.
+    rates: ?rate.Connection = null,
+
+    pub fn init(rates: ?rate.Limits) Peer {
+        return .{ .rates = if (rates) |limits| .init(limits) else null };
+    }
 };
 
 pub const Session = struct {
     shared: *const Shared,
     responder: Responder,
     subscriber: *hub.Subscriber,
+    /// Null for a session with no connection behind it, which is unlimited.
+    peer: ?*Peer = null,
 
     pub fn handle(self: *Session, context: Context, data: []const u8) Error!void {
+        if (self.peer) |peer| if (peer.rates) |*rates| if (!rates.message(context.clock_ns)) return error.RateLimited;
+
         var diagnostics: codec.Diagnostics = .{};
         const message = codec.decode(
             context.arena,
@@ -90,6 +114,12 @@ pub const Session = struct {
         event: Event,
         serialized_length: usize,
     ) Error!void {
+        if (self.peer) |peer| if (peer.rates) |*rates| if (!rates.event(context.clock_ns)) return self.sendOk(.{
+            .event_id = event.id,
+            .accepted = false,
+            .prefix = .rate_limited,
+            .reason = "this connection is publishing too fast",
+        });
         var diagnostics: validation.Diagnostics = .{};
         const validator = validation.Validator{
             .limits = self.shared.limits.event,
@@ -115,6 +145,12 @@ pub const Session = struct {
                 .reason = "the relay ran out of memory validating this event",
             }),
         };
+        if (self.shared.authors) |authors| if (!authors.take(&event.pubkey, context.clock_ns)) return self.sendOk(.{
+            .event_id = event.id,
+            .accepted = false,
+            .prefix = .rate_limited,
+            .reason = "this author is publishing too fast",
+        });
 
         if (kinds.classify(event.kind) == .ephemeral) {
             self.shared.hub.broadcast(context.arena, &event, null);
@@ -156,6 +192,10 @@ pub const Session = struct {
     /// out; holding it while a slow client drains a large result would stall every write. Live
     /// events arriving meanwhile are held and sent after `EOSE`.
     fn subscribe(self: *Session, context: Context, req: codec.ClientMessage.Req) Error!void {
+        if (self.peer) |peer| if (peer.rates) |*rates| if (!rates.subscription(context.clock_ns)) {
+            self.closeSubscription(req.subscription_id);
+            return self.sendClosed(req.subscription_id, .rate_limited, "this connection is opening subscriptions too fast");
+        };
         const opened = opened: {
             self.subscriber.mutex.lockUncancelable(self.shared.io);
             defer self.subscriber.mutex.unlock(self.shared.io);

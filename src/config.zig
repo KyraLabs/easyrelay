@@ -43,6 +43,14 @@ pub const Limits = struct {
 };
 
 pub const RateLimit = struct {
+    events_per_second: ?f64 = 10,
+    events_burst: usize = 50,
+    messages_per_second: ?f64 = 50,
+    messages_burst: usize = 100,
+    subscriptions_per_minute: ?f64 = 60,
+    subscriptions_burst: usize = 20,
+    author_events_per_second: ?f64 = 10,
+    author_events_burst: usize = 50,
     write_queue_depth: usize = 4096,
 };
 
@@ -91,6 +99,14 @@ const descriptions = .{
         .created_at_lower_limit_s = "Seconds into the past an event may claim. `null` disables the check.",
     },
     .rate_limit = .{
+        .events_per_second = "Sustained events per connection; more are refused with rate-limited:. `null` disables.",
+        .events_burst = "Events a connection may send at once before events_per_second applies.",
+        .messages_per_second = "Sustained messages of any type per connection; a connection above it is closed. `null` disables.",
+        .messages_burst = "Messages a connection may send at once before messages_per_second applies.",
+        .subscriptions_per_minute = "Sustained REQs per connection; more are refused with rate-limited:. `null` disables.",
+        .subscriptions_burst = "REQs a connection may send at once before subscriptions_per_minute applies.",
+        .author_events_per_second = "Sustained events per author across all connections, counted after the signature verifies. `null` disables.",
+        .author_events_burst = "Events an author may publish at once before author_events_per_second applies.",
         .write_queue_depth = "Pending writes before events are refused with rate-limited:.",
     },
     .info = .{
@@ -183,6 +199,7 @@ fn parseValue(comptime T: type, arena: std.mem.Allocator, text: []const u8) erro
             return null;
         },
         .int => return std.fmt.parseInt(T, text, 10) catch null,
+        .float => return std.fmt.parseFloat(T, text) catch null,
         .pointer => |pointer| {
             if (pointer.child == u8) return try arena.dupe(u8, text);
             var items: std.ArrayList([]const u8) = .empty;
@@ -202,6 +219,7 @@ fn describeType(comptime T: type) []const u8 {
         .optional => |optional| describeType(optional.child) ++ " or null",
         .bool => "true or false",
         .int => "an integer in range for " ++ @typeName(T),
+        .float => "a number",
         .pointer => |pointer| if (pointer.child == u8) "a string" else "a comma-separated list",
         else => @typeName(T),
     };
@@ -230,6 +248,14 @@ pub fn validate(config: Config, diagnostics: *Diagnostics) error{InvalidConfig}!
     if (config.storage.map_size < 1024 * 1024) return diagnostics.fail("storage.map_size is {d} bytes; it must be at least 1048576 (1 MiB)", .{config.storage.map_size});
     if (config.storage.max_scan == 0) return diagnostics.fail("storage.max_scan must be at least 1", .{});
     if (config.rate_limit.write_queue_depth == 0) return diagnostics.fail("rate_limit.write_queue_depth must be at least 1", .{});
+    inline for (.{ "events_per_second", "messages_per_second", "subscriptions_per_minute", "author_events_per_second" }) |name| {
+        if (@field(config.rate_limit, name)) |value| if (!(value > 0) or std.math.isInf(value)) {
+            return diagnostics.fail("rate_limit." ++ name ++ " must be a positive number, or null to disable it", .{});
+        };
+    }
+    inline for (.{ "events_burst", "messages_burst", "subscriptions_burst", "author_events_burst" }) |name| {
+        if (@field(config.rate_limit, name) == 0) return diagnostics.fail("rate_limit." ++ name ++ " must be at least 1", .{});
+    }
     inline for (.{ "max_event_size", "max_message_size", "max_subscriptions", "max_filters", "max_limit", "max_subid_length" }) |name| {
         if (@field(limits, name) == 0) return diagnostics.fail("limits." ++ name ++ " must be at least 1", .{});
     }
@@ -282,6 +308,12 @@ fn writeValue(writer: *std.Io.Writer, value: anytype) std.Io.Writer.Error!void {
     switch (@typeInfo(T)) {
         .optional => if (value) |present| try writeValue(writer, present) else try writer.writeAll("null"),
         .bool, .int => try writer.print("{}", .{value}),
+        .float => {
+            var buffer: [64]u8 = undefined;
+            const text = std.fmt.bufPrint(&buffer, "{d}", .{value}) catch unreachable;
+            try writer.writeAll(text);
+            if (std.mem.indexOfAny(u8, text, ".en") == null) try writer.writeAll(".0");
+        },
         .pointer => |pointer| {
             if (pointer.child == u8) return writer.print("\"{f}\"", .{std.zig.fmtString(value)});
             try writer.writeAll(".{");
@@ -397,6 +429,10 @@ test "every validation error names the setting it is about" {
         .{ .config = .{ .network = .{ .idle_timeout_s = 5_000_000 } }, .key = "network.idle_timeout_s" },
         .{ .config = .{ .network = .{ .write_buffer_limit = 1000 } }, .key = "network.write_buffer_limit" },
         .{ .config = .{ .rate_limit = .{ .write_queue_depth = 0 } }, .key = "rate_limit.write_queue_depth" },
+        .{ .config = .{ .rate_limit = .{ .events_per_second = 0 } }, .key = "rate_limit.events_per_second" },
+        .{ .config = .{ .rate_limit = .{ .messages_per_second = -1 } }, .key = "rate_limit.messages_per_second" },
+        .{ .config = .{ .rate_limit = .{ .author_events_per_second = std.math.nan(f64) } }, .key = "rate_limit.author_events_per_second" },
+        .{ .config = .{ .rate_limit = .{ .subscriptions_burst = 0 } }, .key = "rate_limit.subscriptions_burst" },
         .{ .config = .{ .limits = .{ .max_filters = 0 } }, .key = "limits.max_filters" },
         .{ .config = .{ .limits = .{ .default_limit = 9000 } }, .key = "limits.default_limit" },
         .{ .config = .{ .limits = .{ .max_message_size = 1000 } }, .key = "limits.max_event_size" },

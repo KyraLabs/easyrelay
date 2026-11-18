@@ -209,7 +209,19 @@ Enforced before signature verification and advertised in NIP-11 `limitation`:
 
 All are configurable; see [configuration.md](configuration.md).
 
-## Backpressure
+## Rate limits and backpressure
+
+Per connection, token buckets bound events, `REQ`s and messages of any type; per author, a bucket
+shared by every connection bounds events. All are configurable in
+[configuration.md](configuration.md#rate_limit).
+
+| Exceeded | Answer |
+| --- | --- |
+| Events per connection | `OK` `false` with `rate-limited:`, before the signature is checked |
+| Events per author | `OK` `false` with `rate-limited:`, after the signature verifies |
+| `REQ`s per connection | `CLOSED` with `rate-limited:` |
+| Messages per connection | The connection is closed with WebSocket close code 1008 |
+| The write queue | `OK` `false` with `rate-limited:` |
 
 A connection that does not read what it subscribed to is closed once its pending outbound bytes
 pass `network.write_buffer_limit`, or once a write to it makes no progress for

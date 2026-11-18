@@ -81,15 +81,24 @@ Defaults match [protocol.md](protocol.md#structural-limits) and are published in
 
 ## `rate_limit`
 
-Token buckets. `null` on any bucket disables it.
+Token buckets: each `*_per_second` (or `*_per_minute`) is the sustained rate and each `*_burst`
+how many may arrive at once on top of it. `null` on a rate disables that bucket.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `events_per_second` | ?f64 | `10` | Sustained accepted-event rate per connection. Phase 3. |
-| `events_burst` | usize | `50` | Burst allowance. Phase 3. |
-| `messages_per_second` | ?f64 | `50` | Sustained inbound message rate per connection, of any type. Phase 3. |
-| `subscriptions_per_minute` | ?f64 | `60` | `REQ` rate per connection. Phase 3. |
+| `events_per_second` | ?f64 | `10` | Sustained events per connection. Over it, `OK` `false` with `rate-limited:`, before the signature is checked. |
+| `events_burst` | usize | `50` | Burst allowance for `events_per_second`. |
+| `messages_per_second` | ?f64 | `50` | Sustained inbound messages of any type per connection. Over it, the connection is closed with code 1008. |
+| `messages_burst` | usize | `100` | Burst allowance for `messages_per_second`. |
+| `subscriptions_per_minute` | ?f64 | `60` | Sustained `REQ` rate per connection. Over it, `CLOSED` with `rate-limited:`. |
+| `subscriptions_burst` | usize | `20` | Burst allowance for `subscriptions_per_minute`. |
+| `author_events_per_second` | ?f64 | `10` | Sustained events per author, across every connection. Charged only after the signature verifies, so nobody can spend another author's budget. |
+| `author_events_burst` | usize | `50` | Burst allowance for `author_events_per_second`. |
 | `write_queue_depth` | usize | `4096` | Pending writes before events are refused with `rate-limited:`. |
+
+Authors are tracked in a fixed table of 4096 slots, hashed with a key chosen at startup, so memory
+does not grow with the number of authors. Two authors sharing a slot share a budget; that errs
+strict, and the key keeps anyone from choosing a pubkey that lands on another's slot.
 
 ## `policy`
 
