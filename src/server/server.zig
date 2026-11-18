@@ -661,3 +661,115 @@ test "a client stalling in the middle of a frame is closed at the next timeout" 
     };
     try testing.expect(ended == error.Closed);
 }
+
+fn writeFragment(writer: *std.Io.Writer, opcode: frame.Opcode, fin: bool, payload: []const u8, mask: ?[4]u8) !void {
+    std.debug.assert(payload.len < 126);
+    try writer.writeByte((if (fin) @as(u8, 0x80) else 0) | @as(u8, @intFromEnum(opcode)));
+    try writer.writeByte((if (mask != null) @as(u8, 0x80) else 0) | @as(u8, @intCast(payload.len)));
+    const key = mask orelse return writer.writeAll(payload);
+    try writer.writeAll(&key);
+    for (payload, 0..) |byte, position| try writer.writeByte(byte ^ key[position % 4]);
+}
+
+fn expectClosedWith(client: *Client, code: frame.CloseCode) !void {
+    const closed = (try client.receiveMessage()).close;
+    try testing.expectEqual(@as(?u16, @intFromEnum(code)), closed.code);
+}
+
+test "a message in a thousand one-byte fragments is assembled" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{}, null);
+    defer fixture.stop();
+    const client = try Client.connect(testing.allocator, fixture.threaded.io(), fixture.port(), 2000);
+    defer client.close();
+
+    const message = "[\"REQ\",\"s\",{}" ++ " " ** 985 ++ "]";
+    var bytes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer bytes.deinit();
+    for (message, 0..) |byte, position| {
+        const opcode: frame.Opcode = if (position == 0) .text else .continuation;
+        try writeFragment(&bytes.writer, opcode, position == message.len - 1, &.{byte}, .{ 9, 8, 7, 6 });
+    }
+    try client.sendRaw(bytes.written());
+    try testing.expectEqualStrings("[\"EOSE\",\"s\"]", try client.receive());
+}
+
+test "fragments that add up past the message limit close the connection as too big" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{ .max_message_size = 256 }, null);
+    defer fixture.stop();
+    const client = try Client.connect(testing.allocator, fixture.threaded.io(), fixture.port(), 2000);
+    defer client.close();
+
+    var bytes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer bytes.deinit();
+    try writeFragment(&bytes.writer, .text, false, "x" ** 100, .{ 1, 2, 3, 4 });
+    for (0..10) |_| try writeFragment(&bytes.writer, .continuation, false, "x" ** 100, .{ 1, 2, 3, 4 });
+    client.sendRaw(bytes.written()) catch {};
+    try expectClosedWith(client, .too_big);
+}
+
+test "a new message started inside a fragmented one is a protocol error" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{}, null);
+    defer fixture.stop();
+    const client = try Client.connect(testing.allocator, fixture.threaded.io(), fixture.port(), 2000);
+    defer client.close();
+
+    var bytes: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&bytes);
+    try writeFragment(&writer, .text, false, "[\"REQ\",", .{ 1, 2, 3, 4 });
+    try writeFragment(&writer, .text, true, "\"s\",{}]", .{ 1, 2, 3, 4 });
+    try client.sendRaw(writer.buffered());
+    try expectClosedWith(client, .protocol_error);
+}
+
+test "an unmasked frame from a client is a protocol error" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{}, null);
+    defer fixture.stop();
+    const client = try Client.connect(testing.allocator, fixture.threaded.io(), fixture.port(), 2000);
+    defer client.close();
+
+    var bytes: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&bytes);
+    try frame.writeFrame(&writer, .text, "[\"CLOSE\",\"s\"]", null);
+    try client.sendRaw(writer.buffered());
+    try expectClosedWith(client, .protocol_error);
+}
+
+test "text that is not UTF-8 closes with invalid payload, and binary with unsupported data" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{}, null);
+    defer fixture.stop();
+    const io = fixture.threaded.io();
+
+    const text_client = try Client.connect(testing.allocator, io, fixture.port(), 2000);
+    defer text_client.close();
+    try text_client.send("[\"CLOSE\",\"\xff\xfe\"]");
+    try expectClosedWith(text_client, .invalid_payload);
+
+    const binary_client = try Client.connect(testing.allocator, io, fixture.port(), 2000);
+    defer binary_client.close();
+    try binary_client.sendFrame(.binary, "[]");
+    try expectClosedWith(binary_client, .unsupported_data);
+}
+
+test "a ping flood is answered without disturbing other connections" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{}, null);
+    defer fixture.stop();
+    const io = fixture.threaded.io();
+
+    const flooder = try Client.connect(testing.allocator, io, fixture.port(), 2000);
+    defer flooder.close();
+    var bytes: std.Io.Writer.Allocating = .init(testing.allocator);
+    defer bytes.deinit();
+    for (0..5000) |_| try frame.writeFrame(&bytes.writer, .ping, "flood", .{ 1, 2, 3, 4 });
+    try flooder.sendRaw(bytes.written());
+
+    const bystander = try Client.connect(testing.allocator, io, fixture.port(), 2000);
+    defer bystander.close();
+    try bystander.send("[\"REQ\",\"s\",{}]");
+    try testing.expectEqualStrings("[\"EOSE\",\"s\"]", try bystander.receive());
+}
