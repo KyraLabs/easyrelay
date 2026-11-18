@@ -2,12 +2,12 @@
 
 A [Nostr](https://github.com/nostr-protocol/nips) relay written in [Zig](https://ziglang.org).
 
-**Status: pre-alpha.** The relay works and is not ready to run for anyone else yet. It speaks
-NIP-01 over WebSocket — publishing, subscriptions, live delivery, full event validation, kind
-semantics — and NIP-09 deletion, and it keeps its events in LMDB under `./data`, so they survive a
-restart. It answers NIP-11 on the same port. The rate limits, authentication and distribution a public
-relay needs are Phase 3. See the
-[roadmap](docs/roadmap.md) for what is being built and in which order.
+**Status: pre-alpha.** It speaks NIP-01 over WebSocket — publishing, subscriptions, live
+delivery, full event validation, kind semantics — with NIP-09 deletion, NIP-11, NIP-40
+expiration, NIP-42 authentication, NIP-65 relay lists and NIP-70 protected events, and keeps its
+events in LMDB under `./data`. Rate limits, backpressure, admission policy, metrics and graceful
+shutdown are in place; the first release, which publishes the binaries and the container image,
+has not been cut. See the [roadmap](docs/roadmap.md) for what is being built and in which order.
 
 ## What it is
 
@@ -36,10 +36,10 @@ the admission policy layer, and the operational surface.
 
 ## Quick start
 
-> **Partly available.** Running the relay with no arguments works today. The data directory,
-> the released binaries and the compose file below do not exist yet: they are what the Phase 2
-> and Phase 3 exit criteria in the [roadmap](docs/roadmap.md) test for, written down here as a
-> contract rather than an aspiration.
+> **Partly available.** Running the relay built from source works today, and so does the compose
+> file below once its image is published. Neither the binaries nor the image exist until the first
+> release is cut; the [roadmap](docs/roadmap.md#where-phase-3-stands) says what that release
+> still has to prove.
 
 Run it:
 

@@ -193,22 +193,24 @@ build.zig
 build.zig.zon
 .zigversion
 src/
-  main.zig            entry point, startup, signal handling
+  main.zig            entry point, commands (serve, init, doctor, backup, compact), signals
   config.zig          configuration loading and validation
-  transport/          RFC 6455 frames and handshake, socket reads, a test client
-  server/             listener and connections: WebSocket sessions, plain HTTP answers
-  relay/              protocol codec, validation, session, subscription registry
-  policy/             rate limiting, PoW, auth, allow/deny lists
+  logging.zig         structured log lines, JSON or text
+  transport/          RFC 6455 frames and handshake, socket reads and writes, a test client
+  server/             listener and connections, the per-connection outbox, plain HTTP answers
+  relay/              codec, validation, session (NIP-42, NIP-70), subscriptions, hub, writer,
+                      rate limits, admission policy, NIP-40 reaper, metrics, NIP-11
   storage/
     store.zig         the Store interface
     memory.zig        in-memory backend
-    lmdb.zig          LMDB backend
-  nips/               nip11.zig, nip42.zig, nip45.zig, nip50.zig, nip77.zig, nip86.zig
-  metrics/            Prometheus registry and exposition
+    lmdb.zig          LMDB backend, backup and compaction
 tests/
   conformance/        protocol rules from docs/protocol.md
   vectors/            official test vectors
-bench/                benchmark harness
+deploy/               docker-compose.yml behind Caddy, the systemd unit
+scripts/              toolchain check, and checks that drive the built binary with nak
+Dockerfile            the container image: the static binary and nothing else
+bench/                benchmark harness (Phase 6)
 ```
 
 ## Decision index

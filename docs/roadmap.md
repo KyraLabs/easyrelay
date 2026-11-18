@@ -233,6 +233,10 @@ Measurements: Intel i5-10400F, btrfs on a SATA SSD, LMDB durable (sync on commit
 
 ## Phase 3 — Operational hardening
 
+> **In progress.** Every deliverable is built and every exit criterion that can be checked from
+> this repository is checked; three need a release or a person. See
+> [where Phase 3 stands](#where-phase-3-stands).
+
 The phase that makes the relay safe to expose to the open internet.
 
 ### Deliverables
@@ -288,6 +292,38 @@ The phase that makes the relay safe to expose to the open internet.
   installed.
 - `docker compose up -d` with only `RELAY_DOMAIN` set yields a relay reachable over `wss://`
   with a valid certificate.
+
+### Where Phase 3 stands
+
+How each deliverable landed, where it is not self-evident:
+
+- The I/O pool bound became a store-level permit per LMDB reader slot: ADR-0011 made connections
+  threads rather than pool tasks, and the slot is the scarce resource either way. The environment
+  is opened with `MDB_NOTLS`, without which every connection thread that had once queried kept a
+  slot until it exited, and the 127th such connection failed every read.
+- One `Signer` per connection thread, created when the connection starts; the writer thread
+  verifies nothing.
+- Backpressure needed more than a disconnect: fan-out wrote to sockets from the writer thread, so
+  one subscriber that stopped reading stalled every write on the relay. Each connection now has
+  a bounded outbox drained by its own sending thread ([ADR-0011](adr/0011-first-party-websocket-transport.md)),
+  and a `REQ`'s stored phase no longer holds the lock fan-out takes.
+- Per-pubkey rate limiting is charged after the signature verifies, in a fixed table of keyed
+  slots ([configuration.md](configuration.md#rate_limit)).
+- Also delivered: `network.ping_interval_s` and `network.idle_timeout_s`, `easyrelay backup` and
+  `easyrelay compact`. Retention policies, documented in [storage.md](storage.md#retention) and
+  [configuration.md](configuration.md#retention), are not built; no exit criterion depends on
+  them.
+
+| Exit criterion | Verified by |
+| --- | --- |
+| A flood degrades only its own connections | `src/server/server.zig`: a connection flooding 90 events is rate-limited while a second publishes ten, each answered within 250 ms, and a third receives all ten live |
+| A client that stops reading is disconnected, memory flat | `src/server/server.zig`: a subscriber that never reads is closed at `network.write_buffer_limit` while a publisher keeps getting `OK`; the outbox and held events are bounded by that limit |
+| SIGTERM during sustained writes loses no acknowledged event | `scripts/shutdown-durability.sh`, in CI |
+| NIP-40, NIP-42 and NIP-70 conformance | `tests/conformance/nip40.zig`, `nip42.zig`, `nip70.zig` |
+| The backup and restore runbook, end to end against a running relay | `scripts/backup-restore.sh`, in CI: a backup taken during writes restores every event acknowledged before it |
+| The timed first-run test | **Not yet run.** It needs a person who has not seen the project, a fresh machine and a domain |
+| A published binary runs with no toolchain, LMDB or `libsecp256k1` | **Not yet verified.** The binaries are static and the image is `FROM scratch`, which proves it for Linux; it is checked for real on the first release |
+| `docker compose up -d` with only `RELAY_DOMAIN` gives `wss://` with a valid certificate | **Partly.** CI runs the compose file with `RELAY_DOMAIN=localhost` and checks TLS, NIP-11 and the upgrade through Caddy; a certificate from a public CA needs a public domain, checked by hand on the first release |
 
 ---
 
