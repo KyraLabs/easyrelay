@@ -70,6 +70,8 @@ pub const Decoder = struct {
     assembled: std.ArrayList(u8) = .empty,
     fragmented: ?Opcode = null,
     control: [max_control_payload]u8 = undefined,
+    /// A read failed after part of a frame was consumed; the stream cannot be resumed.
+    interrupted: bool = false,
 
     pub fn init(gpa: std.mem.Allocator, max_message: usize, role: Role) Decoder {
         return .{ .gpa = gpa, .max_message = max_message, .role = role };
@@ -80,9 +82,14 @@ pub const Decoder = struct {
         self.* = undefined;
     }
 
+    /// A read error at a frame boundary leaves the decoder able to continue once the reader can;
+    /// one in the middle of a frame sets `interrupted`.
     pub fn next(self: *Decoder, reader: *std.Io.Reader) (Error || std.Io.Reader.Error)!Message {
+        std.debug.assert(!self.interrupted);
         if (self.fragmented == null) self.assembled.clearRetainingCapacity();
         while (true) {
+            _ = try reader.peek(2);
+            errdefer self.interrupted = true;
             const header = try readHeader(reader, self.role);
             if (header.opcode.isControl()) {
                 if (!header.fin or header.length > max_control_payload) return error.ProtocolViolation;
@@ -420,4 +427,47 @@ test "random and mutated frames never crash the decoder or exceed its bounds" {
         }
         try decodeHostile(input);
     }
+}
+
+test "a read that fails at a frame boundary can be resumed, and one inside a frame cannot" {
+    const Source = struct {
+        bytes: []const u8,
+        available: usize,
+        interface: std.Io.Reader,
+
+        fn stream(io_r: *std.Io.Reader, io_w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+            const self: *@This() = @alignCast(@fieldParentPtr("interface", io_r));
+            if (self.available == 0) return error.ReadFailed;
+            const destination = limit.slice(try io_w.writableSliceGreedy(1));
+            const count = @min(destination.len, self.available, self.bytes.len);
+            @memcpy(destination[0..count], self.bytes[0..count]);
+            self.bytes = self.bytes[count..];
+            self.available -= count;
+            io_w.advance(count);
+            return count;
+        }
+    };
+    var wire: [64]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&wire);
+    try writeFrame(&writer, .text, "first", .{ 1, 2, 3, 4 });
+    try writeFrame(&writer, .text, "second", .{ 1, 2, 3, 4 });
+    const first_len = 2 + 4 + 5;
+
+    var buffer: [64]u8 = undefined;
+    var source: Source = .{ .bytes = writer.buffered(), .available = first_len, .interface = .{
+        .vtable = &.{ .stream = Source.stream },
+        .buffer = &buffer,
+        .seek = 0,
+        .end = 0,
+    } };
+    var decoder = Decoder.init(testing.allocator, 1024, .server);
+    defer decoder.deinit();
+
+    try testing.expectEqualStrings("first", (try decoder.next(&source.interface)).text);
+    try testing.expectError(error.ReadFailed, decoder.next(&source.interface));
+    try testing.expect(!decoder.interrupted);
+
+    source.available = 3;
+    try testing.expectError(error.ReadFailed, decoder.next(&source.interface));
+    try testing.expect(decoder.interrupted);
 }

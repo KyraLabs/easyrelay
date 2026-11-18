@@ -41,7 +41,7 @@ versions may contain breaking changes; they will always be listed under `Changed
   Linux and macOS, and cross-compilation of every published release target.
 - Release automation producing static Linux binaries and macOS binaries with checksums.
 - Backpressure: a client that does not read what it subscribed to is disconnected at
-  `network.write_buffer_limit` instead of stalling other clients.
+  `network.write_buffer_limit` instead of stalling other clients; pings and an idle timeout.
 - Graceful shutdown on SIGTERM and SIGINT: connections close, queued events are committed.
 - Design documentation: architecture, protocol contract, storage model, NIP coverage,
   configuration reference, operations runbook, test strategy, and nine architecture decision

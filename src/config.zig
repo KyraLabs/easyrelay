@@ -17,6 +17,8 @@ pub const Network = struct {
     handshake_timeout_ms: u32 = 5000,
     write_buffer_limit: usize = 1024 * 1024,
     write_timeout_ms: u32 = 30_000,
+    ping_interval_s: u32 = 30,
+    idle_timeout_s: u32 = 300,
 };
 
 pub const Storage = struct {
@@ -66,6 +68,8 @@ const descriptions = .{
         .handshake_timeout_ms = "Time allowed to complete the WebSocket handshake, from accept to the end of the request.",
         .write_buffer_limit = "Per-connection pending write bytes before the connection is dropped. Backpressure, not buffering.",
         .write_timeout_ms = "Time a write to a client may make no progress before the connection is dropped.",
+        .ping_interval_s = "Ping a connection after this long without hearing from it. `0` disables.",
+        .idle_timeout_s = "Close a connection after this long without hearing from it, pongs included. `0` disables.",
     },
     .storage = .{
         .path = "Data directory. The LMDB environment lives in its `events` subdirectory.",
@@ -209,6 +213,14 @@ pub fn validate(config: Config, diagnostics: *Diagnostics) error{InvalidConfig}!
     if (config.network.address.len == 0) return diagnostics.fail("network.address must not be empty", .{});
     if (config.network.port == 0) return diagnostics.fail("network.port must not be 0", .{});
     if (config.network.max_connections == 0) return diagnostics.fail("network.max_connections must be at least 1", .{});
+    inline for (.{ "ping_interval_s", "idle_timeout_s" }) |name| {
+        if (@field(config.network, name) > std.math.maxInt(u32) / std.time.ms_per_s) {
+            return diagnostics.fail("network." ++ name ++ " must be at most {d}", .{std.math.maxInt(u32) / std.time.ms_per_s});
+        }
+    }
+    if (config.network.ping_interval_s != 0 and config.network.idle_timeout_s != 0 and config.network.ping_interval_s >= config.network.idle_timeout_s) {
+        return diagnostics.fail("network.ping_interval_s ({d}) must be below network.idle_timeout_s ({d}), or a live client is closed before it is pinged", .{ config.network.ping_interval_s, config.network.idle_timeout_s });
+    }
     if (config.network.write_timeout_ms == 0) return diagnostics.fail("network.write_timeout_ms must be at least 1", .{});
     if (config.network.write_buffer_limit < 2 * limits.max_message_size) return diagnostics.fail(
         "network.write_buffer_limit ({d}) is below twice limits.max_message_size ({d}); raise write_buffer_limit",
@@ -381,6 +393,8 @@ test "every validation error names the setting it is about" {
         .{ .config = .{ .storage = .{ .map_size = 4096 } }, .key = "storage.map_size" },
         .{ .config = .{ .storage = .{ .max_scan = 0 } }, .key = "storage.max_scan" },
         .{ .config = .{ .network = .{ .write_timeout_ms = 0 } }, .key = "network.write_timeout_ms" },
+        .{ .config = .{ .network = .{ .ping_interval_s = 300, .idle_timeout_s = 300 } }, .key = "network.ping_interval_s" },
+        .{ .config = .{ .network = .{ .idle_timeout_s = 5_000_000 } }, .key = "network.idle_timeout_s" },
         .{ .config = .{ .network = .{ .write_buffer_limit = 1000 } }, .key = "network.write_buffer_limit" },
         .{ .config = .{ .rate_limit = .{ .write_queue_depth = 0 } }, .key = "rate_limit.write_queue_depth" },
         .{ .config = .{ .limits = .{ .max_filters = 0 } }, .key = "limits.max_filters" },

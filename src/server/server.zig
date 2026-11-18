@@ -28,6 +28,10 @@ pub const Options = struct {
     max_message_size: usize = 131072,
     write_buffer_limit: usize = 1024 * 1024,
     write_timeout_ms: u32 = 30_000,
+    /// Ping a connection after this long without hearing from it; zero never pings.
+    ping_interval_ms: u32 = 30_000,
+    /// Close a connection after this long without hearing from it; zero never does.
+    idle_timeout_ms: u32 = 300_000,
 };
 
 const thread_stack_size = 4 * 1024 * 1024;
@@ -245,6 +249,8 @@ const Connection = struct {
             try socket.writeAll(handle, upgrade.buffered());
         }
         try reader.clearDeadline();
+        const options = server.options;
+        try socket.setReceiveTimeout(handle, if (options.ping_interval_ms != 0) options.ping_interval_ms else options.idle_timeout_ms);
         self.sender = try std.Thread.spawn(.{ .stack_size = sender_stack_size }, sendLoop, .{self});
 
         try app.shared.hub.join(&self.subscriber);
@@ -259,14 +265,28 @@ const Connection = struct {
         var responder: Responder = .{ .connection = self, .message = .init(gpa) };
         defer responder.message.deinit();
 
+        var last_heard = std.Io.Timestamp.now(io, .awake);
         while (true) {
             const message = decoder.next(&reader.interface) catch |err| switch (err) {
-                error.EndOfStream, error.ReadFailed => return,
+                error.ReadFailed => {
+                    const timed_out = if (reader.err) |cause| cause == error.Timeout else false;
+                    if (!timed_out or decoder.interrupted) return;
+                    reader.err = null;
+                    const quiet = last_heard.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+                    if (options.idle_timeout_ms != 0 and quiet >= options.idle_timeout_ms) {
+                        log.debug("closing a connection idle for {d} ms", .{quiet});
+                        return self.sendClose(.going_away);
+                    }
+                    if (options.ping_interval_ms != 0) try self.sendFrame(.ping, "");
+                    continue;
+                },
+                error.EndOfStream => return,
                 error.ProtocolViolation, error.InvalidUtf8, error.TooBig, error.OutOfMemory => |violation| {
                     self.sendClose(frame.closeCodeFor(violation));
                     return;
                 },
             };
+            last_heard = std.Io.Timestamp.now(io, .awake);
             switch (message) {
                 .text => |text| {
                     defer _ = arena.reset(.retain_capacity);
@@ -580,4 +600,64 @@ test "a subscriber that stops reading is disconnected without slowing a publishe
         try testing.expect(std.mem.indexOf(u8, try publisher.receive(), ",true,") != null);
     }
     try testing.expectEqual(@as(usize, 1), fixture.connections.count());
+}
+
+test "a quiet connection is pinged, and one that stays silent is closed as idle" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{ .ping_interval_ms = 100, .idle_timeout_ms = 350 }, null);
+    defer fixture.stop();
+    const io = fixture.threaded.io();
+    const client = try Client.connect(testing.allocator, io, fixture.port(), 2000);
+    defer client.close();
+
+    const started = std.Io.Timestamp.now(io, .awake);
+    var pings: usize = 0;
+    const closed = while (true) switch (try client.decoder.next(&client.reader.interface)) {
+        .ping => pings += 1,
+        .close => |close| break close,
+        else => return error.UnexpectedMessage,
+    };
+    const waited = started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds();
+    try testing.expect(pings >= 2);
+    try testing.expect(waited >= 300 and waited < 2000);
+    try testing.expectEqual(@as(?u16, @intFromEnum(frame.CloseCode.going_away)), closed.code);
+}
+
+test "a client answering pings is never closed as idle" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{ .ping_interval_ms = 50, .idle_timeout_ms = 200 }, null);
+    defer fixture.stop();
+    const client = try Client.connect(testing.allocator, fixture.threaded.io(), fixture.port(), 2000);
+    defer client.close();
+
+    const io = fixture.threaded.io();
+    const started = std.Io.Timestamp.now(io, .awake);
+    var pings: usize = 0;
+    while (started.durationTo(std.Io.Timestamp.now(io, .awake)).toMilliseconds() < 600) {
+        switch (try client.decoder.next(&client.reader.interface)) {
+            .ping => |payload| {
+                pings += 1;
+                try client.sendFrame(.pong, payload);
+            },
+            else => return error.UnexpectedMessage,
+        }
+    }
+    try testing.expect(pings >= 3);
+    try client.send("[\"REQ\",\"s\",{}]");
+    try testing.expectEqualStrings("[\"EOSE\",\"s\"]", try client.receive());
+}
+
+test "a client stalling in the middle of a frame is closed at the next timeout" {
+    var fixture: Fixture = undefined;
+    try fixture.start(.{ .ping_interval_ms = 100, .idle_timeout_ms = 0 }, null);
+    defer fixture.stop();
+    const client = try Client.connect(testing.allocator, fixture.threaded.io(), fixture.port(), 2000);
+    defer client.close();
+
+    try client.sendRaw(&.{ 0x81, 0x85, 1, 2 });
+    const ended = while (true) {
+        const message = client.receiveMessage() catch |err| break err;
+        if (message != .ping) return error.UnexpectedMessage;
+    };
+    try testing.expect(ended == error.Closed);
 }

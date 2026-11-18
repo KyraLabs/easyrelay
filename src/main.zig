@@ -179,6 +179,8 @@ fn serverOptions(settings: config.Config) easyrelay.server.Options {
         .max_message_size = settings.limits.max_message_size,
         .write_buffer_limit = settings.network.write_buffer_limit,
         .write_timeout_ms = settings.network.write_timeout_ms,
+        .ping_interval_ms = settings.network.ping_interval_s * std.time.ms_per_s,
+        .idle_timeout_ms = settings.network.idle_timeout_s * std.time.ms_per_s,
     };
 }
 
