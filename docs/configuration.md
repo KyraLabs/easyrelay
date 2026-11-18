@@ -102,21 +102,22 @@ strict, and the key keeps anyone from choosing a pubkey that lands on another's 
 
 ## `policy`
 
-Phase 3; `plugin` is Phase 4.
+`min_pow_difficulty` and `plugin` are Phase 4.
 
 | Key | Type | Default | Meaning |
 | --- | --- | --- | --- |
-| `allowed_pubkeys` | ?[]string | `null` | If set, only these authors may write. |
+| `allowed_pubkeys` | ?[]string | `null` | If set, only these authors may write. Hex pubkeys. |
 | `blocked_pubkeys` | []string | `[]` | These authors may never write. |
-| `allowed_kinds` | ?[]u32 | `null` | If set, only these kinds are accepted. |
-| `blocked_kinds` | []u32 | `[]` | These kinds are always rejected. |
-| `min_pow_difficulty` | u8 | `0` | NIP-13 minimum leading zero bits. `0` disables. |
-| `auth_required_for_write` | bool | `false` | Require NIP-42 before accepting events. |
-| `auth_required_for_read` | bool | `false` | Require NIP-42 before serving subscriptions. |
-| `plugin` | ?string | `null` | Path to an external write-policy executable (Phase 4). |
+| `allowed_kinds` | ?[]u16 | `null` | If set, only these kinds are accepted. |
+| `blocked_kinds` | []u16 | `[]` | These kinds are always rejected. |
+| `min_pow_difficulty` | u8 | `0` | NIP-13 minimum leading zero bits. `0` disables. Phase 4. |
+| `auth_required_for_write` | bool | `false` | Require NIP-42 before accepting events. Phase 3, with NIP-42. |
+| `auth_required_for_read` | bool | `false` | Require NIP-42 before serving subscriptions. Phase 3, with NIP-42. |
+| `plugin` | ?string | `null` | Path to an external write-policy executable. Phase 4. |
 
 An allow list and a deny list containing the same entry is a configuration error, not a
-precedence puzzle.
+precedence puzzle. A refused event is answered with `OK` `false` and `blocked:`, after its
+signature has verified.
 
 ## `retention`
 

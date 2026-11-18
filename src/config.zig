@@ -7,6 +7,7 @@ pub const Config = struct {
     storage: Storage = .{},
     limits: Limits = .{},
     rate_limit: RateLimit = .{},
+    policy: Policy = .{},
     info: Info = .{},
 };
 
@@ -52,6 +53,13 @@ pub const RateLimit = struct {
     author_events_per_second: ?f64 = 10,
     author_events_burst: usize = 50,
     write_queue_depth: usize = 4096,
+};
+
+pub const Policy = struct {
+    allowed_pubkeys: ?[]const []const u8 = null,
+    blocked_pubkeys: []const []const u8 = &.{},
+    allowed_kinds: ?[]const u16 = null,
+    blocked_kinds: []const u16 = &.{},
 };
 
 pub const Info = struct {
@@ -108,6 +116,12 @@ const descriptions = .{
         .author_events_per_second = "Sustained events per author across all connections, counted after the signature verifies. `null` disables.",
         .author_events_burst = "Events an author may publish at once before author_events_per_second applies.",
         .write_queue_depth = "Pending writes before events are refused with rate-limited:.",
+    },
+    .policy = .{
+        .allowed_pubkeys = "If set, only these authors may publish. Hex pubkeys.",
+        .blocked_pubkeys = "These authors may never publish. Hex pubkeys.",
+        .allowed_kinds = "If set, only these kinds are accepted.",
+        .blocked_kinds = "These kinds are always refused.",
     },
     .info = .{
         .name = "Relay name in the NIP-11 document.",
@@ -202,11 +216,11 @@ fn parseValue(comptime T: type, arena: std.mem.Allocator, text: []const u8) erro
         .float => return std.fmt.parseFloat(T, text) catch null,
         .pointer => |pointer| {
             if (pointer.child == u8) return try arena.dupe(u8, text);
-            var items: std.ArrayList([]const u8) = .empty;
+            var items: std.ArrayList(pointer.child) = .empty;
             var parts = std.mem.splitScalar(u8, text, ',');
             while (parts.next()) |part| {
                 const trimmed = std.mem.trim(u8, part, " ");
-                if (trimmed.len != 0) try items.append(arena, try arena.dupe(u8, trimmed));
+                if (trimmed.len != 0) try items.append(arena, try parseValue(pointer.child, arena, trimmed) orelse return null);
             }
             return items.items;
         },
@@ -274,12 +288,30 @@ pub fn validate(config: Config, diagnostics: *Diagnostics) error{InvalidConfig}!
     if (limits.created_at_upper_limit_s < 0) return diagnostics.fail("limits.created_at_upper_limit_s must not be negative", .{});
     if (limits.created_at_lower_limit_s) |lower| if (lower < 0) return diagnostics.fail("limits.created_at_lower_limit_s must not be negative", .{});
     if (config.info.pubkey) |pubkey| {
-        const hex = pubkey.len == 64 and for (pubkey) |char| switch (char) {
-            '0'...'9', 'a'...'f' => {},
-            else => break false,
-        } else true;
-        if (!hex) return diagnostics.fail("info.pubkey must be 64 lowercase hex characters", .{});
+        if (!isPubkey(pubkey)) return diagnostics.fail("info.pubkey must be 64 lowercase hex characters", .{});
     }
+    const policy = config.policy;
+    if (policy.allowed_pubkeys) |allowed| for (allowed) |pubkey| {
+        if (!isPubkey(pubkey)) return diagnostics.fail("policy.allowed_pubkeys holds \"{s}\", which is not 64 lowercase hex characters", .{pubkey});
+    };
+    for (policy.blocked_pubkeys) |pubkey| {
+        if (!isPubkey(pubkey)) return diagnostics.fail("policy.blocked_pubkeys holds \"{s}\", which is not 64 lowercase hex characters", .{pubkey});
+        if (policy.allowed_pubkeys) |allowed| for (allowed) |other| if (std.mem.eql(u8, pubkey, other)) {
+            return diagnostics.fail("policy.blocked_pubkeys and policy.allowed_pubkeys both hold {s}; remove it from one", .{pubkey});
+        };
+    }
+    for (policy.blocked_kinds) |kind| {
+        if (policy.allowed_kinds) |allowed| if (std.mem.indexOfScalar(u16, allowed, kind) != null) {
+            return diagnostics.fail("policy.blocked_kinds and policy.allowed_kinds both hold {d}; remove it from one", .{kind});
+        };
+    }
+}
+
+fn isPubkey(text: []const u8) bool {
+    return text.len == 64 and for (text) |char| switch (char) {
+        '0'...'9', 'a'...'f' => {},
+        else => break false,
+    } else true;
 }
 
 /// Writes a configuration file holding every setting at its default, each with its description.
@@ -440,6 +472,10 @@ test "every validation error names the setting it is about" {
         .{ .config = .{ .limits = .{ .created_at_upper_limit_s = -1 } }, .key = "limits.created_at_upper_limit_s" },
         .{ .config = .{ .limits = .{ .created_at_lower_limit_s = -1 } }, .key = "limits.created_at_lower_limit_s" },
         .{ .config = .{ .info = .{ .pubkey = "ABC" } }, .key = "info.pubkey" },
+        .{ .config = .{ .policy = .{ .allowed_pubkeys = &.{"zz"} } }, .key = "policy.allowed_pubkeys" },
+        .{ .config = .{ .policy = .{ .blocked_pubkeys = &.{"zz"} } }, .key = "policy.blocked_pubkeys" },
+        .{ .config = .{ .policy = .{ .allowed_pubkeys = &.{"ab" ** 32}, .blocked_pubkeys = &.{"ab" ** 32} } }, .key = "policy.blocked_pubkeys" },
+        .{ .config = .{ .policy = .{ .allowed_kinds = &.{1}, .blocked_kinds = &.{1} } }, .key = "policy.blocked_kinds" },
     };
     for (cases) |case| {
         var diagnostics: Diagnostics = .{};
@@ -449,4 +485,19 @@ test "every validation error names the setting it is about" {
             return err;
         };
     }
+}
+
+test "a list setting from the environment parses each item as its own type" {
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    var environment: std.process.Environ.Map = .init(testing.allocator);
+    defer environment.deinit();
+    try environment.put("EASYRELAY_POLICY_ALLOWED_KINDS", "1, 7,30023");
+    var settings: Config = .{};
+    var diagnostics: Diagnostics = .{};
+    try applyEnvironment(arena_state.allocator(), &settings, &environment, &diagnostics);
+    try testing.expectEqualSlices(u16, &.{ 1, 7, 30023 }, settings.policy.allowed_kinds.?);
+
+    try environment.put("EASYRELAY_POLICY_BLOCKED_KINDS", "1,70000");
+    try testing.expectError(error.InvalidConfig, applyEnvironment(arena_state.allocator(), &settings, &environment, &diagnostics));
 }

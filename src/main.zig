@@ -180,6 +180,16 @@ fn rateLimits(settings: config.Config) easyrelay.rate.Limits {
     };
 }
 
+fn admissionPolicy(arena: std.mem.Allocator, settings: config.Config) !easyrelay.policy.Policy {
+    const lists = settings.policy;
+    return easyrelay.policy.Policy.init(arena, .{
+        .allowed_pubkeys = lists.allowed_pubkeys,
+        .blocked_pubkeys = lists.blocked_pubkeys,
+        .allowed_kinds = lists.allowed_kinds,
+        .blocked_kinds = lists.blocked_kinds,
+    });
+}
+
 fn rule(per_second: ?f64, burst: usize) ?easyrelay.rate.Rule {
     return .{ .per_second = per_second orelse return null, .burst = burst };
 }
@@ -286,6 +296,7 @@ fn serve(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: Io, loaded: Loade
         .writer = &writer,
         .limits = sessionLimits(settings),
         .authors = if (authors) |*present| present else null,
+        .policy = try admissionPolicy(arena, settings),
     };
     const information = try easyrelay.nip11.Responses.render(arena, settings);
     var app: easyrelay.server.App = .{ .gpa = gpa, .shared = &shared, .information = &information, .rates = rates };

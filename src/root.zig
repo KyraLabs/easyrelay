@@ -28,6 +28,8 @@ pub const hub = @import("relay/hub.zig");
 
 pub const rate = @import("relay/rate.zig");
 
+pub const policy = @import("relay/policy.zig");
+
 pub const writer = @import("relay/writer.zig");
 
 pub const diagnostics = @import("relay/diagnostics.zig");
@@ -62,6 +64,7 @@ test {
     _ = subscriptions;
     _ = hub;
     _ = rate;
+    _ = policy;
     _ = diagnostics;
     _ = outbox;
     _ = server;

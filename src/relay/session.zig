@@ -4,6 +4,7 @@ const nostr = @import("nostr");
 const codec = @import("codec.zig");
 const hub = @import("hub.zig");
 const rate = @import("rate.zig");
+const policy = @import("policy.zig");
 const subscriptions = @import("subscriptions.zig");
 const validation = @import("validation.zig");
 const write_queue = @import("writer.zig");
@@ -53,6 +54,7 @@ pub const Shared = struct {
     limits: Limits = .{},
     /// Per-author publishing budgets, charged only once a signature has verified.
     authors: ?*rate.Authors = null,
+    policy: policy.Policy = .{},
 };
 
 pub const Context = struct {
@@ -145,6 +147,12 @@ pub const Session = struct {
                 .reason = "the relay ran out of memory validating this event",
             }),
         };
+        if (self.shared.policy.refusal(&event)) |reason| return self.sendOk(.{
+            .event_id = event.id,
+            .accepted = false,
+            .prefix = .blocked,
+            .reason = reason,
+        });
         if (self.shared.authors) |authors| if (!authors.take(&event.pubkey, context.clock_ns)) return self.sendOk(.{
             .event_id = event.id,
             .accepted = false,
@@ -948,4 +956,18 @@ test "a stored phase that holds more live events than allowed is closed with err
     try testing.expectEqualStrings("[\"EOSE\",\"s\"]", sent[0]);
     try testing.expect(std.mem.startsWith(u8, sent[1], "[\"CLOSED\",\"s\",\"error:"));
     try testing.expectEqual(@as(usize, 0), harness.subscriber.registry.count());
+}
+
+test "an event the policy refuses is answered with blocked: and not stored" {
+    var harness = Harness.init(.{});
+    try harness.start();
+    defer harness.deinit();
+    harness.shared.policy = .{ .blocked_kinds = &.{1} };
+
+    try harness.handle(try harness.eventMessage(try harness.signedEvent("refused")));
+    try testing.expect(std.mem.indexOf(u8, harness.recorder.only(), ",false,\"blocked: this kind is not accepted here\"]") != null);
+
+    harness.recorder.clear();
+    try harness.handle("[\"REQ\",\"s\",{}]");
+    try testing.expectEqualStrings("[\"EOSE\",\"s\"]", harness.recorder.only());
 }
