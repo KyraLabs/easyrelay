@@ -4,5 +4,6 @@ test {
     _ = @import("kinds.zig");
     _ = @import("nip40.zig");
     _ = @import("nip42.zig");
+    _ = @import("nip65.zig");
     _ = @import("nip70.zig");
 }
